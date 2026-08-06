@@ -1,8 +1,10 @@
 # Global Weather Fields — Architecture and Implementation Plan
 
-> **Status:** design only; no runtime code has been changed. Research was
+> **Status:** implemented in commits `a9c64ca` through `1f2b5c5`. Research was
 > performed against the repository at `df884c3` and the live Open-Meteo IFS
-> dataset on 2026-08-06.
+> dataset on 2026-08-06. This file preserves the original design/audit record;
+> current operator and API documentation lives in
+> [`global-weather-fields.md`](global-weather-fields.md).
 
 ## Goal and invariants
 

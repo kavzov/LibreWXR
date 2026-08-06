@@ -8,6 +8,8 @@ A tutorial for adding live weather radar to a website using LibreWXR. No prior e
 - [Prerequisites](#prerequisites)
 - [API Reference](#api-reference)
   - [Weather Maps Endpoint](#weather-maps-endpoint)
+  - [Global Weather Metadata](#global-weather-metadata)
+  - [Global Weather Tile URL](#global-weather-tile-url)
   - [Tile URL Format](#tile-url-format)
   - [Satellite Tile URL Format](#satellite-tile-url-format)
   - [Coverage Tile Endpoint](#coverage-tile-endpoint)
@@ -28,6 +30,7 @@ A tutorial for adding live weather radar to a website using LibreWXR. No prior e
   - [2. Adding a Radar Layer](#2-adding-a-radar-layer)
   - [3. Animating Frames](#3-animating-frames)
   - [4. Adding a Satellite Layer](#4-adding-a-satellite-layer)
+- [Minimal Leaflet Global Weather Client](#minimal-leaflet-global-weather-client)
 - [Tile URL Parameters In Depth](#tile-url-parameters-in-depth)
   - [Color Schemes](#color-schemes)
   - [Smoothing and Snow](#smoothing-and-snow)
@@ -53,6 +56,12 @@ The basic flow for displaying radar on a web page is:
 Each radar frame represents a 10-minute snapshot of precipitation. The API typically serves 12 past frames (2 hours of history) plus optional nowcast (forecast) frames up to 60 minutes into the future.
 
 LibreWXR also serves **satellite tiles** — real satellite imagery from NOAA's GMGSI hourly global mosaic, rendered as a VIS-over-LW composite (daytime visible reflectance over longwave IR cloud tops, with a natural day/night terminator). These work the same way as radar (fetch timestamps, build URLs, add as a layer) but use a different URL pattern and update hourly instead of every 10 minutes.
+
+Global **temperature, dew point, relative humidity, mean sea-level pressure,
+and wind speed** are a third tile family. They come from the ECMWF IFS model
+through Open-Meteo bulk files, cover the whole Web Mercator world, and expose
+their own metadata, timestamp, palette, legend, and attribution contract. They
+are forecast/analysis fields rather than direct observations.
 
 Beyond tiles, LibreWXR exposes a **weather alerts API** — a global feed of WMO CAP alerts (severe weather warnings, watches, advisories) returned as a GeoJSON FeatureCollection that you can drop into any map library that consumes GeoJSON.
 
@@ -133,6 +142,67 @@ This is the starting point for any integration. It returns metadata about all av
 | `satellite.infrared` | Array of GMGSI satellite frames, oldest first. Hourly cadence, up to 12 hours. May be empty if satellite is disabled or still loading. |
 | `time` | Unix timestamp (seconds) of the frame. |
 | `path` | Path prefix for tile requests for this frame. |
+
+No global scalar fields are added to this response. That separation preserves
+the Rain Viewer schema for existing clients.
+
+### Global Weather Metadata
+
+```text
+GET /v2/weather/metadata.json
+```
+
+Fetch this endpoint before creating a scalar layer. Important response fields:
+
+| Field | Description |
+|---|---|
+| `active_model_run` | IFS model initialization time currently served. |
+| `generated` | Unix time when this metadata response was generated. |
+| `stale` | `true` when the last complete run is old; stale data remains usable. |
+| `attribution` | Attribution text the client should display. |
+| `fields` | Public IDs, display names, units, and compatible palette IDs. |
+| `available_timestamps` | Native model valid times, in Unix seconds. |
+| `default_timestamp` | Valid time nearest the server's current time. |
+| `palettes` | Complete legend ranges, stops, below/above/nodata colours, and opacity. |
+| `tile_url_template` | Full URL with `{field}`, `{timestamp}`, `{size}`, `{z}`, `{x}`, `{y}`, `{palette}`, `{ext}` placeholders. |
+| `sizes`, `formats`, `min_zoom`, `max_zoom` | Values accepted by the tile endpoint. |
+
+Public field IDs and units are:
+
+| ID | Unit | Default palette |
+|---|---|---|
+| `temperature_2m` | °C | `temperature` |
+| `dewpoint_2m` | °C | `dewpoint` |
+| `relative_humidity_2m` | % | `humidity` |
+| `pressure_msl` | hPa | `pressure` |
+| `wind_speed_10m` | m/s | `wind_speed` |
+
+Build legends from the selected palette's `stops` array. Values below/above
+its physical range use `below_color` / `above_color`; `nodata_color` is
+normally transparent. Show `attribution` with the layer.
+
+### Global Weather Tile URL
+
+```text
+GET /v2/weather/{field}/{timestamp}/{size}/{z}/{x}/{y}/{palette}.{ext}
+```
+
+Example:
+
+```text
+http://localhost:8080/v2/weather/temperature_2m/1785996000/256/5/17/10/temperature.png
+```
+
+Use a palette listed in the chosen field's `palette_ids`, a size of 256 or
+512, and PNG or WebP. Listed timestamps avoid client ambiguity; intermediate
+timestamps inside the range are accepted and interpolated between surrounding
+model times. Responses carry an ETag and support `If-None-Match`.
+
+Metadata is cacheable for 60 seconds and tiles for six hours. A future model
+run may revise the same valid timestamp, so let the CDN honour the origin TTL
+and revalidate instead of overriding it with an indefinite immutable policy.
+See [Global weather map layers](global-weather-fields.md) for storage, stale
+publication, single/multi deployment, and precision details.
 
 ### Tile URL Format
 
@@ -949,6 +1019,66 @@ To animate through satellite frames, use the same pattern as radar animation (se
 
 ---
 
+## Minimal Leaflet Global Weather Client
+
+The complete self-contained example is
+[`examples/leaflet-weather-fields.html`](../examples/leaflet-weather-fields.html).
+Its essential metadata-driven flow is:
+
+```javascript
+const API = "http://localhost:8080";
+const metadata = await fetch(`${API}/v2/weather/metadata.json`).then(r => {
+    if (!r.ok) throw new Error(`Weather metadata: HTTP ${r.status}`);
+    return r.json();
+});
+
+let fieldId = "temperature_2m";
+let timestamp = metadata.default_timestamp;
+let weatherLayer;
+
+function showWeather(field, time) {
+    const fieldInfo = metadata.fields.find(item => item.id === field);
+    const paletteId = fieldInfo.palette_ids[0];
+    const palette = metadata.palettes.find(item => item.id === paletteId);
+
+    // Replace weather-specific placeholders now; Leaflet replaces z/x/y.
+    const url = metadata.tile_url_template
+        .replace("{field}", field)
+        .replace("{timestamp}", String(time))
+        .replace("{size}", "256")
+        .replace("{palette}", paletteId)
+        .replace("{ext}", "png");
+
+    if (weatherLayer) map.removeLayer(weatherLayer);
+    weatherLayer = L.tileLayer(url, {
+        tileSize: 256,
+        minZoom: metadata.min_zoom,
+        maxZoom: metadata.max_zoom,
+        opacity: 0.72,
+        attribution: metadata.attribution
+    }).addTo(map);
+
+    renderLegend(palette.display_name, palette.unit, palette.stops);
+}
+
+fieldSelect.onchange = event => {
+    fieldId = event.target.value; // temperature/humidity/pressure/etc.
+    showWeather(fieldId, timestamp);
+};
+timeSelect.onchange = event => {
+    timestamp = Number(event.target.value);
+    showWeather(fieldId, timestamp);
+};
+
+showWeather(fieldId, timestamp);
+```
+
+Populate both controls from `metadata.fields` and
+`metadata.available_timestamps`. The example builds the colour bar from
+`palette.stops`, so a server-side palette change does not require a client
+release. Refresh metadata every minute; preserve the user's selected field and
+choose the nearest available timestamp if the valid-time window moves.
+
 ## Tile URL Parameters In Depth
 
 ### Color Schemes
@@ -1086,6 +1216,8 @@ The `examples/` directory contains two self-contained HTML files that demonstrat
 
 - **`examples/leaflet.html`** — Full Leaflet integration
 - **`examples/maplibre.html`** — Full MapLibre GL JS integration
+- **`examples/leaflet-weather-fields.html`** — Minimal metadata-driven global
+  temperature/humidity/pressure/wind client with timestamp and legend controls
 
 Both examples include:
 - **Source selector** — switch between your local server and the public instance (`api.librewxr.net`) without editing code. Auto-detects the best default based on how the file is opened.

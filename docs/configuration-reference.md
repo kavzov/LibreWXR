@@ -573,6 +573,29 @@ LibreWXR uses ECMWF IFS 9 km global data from [Open-Meteo](https://open-meteo.co
 - Nowcast extrapolation outside regional model coverage
 - Global 2 m temperature and dew point, mean sea-level pressure, and 10 m U/V wind components
 
+The global scalar API is separate from Rain Viewer metadata and radar tiles:
+
+```text
+GET /v2/weather/metadata.json
+GET /v2/weather/{field}/{timestamp}/{size}/{z}/{x}/{y}/{palette}.{ext}
+```
+
+LibreWXR reads the same bulk per-valid-time `.om` objects as precipitation;
+it never builds global rasters from the Open-Meteo point forecast API. Exact
+source names and public units are:
+
+| Public field | Open-Meteo variable(s) | Unit |
+|---|---|---|
+| `temperature_2m` | `temperature_2m` | °C |
+| `dewpoint_2m` | `dew_point_2m` | °C |
+| `relative_humidity_2m` | derived from temperature/dew point | % |
+| `pressure_msl` | `pressure_msl` (Pa converted to hPa) | hPa |
+| `wind_speed_10m` | `wind_u_component_10m`, `wind_v_component_10m` | m/s |
+
+See [Global weather map layers](global-weather-fields.md) for metadata and tile
+examples, palettes/legends, attribution, deployment, storage, caching, stale
+behaviour, and accuracy limitations.
+
 ### `LIBREWXR_ECMWF_ENABLED`
 
 Disable ECMWF IFS entirely. Useful only for isolating regional NWP layers during debugging — anywhere outside the regional models will then simply show zero precipitation.
@@ -745,6 +768,33 @@ Optional cap on native ECMWF valid times retained for global continuous fields, 
 |---|---|
 | **Default** | `0` (unlimited within the horizon) |
 | **Type** | integer |
+
+### Operational sizing and publication
+
+Scalar fields use the existing `LIBREWXR_FETCH_INTERVAL` check loop. The run
+reference is compared before downloading, so an already-complete model run is
+not fetched again; model publication cadence remains the upstream IFS cadence,
+independent of the ten-minute check cadence.
+
+The 1801 × 3600 regular global grid stores five two-byte native components by
+default, or 61.8 MiB per valid time. An hourly 48-hour window is approximately
+3.0 GiB for one run. LibreWXR retains the active and previous complete runs
+(approximately 6.0 GiB) and may need up to approximately 9 GiB while staging a
+new run. Precipitation, radar, satellite, nowcast, and tile caches are extra.
+Actual use follows the upstream valid-time list and configured field/timestep
+caps; `/health` exposes `field_bytes` for the active run.
+
+Every field array is written to a `.tmp`, flushed, size-checked, and atomically
+renamed. The active manifest and frame mapping are replaced only after the
+entire configured generation succeeds. A missing/corrupt new run leaves the
+last-known-good generation active and sets `stale` / `last_update_error` in
+health. In multi mode only the pipeline downloads; render-only workers reopen
+the snapshot's memmaps read-only and never contact the model upstream.
+
+Weather metadata uses a 60-second public cache lifetime. Timestamped tiles use
+ETags and a six-hour public lifetime. A later model run can revise a forecast
+for the same valid timestamp, so CDNs should honour origin TTL and conditional
+revalidation rather than pinning a URL forever.
 
 ---
 

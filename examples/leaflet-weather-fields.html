@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LibreWXR Global Weather Fields</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        html, body, #map { height: 100%; margin: 0; }
+        body { font: 14px system-ui, sans-serif; }
+        .controls, .legend {
+            background: rgba(255, 255, 255, 0.94);
+            border-radius: 6px;
+            box-shadow: 0 1px 5px rgba(0, 0, 0, 0.35);
+            padding: 10px;
+        }
+        .controls { display: grid; gap: 8px; min-width: 250px; }
+        .controls label { display: grid; gap: 3px; }
+        .controls select { width: 100%; }
+        .status { color: #555; font-size: 12px; }
+        .legend { min-width: 260px; }
+        .legend-title { font-weight: 650; margin-bottom: 6px; }
+        .legend-bar { height: 14px; border-radius: 3px; }
+        .legend-labels {
+            display: flex;
+            font-size: 11px;
+            justify-content: space-between;
+            margin-top: 3px;
+        }
+    </style>
+</head>
+<body>
+<div id="map"></div>
+<script>
+    // Override without editing the file: ?api=https://your-librewxr.example
+    const API = new URLSearchParams(location.search).get("api") ||
+        "http://localhost:8080";
+    const map = L.map("map").setView([30, 0], 3);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap contributors"
+    }).addTo(map);
+
+    const controls = L.control({position: "topright"});
+    controls.onAdd = () => {
+        const root = L.DomUtil.create("div", "controls");
+        root.innerHTML = `
+            <label>Field <select class="field"></select></label>
+            <label>Valid time <select class="time"></select></label>
+            <div class="status">Loading metadata…</div>`;
+        L.DomEvent.disableClickPropagation(root);
+        return root;
+    };
+    controls.addTo(map);
+
+    const legend = L.control({position: "bottomright"});
+    legend.onAdd = () => L.DomUtil.create("div", "legend");
+    legend.addTo(map);
+
+    let metadata;
+    let layer;
+    const fieldSelect = controls.getContainer().querySelector(".field");
+    const timeSelect = controls.getContainer().querySelector(".time");
+    const status = controls.getContainer().querySelector(".status");
+
+    function option(value, label) {
+        const item = document.createElement("option");
+        item.value = value;
+        item.textContent = label;
+        return item;
+    }
+
+    function renderLegend(palette) {
+        const root = legend.getContainer();
+        root.replaceChildren();
+        const title = document.createElement("div");
+        title.className = "legend-title";
+        title.textContent = `${palette.display_name} (${palette.unit})`;
+        const bar = document.createElement("div");
+        bar.className = "legend-bar";
+        const first = palette.stops[0].value;
+        const last = palette.stops[palette.stops.length - 1].value;
+        const stops = palette.stops.map(stop => {
+            const position = 100 * (stop.value - first) / (last - first);
+            return `${stop.color} ${position}%`;
+        });
+        bar.style.background = `linear-gradient(to right, ${stops.join(", ")})`;
+        const labels = document.createElement("div");
+        labels.className = "legend-labels";
+        for (const stop of palette.stops) {
+            const label = document.createElement("span");
+            label.textContent = stop.value;
+            labels.append(label);
+        }
+        root.append(title, bar, labels);
+    }
+
+    function renderSelection() {
+        const field = metadata.fields.find(item => item.id === fieldSelect.value);
+        const paletteId = field.palette_ids[0];
+        const palette = metadata.palettes.find(item => item.id === paletteId);
+        const timestamp = Number(timeSelect.value);
+        const url = metadata.tile_url_template
+            .replace("{field}", field.id)
+            .replace("{timestamp}", String(timestamp))
+            .replace("{size}", "256")
+            .replace("{palette}", palette.id)
+            .replace("{ext}", "png");
+
+        if (layer) map.removeLayer(layer);
+        layer = L.tileLayer(url, {
+            tileSize: 256,
+            minZoom: metadata.min_zoom,
+            maxZoom: metadata.max_zoom,
+            opacity: 0.72,
+            attribution: metadata.attribution
+        }).addTo(map);
+        renderLegend(palette);
+        const stale = metadata.stale ? " — stale last-known-good run" : "";
+        status.textContent = `Run ${metadata.active_model_run || "unknown"}${stale}`;
+    }
+
+    async function start() {
+        const response = await fetch(`${API}/v2/weather/metadata.json`);
+        if (!response.ok) throw new Error(`metadata HTTP ${response.status}`);
+        metadata = await response.json();
+        if (!metadata.fields.length || !metadata.available_timestamps.length) {
+            throw new Error("global weather fields are not available");
+        }
+
+        for (const field of metadata.fields) {
+            fieldSelect.append(option(field.id, `${field.display_name} (${field.unit})`));
+        }
+        const defaultIndex = metadata.available_timestamps.indexOf(
+            metadata.default_timestamp
+        );
+        for (const timestamp of metadata.available_timestamps) {
+            timeSelect.append(option(
+                timestamp,
+                new Date(timestamp * 1000).toISOString().replace(".000Z", "Z")
+            ));
+        }
+        fieldSelect.value = metadata.fields.some(item => item.id === "temperature_2m")
+            ? "temperature_2m" : metadata.fields[0].id;
+        timeSelect.selectedIndex = defaultIndex >= 0 ? defaultIndex : 0;
+        fieldSelect.addEventListener("change", renderSelection);
+        timeSelect.addEventListener("change", renderSelection);
+        renderSelection();
+    }
+
+    start().catch(error => {
+        status.textContent = `Could not load weather layers: ${error.message}`;
+        console.error(error);
+    });
+</script>
+</body>
+</html>

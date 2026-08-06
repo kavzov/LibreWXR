@@ -235,11 +235,48 @@ Your `*Grid` class must satisfy the `NWPSource` Protocol in `data/nwp_source.py`
 
 - `name: str` (used in logs)
 - `sample(lat, lon, timestamp, bilinear) -> uint8 dBZ-encoded ndarray`
+- `available_fields() -> frozenset[WeatherField]`
+- `has_field(field) -> bool`
+- `sample_field(field, lat, lon, timestamp, bilinear) -> float32 ndarray` in
+  the canonical physical unit, with missing values represented by `NaN`
 - `supports_snow: bool` and `get_snow_mask(lat, lon, timestamp) -> bool ndarray`
 - `domain_mask(lat, lon) -> bool ndarray` — where the grid has coverage
 - `feather_mask(lat, lon) -> float32 ndarray in [0, 1]` — soft taper at the boundary
 - `has_data_at(timestamp) -> bool` / `has_data() -> bool`
 - `async close() -> None`
+
+Existing and new precipitation-only regional sources do **not** need to
+implement temperature, pressure, or wind. They should advertise only
+`WeatherField.PRECIPITATION`; the chain skips them for unrelated fields and
+continues to the global IFS catch-all. Keep `sample()` as the legacy
+radar-compatible precipitation path because radar rendering and nowcast depend
+on its exact uint8 dBZ semantics.
+
+When a source does provide continuous fields, use the central registry in
+`data/weather_fields.py` for IDs, units, dtype/scale metadata, interpolation
+rules, and derived dependencies. Do not copy scale/offset constants into the
+source. `sample_field()` always returns decoded physical values:
+
+| Field | Canonical unit |
+|---|---|
+| `TEMPERATURE_2M`, `DEWPOINT_2M` | °C |
+| `RELATIVE_HUMIDITY_2M` | % |
+| `PRESSURE_MSL` | hPa |
+| `WIND_U_10M`, `WIND_V_10M`, `WIND_SPEED_10M` | m/s |
+
+If valid-time availability differs by field, also implement
+`has_field_at(field, timestamp)`. `NWPChain.sample_field()` participates only
+when both field and timestamp are available, blends continuous fields in
+physical units using the existing priority/feather order, ignores nodata, and
+uses hard selection for categorical fields. A regular global grid can expose
+`sample_tile_field(...)` and a stable `grid_version` so the shared sampling
+plan cache can reuse indexes across fields and valid times without retaining
+memmap references.
+
+Derived relative humidity and wind speed should normally be calculated after
+sampling their dependencies, not stored as full grids. See `ECMWFGrid`,
+`FieldSpec`, and `tests/test_weather_sampling.py` for the reference
+implementation and boundary/fallback tests.
 
 For the shared `compute_snow_mask` helper (used by every regional NWP that supports snow), import from HRRR:
 
@@ -390,6 +427,10 @@ Before opening a PR:
 - [ ] `regions.py` (radar) defines `REGIONS` and `REGION_GROUP`.
 - [ ] `stations.py` (radar) defines `STATION_MAP` and (optionally) `RANGE_OVERRIDES`.
 - [ ] New config knobs added to `config.py` and `.env.example`, defaulting to enabled.
+- [ ] `available_fields()` accurately lists only fields the source can sample;
+      precipitation-only sources remain valid.
+- [ ] Generic fields return canonical physical units and `NaN` for nodata;
+      field availability, feather blending, and fallback have tests.
 - [ ] License + attribution documented in the package's `README.md` (every existing source has one — copy the shape).
 - [ ] `scripts/generate_coverage_map.py` updated; both coverage PNGs regenerated.
 - [ ] `pytest` clean.

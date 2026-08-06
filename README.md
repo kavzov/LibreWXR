@@ -23,6 +23,7 @@ Beyond this though, is the goal of creating a far more customizable API backend 
 - **Regional NWP chain** — high-resolution rapid-refresh NWP models layered specificity-first: NOAA HRRR (CONUS + Alaska), ECCC HRDPS (Canada + N. CONUS), DMI HARMONIE-AROME DINI (most of populated Europe), DWD ICON-EU (the European remainder), JMA MSM (Japan + Korean Peninsula + Taiwan + Yellow Sea), SMN WRF-DET (Argentina + S. American Cone), and the full Météo-France AROME Outre-Mer family (Antilles, Guyane, Indien, Nouvelle-Calédonie, Polynésie), all on top of ECMWF IFS for global coverage. Soft-feathering at each domain edge prevents visible seams
 - **Modular toggles** — every radar source, regional NWP, satellite channel, and the alerts feed has its own enable flag; master switches (`LIBREWXR_RADAR_ENABLED`, `LIBREWXR_REGIONAL_NWP_ENABLED`, `LIBREWXR_SATELLITE_ENABLED`) collapse whole layers in one line for satellite-only or nowcast-only deployments
 - **ECMWF IFS global coverage** — ECMWF IFS 9 km precipitation data provides global precipitation animation and powers the nowcast everywhere the regional NWP chain doesn't reach. Multi-timestep animation auto-scales to match radar history length
+- **Global weather map layers** — temperature, dew point, relative humidity, mean sea-level pressure, and 10 m wind speed are available worldwide through a separate `/v2/weather/...` metadata/tile API. Native IFS fields are atomically published as compact memmaps, continuously interpolated in space/time, and retained as last-known-good data through upstream outages
 - **Optical flow interpolation** — hourly ECMWF IFS frames are interpolated to 10-minute steps using dense motion vectors, so global IFS coverage animates smoothly like real radar data instead of jumping hour-to-hour (configurable, enabled by default)
 - **Precipitation nowcasting (experimental)** — 60-minute short-range forecast by extrapolating recent radar forward using optical flow, with configurable blend mode: smooth radar-to-model blending (default), pure radar extrapolation (closest to Rain Viewer), or pure NWP forecast. The model side is taken from the active NWP chain — HRRR over CONUS, ICON-EU/DINI over Europe, WRF-SMN over the S. American Cone, JMA MSM over Japan + adjacent East Asia, IFS elsewhere. Beyond 60 minutes, always uses pure model. Quality varies by weather pattern — works best for steady, organized precipitation; less reliable for fast-developing convection
 - **Precipitation motion arrows** — optional Dark Sky-style arrows showing storm movement direction and speed, derived from optical flow. Available for both radar and ECMWF data globally. Supports light and dark styles for different map themes via `?arrows=light` or `?arrows=dark` query parameter
@@ -45,6 +46,7 @@ Beyond this though, is the goal of creating a far more customizable API backend 
 - **Limited radar coverage outside US / Canada / Europe / Central America / Taiwan / Japan / SE Asia** — real radar composites cover the US (CONUS, Alaska, Hawaii, Puerto Rico, Guam), Canada, El Salvador and its neighbours, Europe (via OPERA pan-European composite + DPC for Italy), Taiwan (CWA QPESUMS), Japan (JMA HRPN), and Malaysia + Borneo + Brunei + Singapore + N. Sumatra (MET Malaysia). Everywhere else uses the regional NWP chain on top of ECMWF IFS for the precipitation layer — that's a complete picture of global precipitation, but it's modelled output, not direct radar observation
 - **Experimental nowcasting** — precipitation nowcast uses optical flow extrapolation blended with whichever regional model is active in the active NWP chain (or ECMWF IFS where none is), which works well for steady, organized precipitation but is less reliable for fast-developing convection, cell initiation/dissipation, or complex terrain effects
 - **Satellite is hourly, not real-time** — GMGSI publishes one composite per hour with ~35 minutes of latency from observation. Native per-satellite feeds (GOES, Himawari, Meteosat) refresh every 5–15 minutes, but at the cost of seam-blending and reprojection work that GMGSI handles upstream. GMGSI also caps at ±72.7° latitude — the deep polar regions are out of frame
+- **Global scalar layers are model data** — temperature, humidity, pressure, and wind tiles come from roughly 9 km ECMWF IFS output regridded to 0.1°. They are not station observations, and higher map zoom does not add meteorological resolution
 
 ## Coverage
 
@@ -299,6 +301,43 @@ Returns available radar timestamps and the host URL, matching Rain Viewer's resp
 }
 ```
 
+Global scalar layers deliberately do not add fields to this response. Existing
+Rain Viewer clients continue to receive the same schema; use the separate
+endpoint below for model weather maps.
+
+#### Global Weather Map Layers (LibreWXR extension)
+
+```text
+GET /v2/weather/metadata.json
+GET /v2/weather/{field}/{timestamp}/{size}/{z}/{x}/{y}/{palette}.{ext}
+```
+
+The metadata response advertises the active IFS run, stale status, attribution,
+available timestamps, fields, units, palettes, legend stops, tile sizes,
+formats, and the complete tile URL template. Public fields are:
+
+| Field | Unit | Palette |
+|---|---|---|
+| `temperature_2m` | °C | `temperature` |
+| `dewpoint_2m` | °C | `dewpoint` |
+| `relative_humidity_2m` | % | `humidity` |
+| `pressure_msl` | hPa | `pressure` |
+| `wind_speed_10m` | m/s | `wind_speed` |
+
+Example:
+
+```text
+http://localhost:8080/v2/weather/temperature_2m/1785996000/256/4/8/5/temperature.png
+```
+
+These are ECMWF IFS model fields delivered through Open-Meteo bulk data, not
+observations. Display the metadata attribution (`ECMWF IFS data via
+Open-Meteo`) and construct legends from `palettes[].stops`. See
+[Global weather map layers](docs/global-weather-fields.md) for the full API,
+storage sizing, stale behaviour, deployment guidance, precision limits, and
+CDN recommendations. A minimal Leaflet client is available at
+[`examples/leaflet-weather-fields.html`](examples/leaflet-weather-fields.html).
+
 #### Radar Tiles
 
 ```
@@ -465,6 +504,13 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_JMA_MSM_ENABLED` | `true` | JMA Mesoscale Model (Japan + Korean Peninsula + Taiwan) |
 | `LIBREWXR_ECMWF_ENABLED` | `true` | ECMWF IFS global precipitation (disable for regional-only debugging) |
 | `LIBREWXR_NWP_FETCH_CONCURRENCY` | `4` | Max parallel NWP grid fetches per cycle |
+| **Global weather maps** | | |
+| `LIBREWXR_WEATHER_FIELDS_ENABLED` | `true` | Enable the separate global scalar-field store and `/v2/weather/...` API |
+| `LIBREWXR_WEATHER_FIELDS_FIELDS` | `temperature_2m,dewpoint_2m,relative_humidity_2m,pressure_msl,wind_speed_10m` | Public/native fields to retain; derived fields automatically add dependencies |
+| `LIBREWXR_WEATHER_FIELDS_FORECAST_HOURS` | `48` | Forecast horizon, independent of radar history |
+| `LIBREWXR_WEATHER_FIELDS_MAX_TIMESTEPS` | `0` | Optional valid-time cap; 0 keeps all published times in the horizon |
+| `LIBREWXR_WEATHER_PNG_MODE` | `quantized` | `quantized` or full-RGBA `lossless` weather PNGs |
+| `LIBREWXR_NATIVE_RENDER` | `auto` | Optional sampling backend: `auto`, `on`, or `off` |
 | **Nowcast** | | |
 | `LIBREWXR_NOWCAST_ENABLED` | `true` | Enable experimental precipitation nowcast |
 | `LIBREWXR_NOWCAST_FRAMES` | `6` | Number of nowcast frames (6 × 10 min = 60 min forecast) |
@@ -704,6 +750,16 @@ Layered ahead of IFS via specificity-first dispatch (see the [Regional NWP chain
 
 - **[ECMWF IFS](https://www.ecmwf.int/)** via [Open-Meteo](https://open-meteo.com/) — ECMWF IFS 9 km global precipitation and snowfall. Marshall-Palmer Z-R conversion with snow/rain classification from snowfall ratio. Hourly frames optical-flow-interpolated to 10-min steps. The global base layer for precipitation animation and nowcast extrapolation outside the regional NWP chain. Licensed [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/); data provided by Open-Meteo.com.
 
+### Global scalar weather fields
+
+- **ECMWF IFS via Open-Meteo bulk `.om` files** — 2 m temperature
+  (`temperature_2m`), 2 m dew point (`dew_point_2m`), mean sea-level pressure
+  (`pressure_msl`), and 10 m wind components (`wind_u_component_10m`,
+  `wind_v_component_10m`). LibreWXR derives relative humidity and wind speed
+  after sampling. Runs are staged atomically and the last complete run remains
+  available during upstream outages. Attribution: ECMWF IFS data via
+  Open-Meteo.
+
 ### Satellite
 
 - **[NOAA GMGSI](https://registry.opendata.aws/noaa-gmgsi/)** — Global Mosaic of Geostationary Satellite Imagery, composited by NESDIS from GOES-East, GOES-West, Meteosat-9, Meteosat-10, and Himawari-9. Ingested as longwave IR + visible channels and rendered as a VIS-over-LW composite with natural day/night terminator. Anonymous AWS Open Data; hourly cadence; ±72.7° latitude coverage. Persistent disk cache survives restarts.
@@ -714,12 +770,13 @@ Layered ahead of IFS via specificity-first dispatch (see the [Regional NWP chain
 
 ## Examples
 
-The `examples/` directory contains two self-contained HTML files showcasing the full LibreWXR feature set:
+The `examples/` directory contains self-contained HTML files showcasing the LibreWXR APIs:
 
 - **`leaflet.html`** — Leaflet-based weather map
 - **`maplibre.html`** — MapLibre GL JS-based weather map
+- **`leaflet-weather-fields.html`** — minimal global temperature/humidity/pressure client with metadata-driven timestamps and legend
 
-Both examples include:
+The two full radar/satellite examples include:
 - **Source selector** — switch between local (`localhost:8080`) and the public instance (`api.librewxr.net`) with auto-detection
 - **Layer modes** — Radar, Satellite, or Radar + Satellite (satellite as background under radar)
 - **Light/dark theme** — toggles both the base map and UI styling

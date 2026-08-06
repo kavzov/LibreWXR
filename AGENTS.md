@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-LibreWRX is a self-hostable Rain Viewer API replacement. It fetches radar composites from public sources, composites them into map tiles, and serves a Rain Viewer-compatible JSON/tile API. Python + FastAPI, no GDAL dependency.
+LibreWRX is a self-hostable Rain Viewer API replacement. It fetches radar composites from public sources, composites them into map tiles, and serves a Rain Viewer-compatible JSON/tile API plus separate global ECMWF scalar-field tiles. Python + FastAPI, no GDAL dependency.
 
 - **License:** AGPL-3.0-or-later
 - **Python:** >=3.11 (Docker uses 3.12)
@@ -79,6 +79,8 @@ src/librewxr/
     coverage.py      # Radar station coverage masks (parameter-driven)
     nowcast.py       # Nowcast generation (radar extrapolation + IFS blend)
     nwp_source.py    # NWPSource Protocol + NWPChain dispatcher
+    weather_fields.py  # Field registry, storage codecs, units, derived fields
+    weather_sampling.py # Cacheable regular-grid SamplingPlan geometry
     nwp_interpolation.py  # Shared optical-flow helper for regional NWP
     radar_cache.py   # Persistent disk cache for radar frames
     alerts_fetcher.py / alerts_store.py   # WMO weather alerts
@@ -88,11 +90,15 @@ src/librewxr/
     renderer.py      # On-demand tile rendering (compute / present split)
     satellite_renderer.py  # GMGSI VIS-over-LW composite tiles
     cache.py         # Byte-capped LRU tile cache (stores TileGeometry)
+    weather_renderer.py  # Scalar field sample → palette LUT → PNG/WebP
     coordinates.py   # Tile/region coordinate transforms
     warmer.py        # Background tile pre-rendering
     request_tracker.py  # Hot-tile counters for /health diagnostics
   colors/
     schemes.py       # Color scheme definitions
+    weather_palettes.py # Stable scalar palette/legend registry + prebuilt LUTs
+  native_weather.py  # Optional PyO3 sampling boundary + strict NumPy fallback
+native/              # Separately-built optional abi3 PyO3/maturin crate
 ```
 
 ## Deployment Modes
@@ -111,6 +117,10 @@ Docker Compose uses profiles: `COMPOSE_PROFILES=single` or `COMPOSE_PROFILES=mul
 - **Auto-discovery:** `sources/__init__.py` walks the `sources/` tree and registers radar/NWP/satellite providers automatically. Adding a source requires no changes to `fetcher.py`, `routes.py`, or `main.py`.
 - **Shared state wiring:** Lifespan functions in `main.py` create all singletons and assign them to `routes` module-level vars — dependencies are NOT injected via FastAPI's DI. Two variants exist: `lifespan` (single mode + multi fetcher parent) and `_render_only_lifespan` (multi renderer workers; leaves fetch-side singletons as `None`). Key vars: `frame_store`, `tile_cache`, `nwp_grids` (dict by slug), `ecmwf_grid`, `nwp_chain`, `satellite_grids`, `nowcast_store`, `alerts_store`, `alerts_fetcher`, `tile_request_tracker`, `tile_warmer`, `radar_cache`, `radar_fetcher`, `enabled_regions`, `alerts_enabled`. (`tile_warmer` is `None` in multi-mode render workers — the warm path is single-mode only).
 - **NWP chain:** Priority-ordered sources: HRRR (10) → HRRR-Alaska (11) → HRDPS (20) → JMA MSM (20) → AROME Antilles (25) → AROME Guyane (26) → AROME Indien (27) → AROME Ncaled (28) → AROME Polyn (29) → DMI DINI (30) → ICON-EU (35) → WRF-SMN (40) → IFS (1000, global catch-all). `NWPChain` dispatches narrowest-domain-first.
+- **Generic weather fields:** `WeatherField` / immutable `FieldSpec` are the single source of truth for IDs, physical units, compact dtype/scale/nodata, and interpolation. `NWPChain.sample()` remains the legacy uint8 dBZ precipitation path; `sample_field()` blends continuous physical values only across sources that advertise the requested field/time. Current regional sources are precipitation-only for this interface, so IFS is the global scalar catch-all.
+- **Global weather API:** `/v2/weather/metadata.json` advertises fields, native valid times, palettes/legend stops, attribution, and a tile template. `/v2/weather/{field}/{timestamp}/{size}/{z}/{x}/{y}/{palette}.{ext}` serves temperature, dew point, relative humidity, MSL pressure, and 10 m wind speed. Do not add these fields to `/public/weather-maps.json`; its Rain Viewer schema is intentionally unchanged.
+- **IFS weather generations:** Open-Meteo `data_spatial/ecmwf_ifs` valid-time `.om` files contain `temperature_2m`, `dew_point_2m`, `pressure_msl`, `wind_u_component_10m`, and `wind_v_component_10m` beside precipitation. Each encoded field has its own versioned memmap under a run directory. A complete run is staged and atomically published through `active.json`; active + previous runs are retained, and stale last-known-good data remains served after an upstream failure.
+- **Weather sampling:** A timestamp-independent `SamplingPlan` caches regular-grid indexes/weights by grid identity/version and tile geometry, never memmap references. Spatial samples from frame A/B are temporally interpolated only at requested tile points; humidity and wind speed are derived afterwards. The optional `native/` PyO3 crate fuses hot kernels, releases the GIL, and has no Rayon pool; `native_weather.py` always provides a NumPy fallback.
 - **Radar regions:** US (USCOMP, AKCOMP, HICOMP, PRCOMP, GUCOMP), Canada (CACOMP), Central America (SVCOMP), Europe (OPERA + ITCOMP — Italy via DPC, finer `pixel_size` so it precedes OPERA in the multi-region compositor), Japan (JPCOMP — JMA HRPN analysis leg), Taiwan (TWCOMP), SE Asia (MYPENINSULAR, MYEAST). Region groups: CONUS, US, CANADA, CENTRAL_AMERICA, EUROPE, JAPAN, SOUTHEAST_ASIA, TAIWAN, ALL.
 - **Data encoding:** Radar frames are `dict[str, np.ndarray]` keyed by region name, stored as uint8 dBZ values.
 - **Tile rendering:** Compute / present split — `compute_tile_geometry` does the expensive work (region sampling, multi-region compositing, NWP fill/blend, noise-floor masking, optional snow mask) and returns a `TileGeometry` dataclass. `present_tile` does the cheap per-request tail (LUT colorize, Gaussian blur, optional motion-arrow overlay, encode). The `TileCache` stores `TileGeometry` records (not encoded bytes) so one cached entry serves every visual variant.
@@ -151,6 +161,11 @@ All config via `LIBREWXR_*` env vars or `.env` file. Settings defined in `src/li
 - `LIBREWXR_NA_NWP_SOURCE`: `ifs` (default) or `hrrr` — North American NWP source
 - `LIBREWXR_EU_NWP_PROFILE`: `ifs`, `icon_eu_only`, or `dini_with_icon_eu` — European NWP profile
 - `LIBREWXR_ECMWF_ENABLED`: disable IFS global precipitation (debug use)
+- `LIBREWXR_WEATHER_FIELDS_ENABLED`: global scalar store/API toggle (independent of IFS precipitation)
+- `LIBREWXR_WEATHER_FIELDS_FIELDS`: selected public/native fields; derived fields expand dependencies
+- `LIBREWXR_WEATHER_FIELDS_FORECAST_HOURS` / `LIBREWXR_WEATHER_FIELDS_MAX_TIMESTEPS`: independent native-valid-time window/cap
+- `LIBREWXR_WEATHER_PNG_MODE` / `LIBREWXR_WEATHER_PNG_COLORS` / `LIBREWXR_WEATHER_PNG_DITHER`: scalar PNG encoding
+- `LIBREWXR_NATIVE_RENDER`: `auto`, `on`, or `off` for the separately-installed native sampling wheel
 
 **Satellite:**
 - `LIBREWXR_SATELLITE_ENABLED`: master toggle for GMGSI satellite layer
