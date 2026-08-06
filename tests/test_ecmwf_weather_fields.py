@@ -312,6 +312,25 @@ def test_state_roundtrip_reopens_every_field_read_only(loaded_grid, tmp_path):
     assert all(values.mode == "r" for values in frame.fields.values())
 
 
+def test_state_descriptor_preserves_run_path_through_cache_symlink(tmp_path):
+    real_cache = tmp_path / "real-cache"
+    real_cache.mkdir()
+    linked_cache = tmp_path / "linked-cache"
+    linked_cache.symlink_to(real_cache, target_is_directory=True)
+    grid = ECMWFGrid(cache_dir=linked_cache)
+    run_file = (
+        real_cache
+        / "ecmwf_ifs"
+        / "runs"
+        / "20260806T060000Z"
+        / "temperature_2m.dat"
+    )
+
+    assert grid._relative_memmap_name(run_file) == (
+        "runs/20260806T060000Z/temperature_2m.dat"
+    )
+
+
 def test_legacy_snapshot_is_backward_compatible(tmp_path):
     producer = ECMWFGrid(cache_dir=tmp_path)
     timestamp = 1700000000

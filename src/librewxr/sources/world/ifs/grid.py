@@ -302,12 +302,26 @@ class ECMWFGrid:
             for values in arrays:
                 filename = getattr(values, "filename", None)
                 if filename is not None:
-                    path = Path(str(filename))
-                    try:
-                        names.add(path.relative_to(self._memmap_dir).as_posix())
-                    except ValueError:
-                        names.add(path.name)
+                    names.add(self._relative_memmap_name(filename))
         return names
+
+    def _relative_memmap_name(self, filename: str | Path) -> str:
+        """Return a stable descriptor through cache-directory symlinks.
+
+        NumPy canonicalises ``memmap.filename`` on some platforms (notably
+        macOS), while ``LIBREWXR_CACHE_DIR`` may retain a symlink such as
+        ``/tmp`` → ``/private/tmp``. Resolve both sides before computing the
+        relative name so versioned ``runs/<run>/...`` descriptors do not
+        collapse to a basename that cannot be reopened after restart.
+        """
+
+        path = Path(str(filename))
+        try:
+            return path.resolve().relative_to(
+                self._memmap_dir.resolve()
+            ).as_posix()
+        except (OSError, ValueError):
+            return path.name
 
     @staticmethod
     def _stored_array_valid(values: np.ndarray) -> bool:
@@ -1464,13 +1478,8 @@ class ECMWFGrid:
         }
 
     def _descriptor(self, values: np.ndarray) -> list:
-        path = Path(str(values.filename))
-        try:
-            filename = path.relative_to(self._memmap_dir).as_posix()
-        except ValueError:
-            filename = path.name
         return [
-            filename,
+            self._relative_memmap_name(values.filename),
             values.dtype.str,
             list(values.shape),
         ]
