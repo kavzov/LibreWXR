@@ -109,6 +109,7 @@ class ECMWFGrid:
     """
 
     name = "ecmwf_ifs"
+    global_catch_all = True
 
     def __init__(
         self,
@@ -1208,32 +1209,65 @@ class ECMWFGrid:
                 np.float32, copy=False
             )
 
-        values = np.stack(
-            [
-                decode_field(field, encoded[plan.r0, plan.c0]),
-                decode_field(field, encoded[plan.r0, plan.c1]),
-                decode_field(field, encoded[plan.r1, plan.c0]),
-                decode_field(field, encoded[plan.r1, plan.c1]),
-            ]
+        samples = (
+            encoded[plan.r0, plan.c0],
+            encoded[plan.r0, plan.c1],
+            encoded[plan.r1, plan.c0],
+            encoded[plan.r1, plan.c1],
         )
-        weights = np.stack(
-            [
-                (1.0 - plan.dr) * (1.0 - plan.dc),
-                (1.0 - plan.dr) * plan.dc,
-                plan.dr * (1.0 - plan.dc),
-                plan.dr * plan.dc,
-            ]
-        ).astype(np.float32)
-        valid = np.isfinite(values)
-        weight_sum = np.sum(np.where(valid, weights, 0.0), axis=0)
-        weighted = np.sum(np.where(valid, values * weights, 0.0), axis=0)
-        result = np.divide(
-            weighted,
-            weight_sum,
-            out=np.full(plan.shape, np.nan, dtype=np.float32),
-            where=(weight_sum > 0.0) & plan.valid,
-        ).astype(np.float32, copy=False)
-        result[~plan.valid] = np.nan
+        spec = field_spec(field)
+        has_nodata = spec.nodata is not None and any(
+            np.any(sample == spec.nodata) for sample in samples
+        )
+
+        if not has_nodata:
+            # Interpolation commutes with the field's affine decode. Work in
+            # encoded space and reuse two float32 buffers instead of stacking
+            # four decoded values, four weights, and four validity masks.
+            top = samples[0].astype(np.float32)
+            scratch = samples[1].astype(np.float32)
+            scratch -= top
+            scratch *= plan.dc
+            top += scratch
+
+            bottom = samples[2].astype(np.float32)
+            scratch = samples[3].astype(np.float32)
+            scratch -= bottom
+            scratch *= plan.dc
+            bottom += scratch
+            bottom -= top
+            bottom *= plan.dr
+            top += bottom
+            top *= np.float32(spec.scale)
+            top += np.float32(spec.offset)
+            top[~plan.valid] = np.nan
+            return top
+
+        # Rare nodata path: accumulate only valid neighbours without stack or
+        # full-size np.where temporaries. The weighted encoded mean can still
+        # be decoded once because every field codec is affine.
+        weighted = np.zeros(plan.shape, dtype=np.float32)
+        weight_sum = np.zeros(plan.shape, dtype=np.float32)
+        scratch = np.empty(plan.shape, dtype=np.float32)
+        one_minus_dr = np.subtract(np.float32(1.0), plan.dr)
+        one_minus_dc = np.subtract(np.float32(1.0), plan.dc)
+        weights = (
+            one_minus_dr * one_minus_dc,
+            one_minus_dr * plan.dc,
+            plan.dr * one_minus_dc,
+            plan.dr * plan.dc,
+        )
+        for sample, weight in zip(samples, weights, strict=True):
+            valid = sample != spec.nodata
+            scratch.fill(0.0)
+            np.multiply(sample, weight, out=scratch, where=valid)
+            weighted += scratch
+            np.add(weight_sum, weight, out=weight_sum, where=valid)
+        result = np.full(plan.shape, np.nan, dtype=np.float32)
+        valid_result = (weight_sum > 0.0) & plan.valid
+        np.divide(weighted, weight_sum, out=result, where=valid_result)
+        result *= np.float32(spec.scale)
+        result[valid_result] += np.float32(spec.offset)
         return result
 
     def _sample_field_with_plan(
@@ -1290,6 +1324,11 @@ class ECMWFGrid:
             frames[after], field, plan, bilinear
         )
         fraction = np.float32((timestamp - before) / (after - before))
+        if np.isfinite(before_values).all() and np.isfinite(after_values).all():
+            after_values -= before_values
+            after_values *= fraction
+            before_values += after_values
+            return before_values
         valid_before = np.isfinite(before_values)
         valid_after = np.isfinite(after_values)
         result = np.full(plan.shape, np.nan, dtype=np.float32)

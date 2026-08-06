@@ -255,10 +255,49 @@ class NWPChain:
         cached spatial plan. Other sources keep using coordinate-array sampling.
         """
 
+        normalized = WeatherField(field)
+        # Continuous public fields currently resolve to IFS alone. Let an
+        # explicitly global source consume the tile key directly so its cached
+        # SamplingPlan can be reused without first materialising duplicate
+        # lat/lon, feather, weight, and derived-dependency rasters in the chain.
+        # The normal chain path remains in force as soon as a regional source
+        # participates in this field.
+        participants = [
+            source
+            for source in self._sources
+            if self._source_has_field(source, normalized)
+            and self._source_has_data(source, normalized, timestamp)
+        ]
+        if len(participants) == 1 and getattr(
+            participants[0], "global_catch_all", False
+        ):
+            tile_sampler = getattr(participants[0], "sample_tile_field", None)
+            if tile_sampler is not None:
+                sampled = np.asarray(
+                    tile_sampler(
+                        normalized,
+                        z,
+                        x,
+                        y,
+                        timestamp,
+                        tile_size,
+                        padding,
+                        bilinear,
+                    ),
+                    dtype=np.float32,
+                )
+                expected = (tile_size + 2 * padding, tile_size + 2 * padding)
+                if sampled.shape != expected:
+                    raise ValueError(
+                        f"{participants[0].name} returned tile shape "
+                        f"{sampled.shape}, expected {expected}"
+                    )
+                return sampled
+
         lat, lon = web_mercator_tile_latlons(z, x, y, tile_size, padding)
         context = _TileSamplingContext(z, x, y, tile_size, padding)
         return self._sample_field(
-            WeatherField(field),
+            normalized,
             lat,
             lon,
             timestamp,

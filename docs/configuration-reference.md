@@ -658,6 +658,39 @@ restart or upstream outage.
 Disk-constrained installations that only use the Rain Viewer-compatible API
 can set this to `false`.
 
+### `LIBREWXR_WEATHER_PNG_MODE`
+
+Encoding mode for scalar weather PNG tiles. Tiles containing at most 256 exact
+RGBA colours always retain the lossless PNG8 path. For more complex tiles,
+`quantized` creates a deterministic palette PNG while `lossless` preserves the
+full RGBA raster. Quantization uses libimagequant when Pillow provides it and
+falls back to FASTOCTREE otherwise. No external optimizer runs on requests.
+
+| | |
+|---|---|
+| **Default** | `quantized` |
+| **Values** | `lossless`, `quantized` |
+
+### `LIBREWXR_WEATHER_PNG_COLORS`
+
+Maximum palette size for quantized weather PNGs.
+
+| | |
+|---|---|
+| **Default** | `256` |
+| **Range** | `2`–`256` |
+
+### `LIBREWXR_WEATHER_PNG_DITHER`
+
+Enable Floyd–Steinberg dithering for quantized weather PNGs. Disabled by
+default for deterministic smooth fields, better compression, and lower request
+cost.
+
+| | |
+|---|---|
+| **Default** | `false` |
+| **Type** | boolean |
+
 ### `LIBREWXR_WEATHER_FIELDS_FIELDS`
 
 Comma-separated scalar fields to retain. Public derived fields automatically

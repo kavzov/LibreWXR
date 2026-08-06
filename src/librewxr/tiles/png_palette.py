@@ -16,7 +16,7 @@ are negligible next to the pixel counting work.
 import io
 
 import numpy as np
-from PIL import Image
+from PIL import Image, features
 
 # Minimum unique colors before the palette path is worth taking.  Pillow
 # does NOT pad a hand-supplied palette — measured with Pillow 12.3.0: the
@@ -28,7 +28,56 @@ from PIL import Image
 _PALETTE_MIN_COLORS = 2
 
 
-def encode_png(img: Image.Image) -> bytes:
+def _quantize_rgba(
+    img: Image.Image,
+    *,
+    colors: int,
+    dither: bool,
+) -> Image.Image:
+    """Return a deterministic RGBA-aware palette image.
+
+    libimagequant gives the best result when the Pillow build provides it.
+    FASTOCTREE is Pillow's RGBA-capable built-in fallback. Fully transparent
+    input pixels receive a dedicated palette entry so quantization can never
+    turn nodata holes partially opaque.
+    """
+
+    method = (
+        Image.Quantize.LIBIMAGEQUANT
+        if features.check_feature("libimagequant")
+        else Image.Quantize.FASTOCTREE
+    )
+    dither_mode = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
+    rgba = np.asarray(img)
+    transparent = rgba[..., 3] == 0
+    has_transparent = bool(transparent.any())
+    quantized = img.quantize(
+        colors=colors - int(has_transparent),
+        method=method,
+        dither=dither_mode,
+    )
+    if not has_transparent:
+        return quantized
+
+    # Reserve index zero for exact transparency. The quantizer receives at
+    # most 255 colours in this branch, so shifting every generated index by
+    # one cannot overflow uint8.
+    indices = np.asarray(quantized, dtype=np.uint8).copy()
+    indices += np.uint8(1)
+    indices[transparent] = 0
+    result = Image.fromarray(indices, mode="P")
+    quantized_rgba = quantized.getpalette("RGBA")[: (colors - 1) * 4]
+    result.putpalette([0, 0, 0, 0, *quantized_rgba], rawmode="RGBA")
+    return result
+
+
+def encode_png(
+    img: Image.Image,
+    *,
+    quantize: bool = False,
+    colors: int = 256,
+    dither: bool = False,
+) -> bytes:
     """Encode an RGBA image as PNG, adaptively PNG8-palette or plain RGBA.
 
     Tiles with ``_PALETTE_MIN_COLORS``..256 unique RGBA colors use an
@@ -36,6 +85,23 @@ def encode_png(img: Image.Image) -> bytes:
     previous 32-bit RGBA encoding.  Output is byte-for-byte deterministic
     for identical input.
     """
+    if not 2 <= colors <= 256:
+        raise ValueError("PNG palette colors must be within [2, 256]")
+
+    # Pillow performs this bounded count in C. For complex tiles it avoids
+    # allocating the packed uint32 raster and full-size inverse array needed
+    # by the exact PNG8 path below.
+    color_count = img.getcolors(maxcolors=256)
+    if color_count is None:
+        if quantize:
+            out = _quantize_rgba(img, colors=colors, dither=dither)
+            buf = io.BytesIO()
+            out.save(buf, format="PNG", optimize=True, compress_level=6)
+            return buf.getvalue()
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=False, compress_level=6)
+        return buf.getvalue()
+
     arr = np.asarray(img)
     packed = (
         (arr[..., 0].astype(np.uint32) << 24)
@@ -60,8 +126,8 @@ def encode_png(img: Image.Image) -> bytes:
         buf = io.BytesIO()
         out.save(buf, format="PNG", optimize=True, compress_level=6)
         return buf.getvalue()
-    # 1 color, or more than 256 unique colors: plain 32-bit RGBA (the
-    # previous PNG encoding).  Level 6, not 1: Pillow wheels link the host
+    # A 1-color tile stays on the plain 32-bit RGBA path. Level 6, not 1:
+    # Pillow wheels link the host
     # libz (stock zlib on Debian, zlib-ng on Fedora) and the two diverge up
     # to ~4x in level-1 output size; level 6 converges and the palette path
     # already uses 6.

@@ -545,6 +545,15 @@ async def weather_field_tile(
         size,
         palette,
         ext,
+        (
+            settings.webp_quality
+            if ext == "webp"
+            else (
+                settings.weather_png_mode,
+                settings.weather_png_colors,
+                settings.weather_png_dither,
+            )
+        ),
         WEATHER_RENDERER_VERSION,
     )
     cached = tile_cache.get(cache_key) if tile_cache is not None else None

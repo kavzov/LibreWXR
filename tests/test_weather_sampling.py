@@ -11,6 +11,7 @@ from librewxr.data.nwp_source import NWPChain
 from librewxr.data.weather_fields import (
     WeatherField,
     WeatherFieldSourceMixin,
+    decode_field,
     encode_field,
 )
 from librewxr.data.weather_sampling import (
@@ -162,6 +163,36 @@ def test_bilinear_sampling_uses_four_cells(regular_global_grid):
     np.testing.assert_allclose(sampled, [10.0])
 
 
+def test_optimized_bilinear_path_matches_stacked_reference(
+    regular_global_grid,
+):
+    grid = regular_global_grid
+    plan = grid.sampling_plan(2, 1, 1, tile_size=23)
+    encoded = grid._timesteps[0].field(WeatherField.TEMPERATURE_2M)
+    values = np.stack([
+        decode_field(WeatherField.TEMPERATURE_2M, encoded[plan.r0, plan.c0]),
+        decode_field(WeatherField.TEMPERATURE_2M, encoded[plan.r0, plan.c1]),
+        decode_field(WeatherField.TEMPERATURE_2M, encoded[plan.r1, plan.c0]),
+        decode_field(WeatherField.TEMPERATURE_2M, encoded[plan.r1, plan.c1]),
+    ])
+    weights = np.stack([
+        (1.0 - plan.dr) * (1.0 - plan.dc),
+        (1.0 - plan.dr) * plan.dc,
+        plan.dr * (1.0 - plan.dc),
+        plan.dr * plan.dc,
+    ])
+    expected = np.sum(values * weights, axis=0)
+
+    actual = grid._sample_physical_frame(
+        grid._timesteps[0],
+        WeatherField.TEMPERATURE_2M,
+        plan,
+        True,
+    )
+
+    np.testing.assert_allclose(actual, expected, atol=1e-5)
+
+
 def test_temporal_interpolation_samples_before_interpolating(regular_global_grid):
     sampled = regular_global_grid.sample_field(
         WeatherField.TEMPERATURE_2M,
@@ -172,6 +203,46 @@ def test_temporal_interpolation_samples_before_interpolating(regular_global_grid
     )
 
     np.testing.assert_allclose(sampled, [15.0])
+
+
+def test_bilinear_sampling_renormalizes_around_encoded_nodata(
+    regular_global_grid,
+):
+    encoded = regular_global_grid._timesteps[0].field(
+        WeatherField.TEMPERATURE_2M
+    )
+    encoded[0, 0] = -32768
+
+    sampled = regular_global_grid.sample_field(
+        WeatherField.TEMPERATURE_2M,
+        np.array([45.0]),
+        np.array([-135.0]),
+        timestamp=0,
+        bilinear=True,
+    )
+
+    np.testing.assert_allclose(sampled, [40.0 / 3.0], atol=1e-5)
+
+
+def test_chain_delegates_directly_to_single_global_tile_sampler(
+    regular_global_grid,
+    monkeypatch,
+):
+    def unexpected_feather(*_args, **_kwargs):
+        raise AssertionError("global fast path must not build a feather raster")
+
+    monkeypatch.setattr(regular_global_grid, "feather_mask", unexpected_feather)
+    sampled = NWPChain([regular_global_grid]).sample_tile_field(
+        WeatherField.TEMPERATURE_2M,
+        1,
+        0,
+        0,
+        timestamp=1800,
+        tile_size=16,
+    )
+
+    assert sampled.shape == (16, 16)
+    assert np.isfinite(sampled).all()
 
 
 def test_sampling_plan_reused_across_fields_and_times(regular_global_grid):

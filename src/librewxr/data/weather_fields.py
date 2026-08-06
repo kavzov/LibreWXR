@@ -254,19 +254,23 @@ def relative_humidity_from_temperature_dewpoint(
     remain ``NaN``; finite results are constrained to the physical 0–100% range.
     """
 
-    temperature = np.asarray(temperature_c, dtype=np.float64)
-    dewpoint = np.asarray(dewpoint_c, dtype=np.float64)
+    temperature = np.asarray(temperature_c, dtype=np.float32)
+    dewpoint = np.asarray(dewpoint_c, dtype=np.float32)
     temperature, dewpoint = np.broadcast_arrays(temperature, dewpoint)
     valid = np.isfinite(temperature) & np.isfinite(dewpoint)
     with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-        exponent = (
-            17.625 * dewpoint / (243.04 + dewpoint)
-            - 17.625 * temperature / (243.04 + temperature)
-        )
-        humidity = 100.0 * np.exp(exponent)
-    humidity = np.clip(humidity, 0.0, 100.0)
-    humidity = np.where(valid, humidity, np.nan)
-    return humidity.astype(np.float32)
+        exponent = np.array(dewpoint, dtype=np.float32, copy=True)
+        exponent *= np.float32(17.625)
+        exponent /= np.float32(243.04) + dewpoint
+        temperature_term = np.array(temperature, dtype=np.float32, copy=True)
+        temperature_term *= np.float32(17.625)
+        temperature_term /= np.float32(243.04) + temperature
+        exponent -= temperature_term
+        np.exp(exponent, out=exponent)
+        exponent *= np.float32(100.0)
+    np.clip(exponent, 0.0, 100.0, out=exponent)
+    np.copyto(exponent, np.float32(np.nan), where=~valid)
+    return exponent.astype(np.float32, copy=False)
 
 
 def wind_speed_from_uv(
@@ -275,13 +279,12 @@ def wind_speed_from_uv(
 ) -> np.ndarray:
     """Return wind speed in the same units as eastward/northward components."""
 
-    u = np.asarray(wind_u, dtype=np.float64)
-    v = np.asarray(wind_v, dtype=np.float64)
+    u = np.asarray(wind_u, dtype=np.float32)
+    v = np.asarray(wind_v, dtype=np.float32)
     u, v = np.broadcast_arrays(u, v)
-    valid = np.isfinite(u) & np.isfinite(v)
-    speed = np.hypot(u, v)
-    speed = np.where(valid, speed, np.nan)
-    return speed.astype(np.float32)
+    speed = np.asarray(np.hypot(u, v), dtype=np.float32)
+    np.copyto(speed, np.float32(np.nan), where=~np.isfinite(speed))
+    return speed.astype(np.float32, copy=False)
 
 
 def wind_direction_from_uv(
