@@ -27,8 +27,10 @@ from librewxr.sources.satellite.gmgsi.source import (
     GRID_WIDTH,
     LAT_MAX,
     LAT_MIN,
+    LAT_VEC,
     LON_MAX,
     LON_MIN,
+    LON_VEC,
 )
 
 pytestmark = pytest.mark.sources
@@ -216,6 +218,26 @@ def test_sample_returns_zero_outside_coverage_band(tmp_path: Path):
     lon = np.array([[0.0, 0.0]], dtype=np.float32)
     out = src.sample(lat, lon, timestamp=12345)
     assert (out == 0).all()
+
+
+def test_sample_bilinearly_interpolates_between_grid_pixels(tmp_path: Path):
+    """Halfway between two columns returns their interpolated value."""
+    src = GMGSILWSource(cache_dir=tmp_path, max_frames=12)
+    grid = np.zeros((GRID_HEIGHT, GRID_WIDTH), dtype=np.uint8)
+    row = 1000
+    col = 2000
+    grid[row, col] = 100
+    grid[row, col + 1] = 200
+    ts = 12345
+    src._frames[ts] = grid
+    src._sorted_timestamps = [ts]
+
+    lat = np.array([[LAT_VEC[row]]], dtype=np.float32)
+    lon = np.array([[(LON_VEC[col] + LON_VEC[col + 1]) / 2]], dtype=np.float32)
+
+    out = src.sample(lat, lon, timestamp=ts)
+
+    assert out[0, 0] == 150
 
 
 def test_sample_returns_zero_when_no_frames(tmp_path: Path):

@@ -467,7 +467,8 @@ class GMGSISource:
     ) -> np.ndarray:
         """Sample encoded uint8 values at the given lat/lon points.
 
-        Nearest-neighbour for Phase 1 — bilinear is a Phase 4 polish.
+        Bilinear interpolation keeps the native ~8 km GMGSI pixels from
+        turning into large square blocks at normal web-map zoom levels.
         Returns 0 (no data) outside the global ±72.74° latitude band.
         Always returns a uint8 array shaped like ``lat``/``lon``.
         """
@@ -486,10 +487,10 @@ class GMGSISource:
             np.sin(np.deg2rad(lat.astype(np.float64))), -0.9999, 0.9999,
         )
         y_query = np.arctanh(sin_lat)
-        row = ((_Y_MAX - y_query) / _Y_STEP).astype(np.int32)
+        row_f = (_Y_MAX - y_query) / _Y_STEP
 
         lon_step = (LON_MAX - LON_MIN) / (GRID_WIDTH - 1)
-        col = ((lon - LON_MIN) / lon_step).astype(np.int32)
+        col_f = (lon - LON_MIN) / lon_step
 
         # Mask points outside the global band — leave them at the
         # zero sentinel rather than wrapping or clamping silently.
@@ -497,11 +498,25 @@ class GMGSISource:
             (lat <= LAT_MAX) & (lat >= LAT_MIN)
             & (lon >= LON_MIN) & (lon <= LON_MAX)
         )
-        row = np.clip(row, 0, GRID_HEIGHT - 1)
-        col = np.clip(col, 0, GRID_WIDTH - 1)
+        row_f = np.clip(row_f, 0.0, GRID_HEIGHT - 1.0)
+        col_f = np.clip(col_f, 0.0, GRID_WIDTH - 1.0)
+        row0 = np.floor(row_f).astype(np.int32)
+        col0 = np.floor(col_f).astype(np.int32)
+        row1 = np.minimum(row0 + 1, GRID_HEIGHT - 1)
+        col1 = np.minimum(col0 + 1, GRID_WIDTH - 1)
 
-        sampled = grid[row, col]
-        out = np.where(in_bounds, sampled, 0).astype(GRID_DTYPE)
+        row_weight = (row_f - row0).astype(np.float32)
+        col_weight = (col_f - col0).astype(np.float32)
+        top = (
+            grid[row0, col0].astype(np.float32) * (1.0 - col_weight)
+            + grid[row0, col1].astype(np.float32) * col_weight
+        )
+        bottom = (
+            grid[row1, col0].astype(np.float32) * (1.0 - col_weight)
+            + grid[row1, col1].astype(np.float32) * col_weight
+        )
+        sampled = top * (1.0 - row_weight) + bottom * row_weight
+        out = np.where(in_bounds, np.rint(sampled), 0).astype(GRID_DTYPE)
         return out
 
     # ── Lifecycle ──
