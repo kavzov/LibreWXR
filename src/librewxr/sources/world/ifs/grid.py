@@ -16,6 +16,7 @@ from earthkit.regrid import interpolate
 from omfiles import OmFileReader
 
 from librewxr.config import settings
+from librewxr.data.weather_fields import WeatherFieldSourceMixin
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ ZR_B_SNOW = 2.0
 S3_LATEST_PATH = "data_spatial/ecmwf_ifs/latest.json"
 
 
-class ECMWFGrid:
+class ECMWFGrid(WeatherFieldSourceMixin):
     """ECMWF IFS 9km precipitation grid for global fallback coverage.
 
     Replaces both GFSReflectivityGrid and TemperatureGrid with a single

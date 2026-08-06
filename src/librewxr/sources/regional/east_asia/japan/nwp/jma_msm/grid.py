@@ -37,6 +37,7 @@ import numpy as np
 from omfiles import OmFileReader
 
 from librewxr.config import settings
+from librewxr.data.weather_fields import WeatherFieldSourceMixin
 from librewxr.sources.regional.north_america.usa.nwp.hrrr.grid import compute_snow_mask
 
 logger = logging.getLogger(__name__)
@@ -257,7 +258,7 @@ def _decode_om_field(
 # ── JMAMSMGrid: the public NWPSource implementation ──────────────────
 
 
-class JMAMSMGrid:
+class JMAMSMGrid(WeatherFieldSourceMixin):
     """JMA MSM as an NWPSource for the East Asia chain slot."""
 
     name = "jma_msm"

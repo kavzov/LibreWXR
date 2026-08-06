@@ -37,6 +37,7 @@ import httpx
 import numpy as np
 
 from librewxr.config import settings
+from librewxr.data.weather_fields import WeatherFieldSourceMixin
 from librewxr.sources.regional.north_america.usa.nwp.hrrr.grid import compute_snow_mask
 
 logger = logging.getLogger(__name__)
@@ -360,7 +361,7 @@ def decompress_bz2(data: bytes) -> bytes:
 # ── ICONEUGrid: the public NWPSource implementation ──────────────────
 
 
-class ICONEUGrid:
+class ICONEUGrid(WeatherFieldSourceMixin):
     """DWD ICON-EU as an NWPSource for the European chain slot."""
 
     name = "icon_eu"

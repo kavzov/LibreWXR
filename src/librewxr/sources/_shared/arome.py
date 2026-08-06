@@ -49,6 +49,7 @@ import httpx
 import numpy as np
 
 from librewxr.config import settings
+from librewxr.data.weather_fields import WeatherFieldSourceMixin
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +125,7 @@ def _format_run_ts(dt: datetime) -> str:
 # ── AROMEOverseasGrid: NWPSource base for every AROME-OM variant ──
 
 
-class AROMEOverseasGrid:
+class AROMEOverseasGrid(WeatherFieldSourceMixin):
     """Common NWPSource implementation for AROME overseas variants.
 
     Subclasses MUST override the ``ClassVar`` attributes below — grid

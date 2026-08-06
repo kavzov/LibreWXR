@@ -51,6 +51,7 @@ import httpx
 import numpy as np
 
 from librewxr.config import settings
+from librewxr.data.weather_fields import WeatherFieldSourceMixin
 from librewxr.sources.regional.north_america.usa.nwp.hrrr.grid import (
     IdxRecord,
     compute_snow_mask,
@@ -416,7 +417,7 @@ def bracket_lead_seconds(lead_seconds: int) -> tuple[int, int, float]:
 # ── HRRRAlaskaGrid: the public NWPSource implementation ───────────────
 
 
-class HRRRAlaskaGrid:
+class HRRRAlaskaGrid(WeatherFieldSourceMixin):
     """NOAA HRRR Alaska composite reflectivity, sampled in native polar stereo.
 
     Implements the NWPSource Protocol.  Frames are stored at native 3 km

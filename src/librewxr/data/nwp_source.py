@@ -15,12 +15,44 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
+from librewxr.data.weather_fields import (
+    WeatherField,
+    decode_field,
+    field_spec,
+    relative_humidity_from_temperature_dewpoint,
+    wind_speed_from_uv,
+)
+
 
 @runtime_checkable
 class NWPSource(Protocol):
     """A numerical weather prediction data source."""
 
     name: str
+
+    def available_fields(self) -> frozenset[WeatherField]:
+        """Return the generic weather fields currently exposed by this source."""
+        ...
+
+    def has_field(self, field: WeatherField) -> bool:
+        """Whether this source exposes ``field`` through ``sample_field``."""
+        ...
+
+    def sample_field(
+        self,
+        field: WeatherField,
+        lat: np.ndarray,
+        lon: np.ndarray,
+        timestamp: int | None = None,
+        bilinear: bool = True,
+    ) -> np.ndarray:
+        """Return ``field`` in its canonical physical unit at each point.
+
+        Missing values are represented by ``NaN``. Output shape equals
+        ``lat.shape``; callers may request bilinear or nearest-neighbour spatial
+        sampling, subject to the field specification.
+        """
+        ...
 
     def sample(
         self,
@@ -109,6 +141,198 @@ class NWPChain:
     def has_data(self) -> bool:
         """True if any registered source has data loaded."""
         return any(src.has_data() for src in self._sources)
+
+    @staticmethod
+    def _source_fields(src: NWPSource) -> frozenset[WeatherField]:
+        """Return a source's fields, tolerating pre-field third-party sources.
+
+        The compatibility fallback is deliberately precipitation-only. All
+        built-in sources implement the complete protocol through the shared
+        mixin, but this keeps existing external integrations usable during the
+        interface transition.
+        """
+
+        available_fields = getattr(src, "available_fields", None)
+        if available_fields is None:
+            return frozenset({WeatherField.PRECIPITATION})
+        return frozenset(WeatherField(field) for field in available_fields())
+
+    @classmethod
+    def _source_has_field(cls, src: NWPSource, field: WeatherField) -> bool:
+        has_field = getattr(src, "has_field", None)
+        if has_field is not None:
+            return bool(has_field(field))
+        return field in cls._source_fields(src)
+
+    @staticmethod
+    def _source_has_data(src: NWPSource, timestamp: int | None) -> bool:
+        if timestamp is None:
+            return src.has_data()
+        return src.has_data_at(timestamp)
+
+    def available_fields(self) -> frozenset[WeatherField]:
+        """Return native plus derivable fields exposed by the chain."""
+
+        fields: set[WeatherField] = set()
+        for src in self._sources:
+            fields.update(self._source_fields(src))
+
+        # A derived field is available only when all its native dependencies
+        # can be sampled somewhere in the chain.
+        for candidate in WeatherField:
+            spec = field_spec(candidate)
+            if spec.derived and set(spec.dependencies) <= fields:
+                fields.add(candidate)
+        return frozenset(fields)
+
+    def has_field(self, field: WeatherField) -> bool:
+        """Whether ``field`` can be sampled or derived by this chain."""
+
+        try:
+            normalized = WeatherField(field)
+        except ValueError:
+            return False
+        return normalized in self.available_fields()
+
+    def sample_field(
+        self,
+        field: WeatherField,
+        lat: np.ndarray,
+        lon: np.ndarray,
+        timestamp: int | None = None,
+        bilinear: bool = True,
+    ) -> np.ndarray:
+        """Sample and feather a generic field in canonical physical units.
+
+        Continuous values are blended after source decoding, so encoded nodata
+        sentinels and affine storage scales cannot contaminate the result.
+        Categorical specifications use hard priority selection instead.
+        """
+
+        normalized = WeatherField(field)
+        spec = field_spec(normalized)
+
+        if lat.shape != lon.shape:
+            raise ValueError("lat and lon must have identical shapes")
+
+        if spec.derived:
+            if not set(spec.dependencies) <= self.available_fields():
+                return np.full(lat.shape, np.nan, dtype=np.float32)
+            dependencies = [
+                self.sample_field(
+                    dependency,
+                    lat,
+                    lon,
+                    timestamp=timestamp,
+                    bilinear=bilinear,
+                )
+                for dependency in spec.dependencies
+            ]
+            if normalized is WeatherField.RELATIVE_HUMIDITY_2M:
+                return relative_humidity_from_temperature_dewpoint(*dependencies)
+            if normalized is WeatherField.WIND_SPEED_10M:
+                return wind_speed_from_uv(*dependencies)
+            raise ValueError(f"No derivation function for {normalized.value}")
+
+        if spec.categorical:
+            return self._sample_categorical_field(
+                normalized, lat, lon, timestamp=timestamp
+            )
+
+        weighted_sum = np.zeros(lat.shape, dtype=np.float32)
+        weight_sum = np.zeros(lat.shape, dtype=np.float32)
+        remaining = np.ones(lat.shape, dtype=np.float32)
+
+        for src in self._sources:
+            if not (remaining > 0.0).any():
+                break
+            if not self._source_has_field(src, normalized):
+                continue
+            if not self._source_has_data(src, timestamp):
+                continue
+
+            feather = np.asarray(src.feather_mask(lat, lon), dtype=np.float32)
+            feather = np.where(np.isfinite(feather), feather, 0.0)
+            feather = np.clip(feather, 0.0, 1.0)
+            potential_weight = remaining * feather
+            relevant = potential_weight > 0.0
+            if not relevant.any():
+                continue
+
+            sampler = getattr(src, "sample_field", None)
+            if sampler is None:
+                # A transition-only adapter for older precipitation sources.
+                encoded = src.sample(
+                    lat[relevant], lon[relevant], timestamp, bilinear
+                )
+                sampled = decode_field(normalized, encoded)
+            else:
+                sampled = sampler(
+                    normalized,
+                    lat[relevant],
+                    lon[relevant],
+                    timestamp,
+                    bilinear,
+                )
+            sampled = np.asarray(sampled, dtype=np.float32)
+            valid = np.isfinite(sampled)
+            if not valid.any():
+                continue
+
+            relevant_indices = np.flatnonzero(relevant)
+            valid_indices = relevant_indices[valid.reshape(-1)]
+            flat_weight = potential_weight.reshape(-1)[valid_indices]
+            weighted_sum.reshape(-1)[valid_indices] += (
+                flat_weight * sampled.reshape(-1)[valid.reshape(-1)]
+            )
+            weight_sum.reshape(-1)[valid_indices] += flat_weight
+            remaining.reshape(-1)[valid_indices] *= (
+                1.0 - feather.reshape(-1)[valid_indices]
+            )
+
+        result = np.full(lat.shape, np.nan, dtype=np.float32)
+        valid_result = weight_sum > 0.0
+        result[valid_result] = weighted_sum[valid_result] / weight_sum[valid_result]
+        return result
+
+    def _sample_categorical_field(
+        self,
+        field: WeatherField,
+        lat: np.ndarray,
+        lon: np.ndarray,
+        timestamp: int | None,
+    ) -> np.ndarray:
+        """Select categorical data from the first valid source per pixel."""
+
+        result = np.full(lat.shape, np.nan, dtype=np.float32)
+        unfilled = np.ones(lat.shape, dtype=bool)
+        for src in self._sources:
+            if not unfilled.any():
+                break
+            if not self._source_has_field(src, field):
+                continue
+            if not self._source_has_data(src, timestamp):
+                continue
+            feather = np.asarray(src.feather_mask(lat, lon), dtype=np.float32)
+            covered = unfilled & np.isfinite(feather) & (feather > 0.0)
+            if not covered.any():
+                continue
+            sampled = np.asarray(
+                src.sample_field(
+                    field,
+                    lat[covered],
+                    lon[covered],
+                    timestamp,
+                    False,
+                ),
+                dtype=np.float32,
+            )
+            valid = np.isfinite(sampled)
+            covered_indices = np.flatnonzero(covered)
+            valid_indices = covered_indices[valid.reshape(-1)]
+            result.reshape(-1)[valid_indices] = sampled.reshape(-1)[valid.reshape(-1)]
+            unfilled.reshape(-1)[valid_indices] = False
+        return result
 
     def sample(
         self,

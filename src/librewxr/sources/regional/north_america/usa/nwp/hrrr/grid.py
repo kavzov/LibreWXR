@@ -38,6 +38,7 @@ import httpx
 import numpy as np
 
 from librewxr.config import settings
+from librewxr.data.weather_fields import WeatherFieldSourceMixin
 
 logger = logging.getLogger(__name__)
 
@@ -543,7 +544,7 @@ def bracket_subh_leads(lead_seconds: int) -> tuple[int, int, float]:
 # ── HRRRGrid: the public NWPSource implementation ─────────────────────
 
 
-class HRRRGrid:
+class HRRRGrid(WeatherFieldSourceMixin):
     """NOAA HRRR sub-hourly composite reflectivity, sampled in native LCC.
 
     Implements the NWPSource Protocol.  Frames are stored at native 3 km

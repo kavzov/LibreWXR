@@ -44,6 +44,7 @@ import httpx
 import numpy as np
 
 from librewxr.config import settings
+from librewxr.data.weather_fields import WeatherFieldSourceMixin
 from librewxr.sources.regional.north_america.usa.nwp.hrrr.grid import compute_snow_mask
 
 logger = logging.getLogger(__name__)
@@ -595,7 +596,7 @@ def decode_2t_message(grib_bytes: bytes) -> np.ndarray | None:
 # ── DMIDiniGrid: the public NWPSource implementation ─────────────────
 
 
-class DMIDiniGrid:
+class DMIDiniGrid(WeatherFieldSourceMixin):
     """DMI HARMONIE-AROME DINI as an NWPSource for the European chain slot."""
 
     name = "dmi_dini"

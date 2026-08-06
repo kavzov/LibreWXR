@@ -50,6 +50,7 @@ import httpx
 import numpy as np
 
 from librewxr.config import settings
+from librewxr.data.weather_fields import WeatherFieldSourceMixin
 
 logger = logging.getLogger(__name__)
 
@@ -441,7 +442,7 @@ _DECODE_LOGGED = {"once": False}
 # ── HRDPSGrid: the public NWPSource implementation ────────────────────
 
 
-class HRDPSGrid:
+class HRDPSGrid(WeatherFieldSourceMixin):
     """ECCC HRDPS as an NWPSource for the Canadian / northern-NA chain slot.
 
     Implements the NWPSource Protocol.  Frames are stored at native

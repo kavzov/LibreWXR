@@ -50,6 +50,7 @@ import httpx
 import numpy as np
 
 from librewxr.config import settings
+from librewxr.data.weather_fields import WeatherFieldSourceMixin
 from librewxr.sources._helpers import HDF5_LOCK
 from librewxr.sources.regional.north_america.usa.nwp.hrrr.grid import compute_snow_mask
 
@@ -433,7 +434,7 @@ def decode_t2_message(nc_bytes: bytes) -> np.ndarray | None:
 # ── WRFSMNGrid: the public NWPSource implementation ───────────────────
 
 
-class WRFSMNGrid:
+class WRFSMNGrid(WeatherFieldSourceMixin):
     """SMN Argentina WRF as an NWPSource for the South American Cone."""
 
     name = "wrf_smn"
