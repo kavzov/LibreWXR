@@ -56,17 +56,30 @@ class _FakeFilesystem:
         self.objects = objects
         self.metadata_reads = 0
         self.object_opens = 0
+        self.object_downloads = 0
 
     def cat(self, _path: str) -> bytes:
         self.metadata_reads += 1
         return json.dumps(self.latest).encode()
 
+    def get_file(self, remote_path: str, local_path: str) -> None:
+        self.object_opens += 1
+        self.object_downloads += 1
+        Path(local_path).write_text(remote_path.rsplit("/", 1)[-1])
+
 
 class _FakeOmFileReader:
+    objects: dict[str, dict[str, np.ndarray]] = {}
+
     @staticmethod
     def from_fsspec(fs: _FakeFilesystem, path: str) -> _FakeReader:
         fs.object_opens += 1
         return _FakeReader(fs.objects[path.rsplit("/", 1)[-1]])
+
+    @classmethod
+    def from_path(cls, path: str) -> _FakeReader:
+        assert isinstance(path, str)
+        return _FakeReader(cls.objects[Path(path).read_text()])
 
 
 def _vt(dt: datetime) -> str:
@@ -118,6 +131,7 @@ def loaded_grid(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(ifs_module, "GRID_WIDTH", 4)
     monkeypatch.setattr(ifs_module, "GRID_SHAPE", (2, 4))
     monkeypatch.setattr(ifs_module, "OmFileReader", _FakeOmFileReader)
+    _FakeOmFileReader.objects = objects
     regrid_calls: list[np.ndarray] = []
 
     def fake_regrid(raw, **_kwargs):
@@ -143,6 +157,7 @@ def test_loads_all_required_fields_in_compact_separate_memmaps(loaded_grid):
     assert len(native_times) == 3
     assert grid.timestep_count == 2
     assert fs.object_opens == 3
+    assert fs.object_downloads == 3
     assert len(regrid_calls) == 3 * 5 + 2 * 2
     for timestamp in native_times:
         frame = grid._timesteps[timestamp]
@@ -157,6 +172,7 @@ def test_loads_all_required_fields_in_compact_separate_memmaps(loaded_grid):
             assert f"_t{timestamp}_{field.value}.dat" in filename
             assert Path(values.filename).stat().st_size == values.nbytes
     assert not list(grid._memmap_dir.glob("*.tmp"))
+    assert not list(grid._memmap_dir.rglob("*.om.tmp"))
 
 
 def test_units_and_linear_time_interpolation_after_sampling(loaded_grid):
@@ -310,6 +326,26 @@ def test_state_roundtrip_reopens_every_field_read_only(loaded_grid, tmp_path):
     assert REQUIRED_WEATHER_FIELDS <= frame.fields.keys()
     assert all(isinstance(values, np.memmap) for values in frame.fields.values())
     assert all(values.mode == "r" for values in frame.fields.values())
+
+
+def test_stale_master_snapshot_cannot_replace_newer_active_manifest(
+    loaded_grid, tmp_path
+):
+    producer, _fs, base, _calls = loaded_grid
+    stale = {
+        "memmap_dir": str(producer._memmap_dir),
+        "reference_time": producer.reference_time,
+        "timesteps": {},
+    }
+    consumer = ECMWFGrid(cache_dir=tmp_path)
+
+    assert consumer._content_version == producer._content_version == 1
+    assert consumer.available_timestamps()
+    consumer.__setstate__(stale)
+
+    assert consumer._content_version == 1
+    assert consumer.available_timestamps() == producer.available_timestamps()
+    assert int(base.timestamp()) in consumer._timesteps
 
 
 def test_state_descriptor_preserves_run_path_through_cache_symlink(tmp_path):

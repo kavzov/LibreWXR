@@ -1049,18 +1049,55 @@ class ECMWFGrid:
         om_path = f"{run_prefix}/{vt_clean}.om"
         from librewxr.data.retry import retry_sync
 
-        reader = retry_sync(
-            OmFileReader.from_fsspec,
-            fs,
-            om_path,
-            log_name=f"ECMWF IFS {vt}",
-        )
-        if reader is None:
-            raise RuntimeError(f"failed to open {om_path} after retries")
-
+        reader = None
+        staged_path: Path | None = None
         fields: dict[WeatherField, np.ndarray] = {}
         snow_mask = None
         try:
+            # ``OmFileReader.from_fsspec`` is efficient for one or two fields,
+            # but a complete scalar timestep triggers many small S3 range
+            # requests. Their latency dominates reading the five public IFS
+            # components. Stage those larger reads once, then let omfiles use
+            # normal local seeks. Precipitation-only deployments retain the
+            # existing selective remote path.
+            if required_fields & REQUIRED_WEATHER_FIELDS:
+                staging_dir = self._memmap_dir / "downloads"
+                staging_dir.mkdir(parents=True, exist_ok=True)
+                staged_path = staging_dir / f"{vt_clean}.om.tmp"
+
+                def _download() -> Path:
+                    staged_path.unlink(missing_ok=True)
+                    fs.get_file(om_path, str(staged_path))
+                    return staged_path
+
+                started = time.monotonic()
+                logger.info("Staging ECMWF IFS timestep %s locally", vt)
+                downloaded = retry_sync(
+                    _download,
+                    log_name=f"ECMWF IFS {vt}",
+                )
+                if downloaded is None:
+                    staged_path.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"failed to download {om_path} after retries"
+                    )
+                logger.info(
+                    "Staged ECMWF IFS timestep %s: %.1f MiB in %.1fs",
+                    vt,
+                    staged_path.stat().st_size / (1024 * 1024),
+                    time.monotonic() - started,
+                )
+                reader = OmFileReader.from_path(str(staged_path))
+            else:
+                reader = retry_sync(
+                    OmFileReader.from_fsspec,
+                    fs,
+                    om_path,
+                    log_name=f"ECMWF IFS {vt}",
+                )
+                if reader is None:
+                    raise RuntimeError(f"failed to open {om_path} after retries")
+
             for field in REQUIRED_WEATHER_FIELDS:
                 if field not in required_fields:
                     continue
@@ -1082,7 +1119,10 @@ class ECMWFGrid:
                 )
                 fields[WeatherField.PRECIPITATION] = precipitation
         finally:
-            reader.close()
+            if reader is not None:
+                reader.close()
+            if staged_path is not None:
+                staged_path.unlink(missing_ok=True)
 
         return WeatherFrame(self._vt_to_unix(vt), fields, snow_mask)
 
@@ -1508,6 +1548,19 @@ class ECMWFGrid:
     def __setstate__(self, state: dict) -> None:
         """Restore v2 named frames or a legacy tuple-shaped snapshot."""
 
+        incoming_content_version = int(state.get("content_version", 0))
+        current_content_version = int(getattr(self, "_content_version", 0))
+        if (
+            incoming_content_version < current_content_version
+            and getattr(self, "_timesteps", None)
+        ):
+            logger.warning(
+                "Ignoring stale ECMWF snapshot content version %d; active version is %d",
+                incoming_content_version,
+                current_content_version,
+            )
+            return
+
         memmap_dir = Path(state.get("memmap_dir", self._memmap_dir))
         new_timesteps: dict[int, WeatherFrame] = {}
         for ts_str, payload in state.get("timesteps", {}).items():
@@ -1546,7 +1599,7 @@ class ECMWFGrid:
             restored[ts] = frame
         self._timesteps = restored
         self._grid_version = int(state.get("grid_version", GRID_GEOMETRY_VERSION))
-        self._content_version = int(state.get("content_version", 0))
+        self._content_version = incoming_content_version
         self._reference_time = state.get("reference_time")
         self._previous_reference_time = state.get("previous_reference_time")
         self._last_modified_time = state.get("last_modified_time")
