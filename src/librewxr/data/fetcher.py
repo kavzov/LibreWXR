@@ -491,8 +491,22 @@ class RadarFetcher:
             async def _run(label: str, grid, kwargs: dict, fail_msg: str) -> None:
                 async with semaphore:
                     started = time.time()
+                    previous_model_version = getattr(grid, "model_version", None)
                     try:
                         await grid.fetch(**kwargs)
+                        current_model_version = getattr(grid, "model_version", None)
+                        if (
+                            previous_model_version is not None
+                            and current_model_version != previous_model_version
+                        ):
+                            removed = self._cache.invalidate_nwp_dependent()
+                            logger.info(
+                                "%s published %s; invalidated %d NWP-dependent "
+                                "tile cache entries",
+                                label,
+                                current_model_version,
+                                removed,
+                            )
                         logger.debug(
                             "%s fetch finished in %.1fs", label, time.time() - started,
                         )

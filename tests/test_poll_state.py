@@ -115,6 +115,23 @@ def test_ifs_timestep_set_change_triggers_full_clear():
     assert ts_set is None
 
 
+def test_ifs_content_version_change_with_same_run_invalidates_nwp_only():
+    prev = _payload(ecmwf_grid={
+        "reference_time": "2026-08-03T00:00:00Z",
+        "content_version": 3,
+        "timesteps": {"100": [1], "200": [2]},
+    })
+    cur = _payload(ecmwf_grid={
+        "reference_time": "2026-08-03T00:00:00Z",
+        "content_version": 4,
+        "timesteps": {"100": [1], "200": [2]},
+    })
+
+    ts_set, nwp_changed = _compute_cache_invalidation(prev, cur)
+    assert nwp_changed is True
+    assert ts_set is None
+
+
 def test_other_nwp_store_reference_time_change_triggers_full_clear():
     # Regional NWP overlays (HRRR / HRDPS / ICON-EU / ...) expose
     # reference_time too — a change there must clear the whole cache.

@@ -232,6 +232,16 @@ class Settings(BaseSettings):
     # valid time from the nearest analysis through the forecast horizon.
     weather_fields_forecast_hours: int = 48
     weather_fields_max_timesteps: int = 0
+    # Scalar global fields share the IFS download but can be disabled for
+    # disk-constrained deployments that only need precipitation/nowcast.
+    weather_fields_enabled: bool = True
+    # Comma-separated public/native field names. Derived fields expand to
+    # their native dependencies, so humidity selects temperature+dewpoint
+    # and wind speed selects U+V without storing derived global grids.
+    weather_fields_fields: str = (
+        "temperature_2m,dewpoint_2m,relative_humidity_2m,"
+        "pressure_msl,wind_speed_10m"
+    )
     # Disable IFS entirely (skip the global precipitation fallback).  Useful
     # for isolating regional NWP layers during debugging — anywhere outside
     # the regional models will simply show zero precipitation.  Default
@@ -500,6 +510,39 @@ class Settings(BaseSettings):
             if self.nowcast_enabled else 0
         )
         return past_hours + future_hours + 2
+
+    def get_weather_fields(self):
+        """Resolve configured scalar fields to native ECMWF dependencies."""
+
+        from librewxr.data.weather_fields import WeatherField, field_spec
+
+        if not self.weather_fields_enabled:
+            return frozenset()
+        aliases = {
+            "dewpoint_2m": WeatherField.DEWPOINT_2M,
+            "dew_point_2m": WeatherField.DEWPOINT_2M,
+        }
+        selected: set[WeatherField] = set()
+        for raw in self.weather_fields_fields.split(","):
+            name = raw.strip()
+            if not name:
+                continue
+            try:
+                weather_field = (
+                    aliases[name] if name in aliases else WeatherField(name)
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unknown weather field in configuration: {name}"
+                ) from exc
+            spec = field_spec(weather_field)
+            if weather_field is WeatherField.PRECIPITATION:
+                continue
+            if spec.derived:
+                selected.update(spec.dependencies)
+            else:
+                selected.add(weather_field)
+        return frozenset(selected)
 
     def get_enabled_regions(self) -> list[str]:
         """Resolve the region spec into individual region names."""

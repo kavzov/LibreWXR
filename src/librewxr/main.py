@@ -184,15 +184,16 @@ def _compute_cache_invalidation(
 ) -> tuple[set[int] | None, bool]:
     """Decide what to invalidate in the tile cache after a state.json poll.
 
-    Returns ``(timestamps, full_clear)``:
-    - ``(None, True)``       — clear the whole cache (signature changed; rare).
+    Returns ``(timestamps, nwp_changed)``:
+    - ``(None, True)``       — invalidate NWP-dependent cache namespaces.
     - ``(ts_set, False)``    — call ``invalidate_timestamp(ts)`` for each ``ts``.
 
     The "signature" is the tuple of (store_name, reference_time) for every
     store with a ``reference_time`` field, plus (ecmwf_grid, sorted(timesteps))
     to catch hourly timestep slides that keep ``reference_time`` unchanged.
-    On any signature change → full clear, because cached geometry may have
-    sampled stale NWP content.
+    On any signature change, radar/weather entries are invalidated because
+    they may have sampled stale NWP content. Satellite and coverage entries
+    are unrelated and remain cached.
 
     Targeted invalidation covers: radar frame evictions + version bumps
     (merges), and all nowcast timestamps (content regenerates every cycle —
@@ -219,6 +220,10 @@ def _compute_cache_invalidation(
                 # sorted key *set* is compared, so string keys are fine.
                 ts_keys = sorted(stores.get(name, {}).get("timesteps", {}).keys())
                 items.append(("ecmwf_grid_timesteps", tuple(ts_keys)))
+                items.append((
+                    "ecmwf_grid_content_version",
+                    stores.get(name, {}).get("content_version", 0),
+                ))
         return tuple(sorted(items))
 
     if _signature(cur_stores) != _signature(prev_stores):
@@ -273,7 +278,7 @@ def _drop_absent_stores(stores: dict, refreshed: list[str]) -> None:
     bring it back.  The store repopulates in place via ``__setstate__``
     on the next poll once the pipeline ships it.
     """
-    keep = {"frame_store", "precip_mask", "nowcast_store"}
+    keep = {"frame_store", "precip_mask", "nowcast_store", "ecmwf_grid"}
     for name in list(stores.keys()):
         if name not in refreshed and name not in keep:
             stores[name] = None
@@ -421,10 +426,14 @@ async def _render_only_lifespan(app: FastAPI):
     # precip mask, since apply_state skips None stores and the poller
     # could not otherwise bring it back.
     _drop_absent_stores(stores, refreshed)
-    # Rebuild the slug → grid dict from the (post-drop) stores so the
-    # routes / chain only see grids that actually loaded from disk.
+    # Rebuild the slug → grid dict from stores that actually loaded from
+    # this snapshot. ECMWF is deliberately retained as a dormant object when
+    # absent from a legacy snapshot so a later poll can hydrate it in place,
+    # but it must not be exposed through routes or the chain while empty.
     nwp_grids_by_slug = {
-        slug: stores[slug] for slug in nwp_grids_by_slug if stores[slug] is not None
+        slug: stores[slug]
+        for slug in nwp_grids_by_slug
+        if slug in refreshed and stores[slug] is not None
     }
     satellite_grids_by_slug = {
         slug: stores[slug]
@@ -594,6 +603,29 @@ async def _render_only_lifespan(app: FastAPI):
                     routes.nowcast_store = stores["nowcast_store"]
                     logger.info("Nowcast store resurrected from state snapshot")
 
+                # ECMWF is kept as a dormant store when a worker boots from a
+                # pre-weather snapshot. apply_state hydrates that same object
+                # once the pipeline publishes it; only then expose it and
+                # rebuild the priority-ordered chain used by routes.
+                if routes.ecmwf_grid is None and "ecmwf_grid" in refreshed:
+                    restored_ecmwf = stores.get("ecmwf_grid")
+                    if restored_ecmwf is not None:
+                        restored_grids = {
+                            **routes.nwp_grids,
+                            "ecmwf_grid": restored_ecmwf,
+                        }
+                        restored_chain = NWPChain([
+                            contribution.instance
+                            for contribution in nwp_contribs
+                            if nwp_grid_slug(contribution) in restored_grids
+                        ])
+                        routes.nwp_grids = restored_grids
+                        routes.nwp_chain = restored_chain
+                        routes.ecmwf_grid = restored_ecmwf
+                        logger.info(
+                            "ECMWF weather store resurrected from state snapshot"
+                        )
+
                 # Diff-based cache invalidation: preserve cached geometry
                 # for radar timestamps whose content didn't change between
                 # snapshots.  Full clear only when a NWP content signature
@@ -603,7 +635,7 @@ async def _render_only_lifespan(app: FastAPI):
                     last_payload, payload,
                 )
                 if full_clear:
-                    cache.clear()
+                    cache.invalidate_nwp_dependent()
                 else:
                     for ts in ts_to_invalidate:
                         cache.invalidate_timestamp(ts)

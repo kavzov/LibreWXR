@@ -641,6 +641,38 @@ Enable optical flow interpolation of ECMWF IFS hourly data to 10-minute frames. 
 
 Adds ~130 MB RAM for synthetic frames and ~5-10 seconds of compute per IFS fetch cycle.
 
+### `LIBREWXR_WEATHER_FIELDS_ENABLED`
+
+Enable the global scalar weather-field store and `/v2/weather/...` API. The
+setting is independent of IFS precipitation: disabling it keeps the existing
+radar fallback, snow mask, and nowcast behaviour while avoiding the additional
+weather-field disk footprint. Persistent deployments keep the active and
+immediately previous complete model runs and restore the active run after a
+restart or upstream outage.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
+
+Disk-constrained installations that only use the Rain Viewer-compatible API
+can set this to `false`.
+
+### `LIBREWXR_WEATHER_FIELDS_FIELDS`
+
+Comma-separated scalar fields to retain. Public derived fields automatically
+select their native dependencies: `relative_humidity_2m` adds temperature and
+dew point; `wind_speed_10m` adds both 10 m wind components.
+
+| | |
+|---|---|
+| **Default** | `temperature_2m,dewpoint_2m,relative_humidity_2m,pressure_msl,wind_speed_10m` |
+| **Type** | comma-separated string |
+
+Restricting this list reduces each retained timestep's disk and page-cache
+footprint. The metadata endpoint advertises only fields derivable from the
+selected native inputs.
+
 ### `LIBREWXR_WEATHER_FIELDS_FORECAST_HOURS`
 
 Forecast horizon for the native valid-time window of global continuous weather fields. This window is independent of radar history and precipitation animation.

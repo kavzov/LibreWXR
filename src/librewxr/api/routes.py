@@ -6,6 +6,7 @@ import json
 import logging
 import time
 import psutil
+from collections.abc import Awaitable, Callable
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request, Response
 
@@ -112,6 +113,30 @@ alerts_enabled: bool = False
 mcp_mounted: bool = False
 mcp_path: str = "/mcp"
 mcp_tools: list[str] = []
+
+# Per-process cold-render singleflight. Render workers do not share an event
+# loop or byte cache, so each worker owns its own in-flight task map.
+_weather_tile_flights: dict[tuple, asyncio.Task[CachedRender]] = {}
+
+
+async def _weather_tile_singleflight(
+    key: tuple,
+    factory: Callable[[], Awaitable[CachedRender]],
+) -> CachedRender:
+    """Share one cold weather render among concurrent identical requests."""
+
+    task = _weather_tile_flights.get(key)
+    if task is None:
+        task = asyncio.create_task(factory())
+        _weather_tile_flights[key] = task
+
+        def _remove(done: asyncio.Task[CachedRender]) -> None:
+            if _weather_tile_flights.get(key) is done:
+                _weather_tile_flights.pop(key, None)
+
+        task.add_done_callback(_remove)
+    # A cancelled client must not cancel the shared render needed by peers.
+    return await asyncio.shield(task)
 
 
 def _nwp_grid_health_blocks() -> dict[str, dict]:
@@ -387,6 +412,8 @@ async def weather_metadata(response: Response) -> WeatherMetadataResponse:
     )
     fields = []
     for public_id, field in PUBLIC_WEATHER_FIELDS.items():
+        if nwp_chain is not None and not nwp_chain.has_field(field):
+            continue
         spec = field_spec(field)
         fields.append(
             WeatherFieldInfo(
@@ -396,6 +423,9 @@ async def weather_metadata(response: Response) -> WeatherMetadataResponse:
                 palette_ids=[palette.id for palette in palettes_for_field(field)],
             )
         )
+    advertised_palette_ids = {
+        palette_id for item in fields for palette_id in item.palette_ids
+    }
     palettes = [
         WeatherPaletteInfo(
             id=palette.id,
@@ -413,6 +443,7 @@ async def weather_metadata(response: Response) -> WeatherMetadataResponse:
             ],
         )
         for palette in WEATHER_PALETTES.values()
+        if palette.id in advertised_palette_ids
     ]
     host = settings.public_url.rstrip("/")
     response.headers["Cache-Control"] = "public, max-age=60"
@@ -426,7 +457,11 @@ async def weather_metadata(response: Response) -> WeatherMetadataResponse:
         fields=fields,
         available_timestamps=timestamps,
         default_timestamp=default_timestamp,
-        palette_ids=list(WEATHER_PALETTES),
+        palette_ids=[
+            palette_id
+            for palette_id in WEATHER_PALETTES
+            if palette_id in advertised_palette_ids
+        ],
         palettes=palettes,
         tile_url_template=(
             f"{host}/v2/weather/{{field}}/{{timestamp}}/{{size}}/"
@@ -517,7 +552,7 @@ async def weather_field_tile(
         tile_bytes = cached.data
         etag = cached.etag
     else:
-        try:
+        async def _render_once() -> CachedRender:
             tile_bytes = await asyncio.to_thread(
                 render_scalar_weather_tile,
                 source=nwp_chain,
@@ -530,15 +565,24 @@ async def weather_field_tile(
                 tile_size=size,
                 fmt=ext,
             )
+            rendered = CachedRender(tile_bytes, compute_etag(tile_bytes))
+            if tile_cache is not None:
+                tile_cache.put(cache_key, rendered)
+            return rendered
+
+        try:
+            rendered = await _weather_tile_singleflight(
+                cache_key,
+                _render_once,
+            )
         except Exception as exc:
             logger.exception("Weather field tile render failed: %s", exc)
             raise HTTPException(
                 status_code=503,
                 detail="Weather field tile rendering failed",
             ) from exc
-        etag = compute_etag(tile_bytes)
-        if tile_cache is not None:
-            tile_cache.put(cache_key, CachedRender(tile_bytes, etag))
+        tile_bytes = rendered.data
+        etag = rendered.etag
 
     return conditional_response(
         request=request,

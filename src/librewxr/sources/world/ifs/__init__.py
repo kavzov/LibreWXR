@@ -24,7 +24,10 @@ def nwp_provider(settings, cache_dir) -> NWPContribution | None:
     if not getattr(settings, "ecmwf_enabled", True):
         return None
     return NWPContribution(
-        instance=ECMWFGrid(cache_dir=cache_dir),
+        instance=ECMWFGrid(
+            cache_dir=cache_dir,
+            cleanup_tmp=not getattr(settings, "render_only", False),
+        ),
         priority=1000,
         name="ECMWF IFS",
         # Legacy snapshot key — auto-slug would produce ``ecmwf_ifs_grid``.

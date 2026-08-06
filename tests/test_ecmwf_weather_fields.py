@@ -238,10 +238,12 @@ def test_weather_window_preserves_published_cadence_and_independent_cap():
 def test_unchanged_run_does_not_reopen_om_objects(loaded_grid):
     grid, fs, _base, _calls = loaded_grid
     opens = fs.object_opens
+    model_version = grid.model_version
 
     assert grid._fetch_sync()
     assert fs.object_opens == opens
     assert fs.metadata_reads == 2
+    assert grid.model_version == model_version
 
 
 def test_unchanged_run_refetches_only_timestep_with_missing_memmap(loaded_grid):

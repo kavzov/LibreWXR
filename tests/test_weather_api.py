@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import io
+import asyncio
 import time
 from datetime import datetime, timezone
 
@@ -29,6 +30,7 @@ from librewxr.sources.world.ifs import grid as ifs_module
 from librewxr.sources.world.ifs.grid import ECMWFGrid
 from librewxr.sources.world.ifs.models import WeatherFrame
 from librewxr.tiles.cache import TileCache
+from librewxr.tiles.cache import CachedRender
 from librewxr.tiles.weather_renderer import colorize_weather_values
 
 pytestmark = pytest.mark.api
@@ -299,3 +301,68 @@ def test_adjacent_global_tiles_have_no_seam_or_empty_pixels(weather_api):
     np.testing.assert_array_equal(left_rgba[:, -1], right_rgba[:, 0])
     assert (left_rgba[..., 3] == 255).all()
     assert (right_rgba[..., 3] == 255).all()
+
+
+async def test_weather_singleflight_shares_one_render_and_cleans_success():
+    routes._weather_tile_flights.clear()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def factory():
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return CachedRender(b"tile", '"etag"')
+
+    requests = [
+        asyncio.create_task(routes._weather_tile_singleflight(("same",), factory))
+        for _ in range(4)
+    ]
+    await started.wait()
+    release.set()
+    results = await asyncio.gather(*requests)
+    await asyncio.sleep(0)
+
+    assert calls == 1
+    assert [result.data for result in results] == [b"tile"] * 4
+    assert routes._weather_tile_flights == {}
+
+
+async def test_weather_singleflight_removes_failed_and_cancelled_waiters():
+    routes._weather_tile_flights.clear()
+    attempts = 0
+
+    async def failed_factory():
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("render failed")
+
+    with pytest.raises(RuntimeError, match="render failed"):
+        await routes._weather_tile_singleflight(("failed",), failed_factory)
+    await asyncio.sleep(0)
+    assert ("failed",) not in routes._weather_tile_flights
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_factory():
+        started.set()
+        await release.wait()
+        return CachedRender(b"ok", '"ok"')
+
+    leader = asyncio.create_task(
+        routes._weather_tile_singleflight(("cancel",), slow_factory)
+    )
+    await started.wait()
+    follower = asyncio.create_task(
+        routes._weather_tile_singleflight(("cancel",), slow_factory)
+    )
+    follower.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await follower
+    release.set()
+    assert (await leader).data == b"ok"
+    await asyncio.sleep(0)
+    assert ("cancel",) not in routes._weather_tile_flights

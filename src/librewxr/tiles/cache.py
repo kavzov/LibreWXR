@@ -87,6 +87,25 @@ class TileCache:
                 self._total_bytes -= _size_of(self._cache[k])
                 del self._cache[k]
 
+    def invalidate_nwp_dependent(self) -> int:
+        """Remove radar/weather renders affected by an NWP publication.
+
+        Satellite (``sat``) and coverage (``cov``) entries are independent of
+        model data and deliberately survive this targeted invalidation.
+        Returns the number of removed entries.
+        """
+
+        with self._lock:
+            keys = [
+                key
+                for key in self._cache
+                if key and (isinstance(key[0], int) or key[0] == "weather")
+            ]
+            for key in keys:
+                self._total_bytes -= _size_of(self._cache[key])
+                del self._cache[key]
+            return len(keys)
+
     def clear(self) -> None:
         with self._lock:
             self._cache.clear()
