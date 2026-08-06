@@ -14,8 +14,9 @@ from __future__ import annotations
 from librewxr.sources._base import NWPContribution
 
 from .grid import ECMWFGrid
+from .models import WeatherFrame
 
-__all__ = ["ECMWFGrid", "nwp_provider"]
+__all__ = ["ECMWFGrid", "WeatherFrame", "nwp_provider"]
 
 
 def nwp_provider(settings, cache_dir) -> NWPContribution | None:

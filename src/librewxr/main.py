@@ -357,6 +357,8 @@ async def _render_only_lifespan(app: FastAPI):
     await _wait_for_state(cache_dir, settings.state_wait_timeout)
 
     # Empty stores; __setstate__ wires up cache_dir and reopens memmaps.
+    # ECMWF's versioned state reopens every named weather-field array read-only
+    # and also accepts pre-weather-field precip/snow snapshots.
     # We construct the same superset the pipeline can dump (via the
     # provider walk) so apply_state picks up whichever entries are
     # present in the snapshot.  Sources disabled by config produce no

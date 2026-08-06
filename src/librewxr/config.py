@@ -226,6 +226,12 @@ class Settings(BaseSettings):
     regional_interpolation: bool = True
     ecmwf_max_timesteps: int = 0  # 0 = auto (derived from max_frames)
     ecmwf_interpolation: bool = True  # Optical flow interpolation of IFS hourly data to 10-min frames
+    # Independent native-valid-time window for global continuous weather
+    # fields. It must not shrink with the radar history or precipitation
+    # animation settings. 0 max timesteps means keep every actually-published
+    # valid time from the nearest analysis through the forecast horizon.
+    weather_fields_forecast_hours: int = 48
+    weather_fields_max_timesteps: int = 0
     # Disable IFS entirely (skip the global precipitation fallback).  Useful
     # for isolating regional NWP layers during debugging — anywhere outside
     # the regional models will simply show zero precipitation.  Default

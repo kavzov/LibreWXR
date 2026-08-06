@@ -7,6 +7,8 @@ import pytest
 pytestmark = pytest.mark.ecmwf
 
 from librewxr.sources.world.ifs.interpolation import interpolate_timesteps
+from librewxr.sources.world.ifs.models import WeatherFrame
+from librewxr.data.weather_fields import WeatherField
 from librewxr.data.nwp_interpolation import (
     _compute_flow,
     _interpolate_precip as _interpolate_frame,
@@ -16,6 +18,14 @@ from librewxr.data.nwp_interpolation import (
 
 # Use small grids for fast tests (full grid is 1801×3600)
 H, W = 120, 240
+
+
+def _frame(timestamp: int, precip: np.ndarray, snow: np.ndarray) -> WeatherFrame:
+    return WeatherFrame(
+        timestamp,
+        {WeatherField.PRECIPITATION: precip},
+        snow,
+    )
 
 
 def _make_blob(cy: int, cx: int, radius: int = 20, value: int = 150) -> np.ndarray:
@@ -29,7 +39,13 @@ def _make_blob(cy: int, cx: int, radius: int = 20, value: int = 150) -> np.ndarr
 
 class TestInterpolateTimesteps:
     def test_single_timestep_unchanged(self):
-        ts = {1000: (np.zeros((H, W), dtype=np.uint8), np.zeros((H, W), dtype=bool))}
+        ts = {
+            1000: _frame(
+                1000,
+                np.zeros((H, W), dtype=np.uint8),
+                np.zeros((H, W), dtype=bool),
+            )
+        }
         result = interpolate_timesteps(ts)
         assert list(result.keys()) == [1000]
 
@@ -37,8 +53,8 @@ class TestInterpolateTimesteps:
         precip = np.full((H, W), 100, dtype=np.uint8)
         snow = np.zeros((H, W), dtype=bool)
         ts = {
-            0: (precip.copy(), snow.copy()),
-            3600: (precip.copy(), snow.copy()),
+            0: _frame(0, precip.copy(), snow.copy()),
+            3600: _frame(3600, precip.copy(), snow.copy()),
         }
         result = interpolate_timesteps(ts, interval_seconds=600)
         # 3600 / 600 = 6 slots, endpoints included → 5 intermediates
@@ -51,20 +67,20 @@ class TestInterpolateTimesteps:
         precip1 = np.full((H, W), 120, dtype=np.uint8)
         snow = np.zeros((H, W), dtype=bool)
         ts = {
-            0: (precip0, snow.copy()),
-            3600: (precip1, snow.copy()),
+            0: _frame(0, precip0, snow.copy()),
+            3600: _frame(3600, precip1, snow.copy()),
         }
         result = interpolate_timesteps(ts, interval_seconds=600)
         # Original frames should be byte-identical
-        assert np.array_equal(result[0][0], precip0)
-        assert np.array_equal(result[3600][0], precip1)
+        assert np.array_equal(result[0].field(WeatherField.PRECIPITATION), precip0)
+        assert np.array_equal(result[3600].field(WeatherField.PRECIPITATION), precip1)
 
     def test_skips_already_fine_grained(self):
         precip = np.zeros((H, W), dtype=np.uint8)
         snow = np.zeros((H, W), dtype=bool)
         ts = {
-            0: (precip.copy(), snow.copy()),
-            600: (precip.copy(), snow.copy()),
+            0: _frame(0, precip.copy(), snow.copy()),
+            600: _frame(600, precip.copy(), snow.copy()),
         }
         result = interpolate_timesteps(ts, interval_seconds=600)
         # Gap == interval → nothing to interpolate
@@ -74,9 +90,9 @@ class TestInterpolateTimesteps:
         precip = np.full((H, W), 100, dtype=np.uint8)
         snow = np.zeros((H, W), dtype=bool)
         ts = {
-            0: (precip.copy(), snow.copy()),
-            3600: (precip.copy(), snow.copy()),
-            7200: (precip.copy(), snow.copy()),
+            0: _frame(0, precip.copy(), snow.copy()),
+            3600: _frame(3600, precip.copy(), snow.copy()),
+            7200: _frame(7200, precip.copy(), snow.copy()),
         }
         result = interpolate_timesteps(ts, interval_seconds=600)
         # 2 pairs × 5 intermediates + 3 originals = 13
@@ -87,11 +103,13 @@ class TestInterpolateTimesteps:
         precip = np.zeros((H, W), dtype=np.uint8)
         snow = np.zeros((H, W), dtype=bool)
         ts = {
-            0: (precip.copy(), snow.copy()),
-            3600: (precip.copy(), snow.copy()),
+            0: _frame(0, precip.copy(), snow.copy()),
+            3600: _frame(3600, precip.copy(), snow.copy()),
         }
         result = interpolate_timesteps(ts, interval_seconds=600)
-        for t, (p, s) in result.items():
+        for t, frame in result.items():
+            p = frame.field(WeatherField.PRECIPITATION)
+            s = frame.snow_mask
             assert (p == 0).all(), f"Non-zero precip at t={t}"
             assert not s.any(), f"Snow at t={t}"
 

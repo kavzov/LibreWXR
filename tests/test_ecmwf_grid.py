@@ -20,13 +20,19 @@ from librewxr.sources.world.ifs.grid import (
     ZR_B_SNOW,
 )
 from librewxr.data.nwp_source import NWPChain
+from librewxr.data.weather_fields import WeatherField
+from librewxr.sources.world.ifs.models import WeatherFrame
 
 
 def _inject_timestep(grid, precip_dbz, snow_mask=None, timestamp=1000000):
     """Helper to inject test data into an ECMWFGrid's multi-timestep store."""
     if snow_mask is None:
         snow_mask = np.zeros_like(precip_dbz, dtype=bool)
-    grid._timesteps[timestamp] = (precip_dbz, snow_mask)
+    grid._timesteps[timestamp] = WeatherFrame(
+        timestamp,
+        {WeatherField.PRECIPITATION: precip_dbz},
+        snow_mask,
+    )
     grid._sorted_timestamps = sorted(grid._timesteps.keys())
 
 

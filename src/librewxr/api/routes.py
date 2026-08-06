@@ -114,11 +114,15 @@ def _nwp_grid_health_blocks() -> dict[str, dict]:
             blocks[slug] = {"enabled": False, "loaded": False}
             continue
         if hasattr(grid, "reference_time") and hasattr(grid, "timestep_count"):
-            blocks[slug] = {
+            block = {
                 "loaded": getattr(grid, "data", None) is not None,
                 "reference_time": grid.reference_time,
                 "timesteps": grid.timestep_count,
             }
+            health_status = getattr(grid, "health_status", None)
+            if health_status is not None:
+                block.update(health_status())
+            blocks[slug] = block
         else:
             blocks[slug] = {
                 "enabled": True,

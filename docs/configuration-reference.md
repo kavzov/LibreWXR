@@ -571,6 +571,7 @@ LibreWXR uses ECMWF IFS 9 km global data from [Open-Meteo](https://open-meteo.co
 - Precipitation animation everywhere the regional NWP chain doesn't reach
 - Per-pixel snow/rain classification
 - Nowcast extrapolation outside regional model coverage
+- Global 2 m temperature and dew point, mean sea-level pressure, and 10 m U/V wind components
 
 ### `LIBREWXR_ECMWF_ENABLED`
 
@@ -639,6 +640,25 @@ Enable optical flow interpolation of ECMWF IFS hourly data to 10-minute frames. 
 | **Type** | boolean |
 
 Adds ~130 MB RAM for synthetic frames and ~5-10 seconds of compute per IFS fetch cycle.
+
+### `LIBREWXR_WEATHER_FIELDS_FORECAST_HOURS`
+
+Forecast horizon for the native valid-time window of global continuous weather fields. This window is independent of radar history and precipitation animation.
+
+| | |
+|---|---|
+| **Default** | `48` |
+| **Type** | integer |
+| **Unit** | hours |
+
+### `LIBREWXR_WEATHER_FIELDS_MAX_TIMESTEPS`
+
+Optional cap on native ECMWF valid times retained for global continuous fields, starting with the nearest analysis/past valid time. `0` keeps every actually published valid time through `LIBREWXR_WEATHER_FIELDS_FORECAST_HOURS` and is recommended because IFS cadence becomes coarser later in the forecast.
+
+| | |
+|---|---|
+| **Default** | `0` (unlimited within the horizon) |
+| **Type** | integer |
 
 ---
 

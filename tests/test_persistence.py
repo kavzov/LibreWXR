@@ -18,6 +18,8 @@ import pytest
 from librewxr.sources.regional.caribbean.nwp.arome_antilles.grid import AROMEAntillesGrid
 from librewxr.sources.regional.europe.nwp.dmi_dini.grid import DMIDiniGrid
 from librewxr.sources.world.ifs.grid import ECMWFGrid
+from librewxr.sources.world.ifs.models import WeatherFrame
+from librewxr.data.weather_fields import WeatherField
 from librewxr.sources.regional.north_america.canada.nwp.hrdps.grid import HRDPSGrid
 from librewxr.sources.regional.north_america.usa.nwp.hrrr_alaska.grid import HRRRAlaskaGrid
 from librewxr.sources.regional.north_america.usa.nwp.hrrr.grid import HRRRGrid
@@ -164,8 +166,13 @@ class TestECMWFGridPersistence:
         precip = np.zeros((1801, 3600), dtype=np.uint8)
         snow = np.zeros((1801, 3600), dtype=bool)
         ts = 1700000000
-        producer._timesteps[ts] = (
-            producer._to_memmap(f"{ts}_precip", precip),
+        producer._timesteps[ts] = WeatherFrame(
+            ts,
+            {
+                WeatherField.PRECIPITATION: producer._to_memmap(
+                    f"{ts}_precip", precip
+                )
+            },
             producer._to_memmap(f"{ts}_snow", snow),
         )
         producer._sorted_timestamps = [ts]

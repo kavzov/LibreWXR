@@ -15,7 +15,7 @@ Format::
       "written_at": 1712345600,
       "stores": {
         "frame_store":  { ... __getstate__ output ... },
-        "ecmwf_grid":   { ... },
+        "ecmwf_grid":   { "format_version": 2, "timesteps": { ... } },
         "hrrr_grid":    { ... },
         ...
       }
@@ -25,6 +25,10 @@ Stores whose value is ``None`` (disabled by config) are skipped.  Stores
 present in the snapshot but absent from the consumer's ``stores`` dict
 are silently ignored, so a tile-server worker can be started with a
 subset of stores enabled.
+
+The envelope stays at version 1 for compatibility. Individual stores may
+version their own additive/representation changes; ECMWF IFS uses store format
+2 and its ``__setstate__`` also accepts the legacy implicit precip/snow shape.
 """
 from __future__ import annotations
 
