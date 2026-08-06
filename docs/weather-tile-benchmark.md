@@ -5,7 +5,8 @@ This benchmark covers the scalar weather rendering path independently of
 
 ```bash
 .venv/bin/python scripts/benchmark_weather_tiles.py \
-  --iterations 3 --parallel 4 --output /tmp/weather-tiles.json
+  --iterations 3 --parallel 4 --native-render off \
+  --output /tmp/weather-tiles.json
 ```
 
 The deterministic fixture uses two native valid times on a compact regular
@@ -62,3 +63,38 @@ Average encoded payload sizes:
 The PNG visual-regression fixture requires exact alpha preservation, mean RGB
 error below 3 levels, p95 at most 10 levels, and maximum error at most 20
 levels. The lossless mode and all exact PNG8 tiles remain pixel-exact.
+
+## Optional native sampling result
+
+The native experiment was gated on a CPU profile of the optimized NumPy run
+(`--iterations 1 --parallel 1 --native-render off`). Excluding the benchmark's
+explicit garbage collections, `_numpy_sample` was the largest application
+compute site: 1.34 seconds of self time across 576 calls (1.75 seconds
+cumulative). The next application operation, palette colourization, used
+0.25 seconds; WebP encoding spent 1.62 seconds in its external encoder. This
+confirmed sampling/interpolation as a material CPU bottleneck before any Rust
+code was selected for the production path.
+
+The PyO3 candidate was measured only after the optimized NumPy baseline above.
+Both runs used the same renderer and deterministic fixtures; only
+`LIBREWXR_NATIVE_RENDER=off|on` changed. Each row averages all fields, formats,
+and zooms for that size. Two iterations were used for the concurrency sweep.
+
+| Concurrency | Warm 256 NumPy → Rust | Warm 512 NumPy → Rust | Cold p95 256 NumPy → Rust | Cold p95 512 NumPy → Rust |
+|---:|---:|---:|---:|---:|
+| 1 | 10.80 → 8.08 ms (−25.2%) | 35.92 → 27.54 ms (−23.3%) | 9.70 → 7.55 ms (−22.1%) | 34.47 → 26.90 ms (−22.0%) |
+| 8 | 10.85 → 8.19 ms (−24.5%) | 35.93 → 27.19 ms (−24.3%) | 31.02 → 20.03 ms (−35.4%) | 93.16 → 66.84 ms (−28.3%) |
+| 32 | 11.82 → 8.79 ms (−25.6%) | 39.75 → 28.50 ms (−28.3%) | 114.64 → 72.71 ms (−36.6%) | 339.67 → 222.10 ms (−34.6%) |
+
+Warm traced temporary memory fell from 2.42 to 1.74 MiB for 256 px and
+from 9.66 to 6.79 MiB for 512 px. Total sweep time fell by 15.3%, 19.2%, and
+25.7% at concurrency 1, 8, and 32 respectively. These measurements include
+Python argument validation, the Python/Rust boundary, output allocation, LUT
+colourization, and PNG/WebP encoding.
+
+The result justified retaining the optional extension: boundary cost does not
+erase the gain, and scaling improves when concurrent requests can run native
+kernels outside the GIL. No Rayon dependency or internal thread pool is used.
+Parity tests permit at most half one field encoding step and cover nearest,
+bilinear, fused temporal interpolation, dateline wrapping, grid boundaries,
+nodata, humidity, wind speed, and deterministic random inputs.

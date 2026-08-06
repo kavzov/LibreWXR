@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "librewxr-native"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Optional native weather sampling kernels for LibreWXR"
+license = { text = "AGPL-3.0-or-later" }
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "_librewxr_native"
+features = ["pyo3/extension-module"]

@@ -8,7 +8,8 @@ deterministic synthetic global model, and reports JSON suitable for comparing
 two revisions::
 
     .venv/bin/python scripts/benchmark_weather_tiles.py \
-        --iterations 5 --parallel 8 --output /tmp/weather-before.json
+        --iterations 5 --parallel 8 --native-render off \
+        --output /tmp/weather-before.json
 
 Run it on an otherwise idle machine. Absolute timings are machine-specific;
 the case keys, fixtures, encoded sizes, and decoded pixels are deterministic.
@@ -38,6 +39,7 @@ from librewxr.config import settings
 from librewxr.data.nwp_source import NWPChain
 from librewxr.data.weather_fields import WeatherField, encode_field
 from librewxr.data.weather_sampling import clear_sampling_plan_cache
+from librewxr.native_weather import active_implementation, native_available
 from librewxr.sources.world.ifs import grid as ifs_module
 from librewxr.sources.world.ifs.grid import ECMWFGrid
 from librewxr.sources.world.ifs.models import WeatherFrame
@@ -294,7 +296,8 @@ def _benchmark_case(
     }
 
 
-def run_benchmark(iterations: int, parallel: int) -> dict:
+def run_benchmark(iterations: int, parallel: int, native_render: str = "auto") -> dict:
+    settings.native_render = native_render
     grid, source = _build_source()
     cases = []
     started = time.time()
@@ -326,6 +329,9 @@ def run_benchmark(iterations: int, parallel: int) -> dict:
         "schema_version": 1,
         "iterations": iterations,
         "parallel": parallel,
+        "native_render": native_render,
+        "active_implementation": active_implementation(),
+        "native_available": native_available(),
         "case_count": len(cases),
         "elapsed_seconds": round(time.time() - started, 3),
         "cases": cases,
@@ -336,9 +342,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--parallel", type=int, default=4)
+    parser.add_argument(
+        "--native-render",
+        choices=("auto", "on", "off"),
+        default="auto",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    result = run_benchmark(args.iterations, args.parallel)
+    result = run_benchmark(args.iterations, args.parallel, args.native_render)
     encoded = json.dumps(result, indent=2, sort_keys=True)
     if args.output is not None:
         args.output.write_text(encoded + "\n", encoding="utf-8")

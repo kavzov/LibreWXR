@@ -14,7 +14,7 @@ from librewxr.config import settings
 from librewxr.data.weather_fields import WeatherField
 from librewxr.tiles.png_palette import encode_png
 
-WEATHER_RENDERER_VERSION = 2
+WEATHER_RENDERER_VERSION = 3
 
 
 def colorize_weather_values(

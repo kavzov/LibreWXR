@@ -77,6 +77,9 @@ class Settings(BaseSettings):
     weather_png_mode: Literal["lossless", "quantized"] = "quantized"
     weather_png_colors: int = Field(256, ge=2, le=256)
     weather_png_dither: bool = False
+    # Optional PyO3 weather sampling kernels. ``auto`` uses a separately
+    # installed native wheel when present; the base package never requires it.
+    native_render: Literal["auto", "on", "off"] = "auto"
     workers: int = 0  # Number of uvicorn worker processes; 0 = mode default
     warmer_threads: int = 0  # Render thread pool size; 0 = mode default (auto in single, 4 in multi) (sizes the request-executor pool in multi mode; the warmer itself is single-mode only)
     warm_coord_zoom: int = 6  # Pre-warm coordinate caches up to this zoom (0 = disable) (in multi mode runs in each render worker at startup)

@@ -33,8 +33,14 @@ from librewxr.data.weather_fields import (
     decode_field,
     encode_field,
     field_spec,
-    relative_humidity_from_temperature_dewpoint,
-    wind_speed_from_uv,
+)
+from librewxr.native_weather import (
+    active_implementation,
+    ensure_native_render_available,
+    sample_bilinear_regular_grid,
+    sample_derived_humidity,
+    sample_temporal_bilinear,
+    sample_wind_speed,
 )
 from librewxr.sources.world.ifs.models import (
     ECMWF_STATE_FORMAT_VERSION,
@@ -117,6 +123,7 @@ class ECMWFGrid:
         *,
         cleanup_tmp: bool = True,
     ):
+        ensure_native_render_available()
         self._timesteps: dict[int, WeatherFrame] = _WeatherFrameDict()
         self._grid_version = GRID_GEOMETRY_VERSION
         self._content_version = 0
@@ -1203,72 +1210,15 @@ class ECMWFGrid:
         bilinear: bool,
     ) -> np.ndarray:
         encoded = frame.field(field)
-        if not bilinear:
-            result = decode_field(field, encoded[plan.r0, plan.c0])
-            return np.where(plan.valid, result, np.nan).astype(
-                np.float32, copy=False
-            )
-
-        samples = (
-            encoded[plan.r0, plan.c0],
-            encoded[plan.r0, plan.c1],
-            encoded[plan.r1, plan.c0],
-            encoded[plan.r1, plan.c1],
-        )
         spec = field_spec(field)
-        has_nodata = spec.nodata is not None and any(
-            np.any(sample == spec.nodata) for sample in samples
+        return sample_bilinear_regular_grid(
+            encoded,
+            plan,
+            scale=spec.scale,
+            offset=spec.offset,
+            nodata=spec.nodata,
+            bilinear=bilinear,
         )
-
-        if not has_nodata:
-            # Interpolation commutes with the field's affine decode. Work in
-            # encoded space and reuse two float32 buffers instead of stacking
-            # four decoded values, four weights, and four validity masks.
-            top = samples[0].astype(np.float32)
-            scratch = samples[1].astype(np.float32)
-            scratch -= top
-            scratch *= plan.dc
-            top += scratch
-
-            bottom = samples[2].astype(np.float32)
-            scratch = samples[3].astype(np.float32)
-            scratch -= bottom
-            scratch *= plan.dc
-            bottom += scratch
-            bottom -= top
-            bottom *= plan.dr
-            top += bottom
-            top *= np.float32(spec.scale)
-            top += np.float32(spec.offset)
-            top[~plan.valid] = np.nan
-            return top
-
-        # Rare nodata path: accumulate only valid neighbours without stack or
-        # full-size np.where temporaries. The weighted encoded mean can still
-        # be decoded once because every field codec is affine.
-        weighted = np.zeros(plan.shape, dtype=np.float32)
-        weight_sum = np.zeros(plan.shape, dtype=np.float32)
-        scratch = np.empty(plan.shape, dtype=np.float32)
-        one_minus_dr = np.subtract(np.float32(1.0), plan.dr)
-        one_minus_dc = np.subtract(np.float32(1.0), plan.dc)
-        weights = (
-            one_minus_dr * one_minus_dc,
-            one_minus_dr * plan.dc,
-            plan.dr * one_minus_dc,
-            plan.dr * plan.dc,
-        )
-        for sample, weight in zip(samples, weights, strict=True):
-            valid = sample != spec.nodata
-            scratch.fill(0.0)
-            np.multiply(sample, weight, out=scratch, where=valid)
-            weighted += scratch
-            np.add(weight_sum, weight, out=weight_sum, where=valid)
-        result = np.full(plan.shape, np.nan, dtype=np.float32)
-        valid_result = (weight_sum > 0.0) & plan.valid
-        np.divide(weighted, weight_sum, out=result, where=valid_result)
-        result *= np.float32(spec.scale)
-        result[valid_result] += np.float32(spec.offset)
-        return result
 
     def _sample_field_with_plan(
         self,
@@ -1288,9 +1238,9 @@ class ECMWFGrid:
                 for dependency in spec.dependencies
             ]
             if field is WeatherField.RELATIVE_HUMIDITY_2M:
-                return relative_humidity_from_temperature_dewpoint(*dependencies)
+                return sample_derived_humidity(*dependencies)
             if field is WeatherField.WIND_SPEED_10M:
-                return wind_speed_from_uv(*dependencies)
+                return sample_wind_speed(*dependencies)
             raise ValueError(f"No derivation function for {field.value}")
 
         if field not in REQUIRED_WEATHER_FIELDS:
@@ -1317,28 +1267,17 @@ class ECMWFGrid:
             return self._sample_physical_frame(
                 frames[after], field, plan, bilinear
             )
-        before_values = self._sample_physical_frame(
-            frames[before], field, plan, bilinear
-        )
-        after_values = self._sample_physical_frame(
-            frames[after], field, plan, bilinear
-        )
         fraction = np.float32((timestamp - before) / (after - before))
-        if np.isfinite(before_values).all() and np.isfinite(after_values).all():
-            after_values -= before_values
-            after_values *= fraction
-            before_values += after_values
-            return before_values
-        valid_before = np.isfinite(before_values)
-        valid_after = np.isfinite(after_values)
-        result = np.full(plan.shape, np.nan, dtype=np.float32)
-        both = valid_before & valid_after
-        result[both] = before_values[both] + fraction * (
-            after_values[both] - before_values[both]
+        return sample_temporal_bilinear(
+            frames[before].field(field),
+            frames[after].field(field),
+            plan,
+            alpha=float(fraction),
+            scale=spec.scale,
+            offset=spec.offset,
+            nodata=spec.nodata,
+            bilinear=bilinear,
         )
-        result[valid_before & ~valid_after] = before_values[valid_before & ~valid_after]
-        result[valid_after & ~valid_before] = after_values[valid_after & ~valid_before]
-        return result
 
     def sample_field(
         self,
@@ -1520,6 +1459,7 @@ class ECMWFGrid:
             "last_successful_update": self._last_successful_update,
             "weather_fields_enabled": bool(self._weather_fields),
             "configured_fields": sorted(field.value for field in self._weather_fields),
+            "weather_sampling": active_implementation(),
             "last_update_error": self._last_update_error,
         }
 

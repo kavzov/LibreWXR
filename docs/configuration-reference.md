@@ -691,6 +691,27 @@ cost.
 | **Default** | `false` |
 | **Type** | boolean |
 
+### `LIBREWXR_NATIVE_RENDER`
+
+Select the implementation for continuous weather sampling and derived fields.
+The optional `librewxr-native` ABI3 wheel contains only PyO3 sampling kernels;
+FastAPI, downloading, source discovery, state management, and APIs remain
+Python. The standard LibreWXR installation does not depend on Rust or maturin.
+
+| | |
+|---|---|
+| **Default** | `auto` |
+| **Values** | `auto`, `on`, `off` |
+
+- `auto` uses `_librewxr_native` when installed and otherwise uses NumPy.
+- `on` fails source initialization with a clear error when the extension is
+  unavailable.
+- `off` always uses NumPy, including when the extension is installed.
+
+The native kernels are single-threaded and release the GIL. They do not create
+a Rayon pool, preventing hidden oversubscription across Uvicorn workers. Build
+and wheel-install instructions are in `native/README.md`.
+
 ### `LIBREWXR_WEATHER_FIELDS_FIELDS`
 
 Comma-separated scalar fields to retain. Public derived fields automatically
