@@ -357,6 +357,26 @@ class ECMWFGrid:
 
         return len(self._precip_timestamps())
 
+    def available_timestamps(self) -> list[int]:
+        """Native valid times shared by the atomically published weather fields."""
+
+        return self._field_timestamps(WeatherField.TEMPERATURE_2M)
+
+    def default_timestamp(self, now: int | None = None) -> int | None:
+        """Return the available valid time nearest to ``now``."""
+
+        timestamps = self.available_timestamps()
+        if not timestamps:
+            return None
+        target = int(time.time()) if now is None else now
+        return min(timestamps, key=lambda value: abs(value - target))
+
+    @property
+    def model_version(self) -> str:
+        """Version token for rendered-tile cache isolation."""
+
+        return f"{self._reference_time or 'unpublished'}:g{self._grid_version}"
+
     @property
     def data_bytes(self) -> int:
         return sum(

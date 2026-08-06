@@ -52,3 +52,45 @@ class WeatherMapsResponse(BaseModel):
     host: str
     radar: RadarData
     satellite: SatelliteData
+
+
+class WeatherPaletteStop(BaseModel):
+    value: float
+    color: str
+
+
+class WeatherPaletteInfo(BaseModel):
+    id: str
+    display_name: str
+    unit: str
+    minimum: float
+    maximum: float
+    below_color: str
+    above_color: str
+    nodata_color: str
+    opacity: float
+    stops: list[WeatherPaletteStop]
+
+
+class WeatherFieldInfo(BaseModel):
+    id: str
+    display_name: str
+    unit: str
+    palette_ids: list[str]
+
+
+class WeatherMetadataResponse(BaseModel):
+    active_model_run: str | None
+    generated: int
+    stale: bool
+    attribution: str
+    fields: list[WeatherFieldInfo]
+    available_timestamps: list[int]
+    default_timestamp: int | None
+    palette_ids: list[str]
+    palettes: list[WeatherPaletteInfo]
+    tile_url_template: str
+    sizes: list[int]
+    formats: list[str]
+    min_zoom: int
+    max_zoom: int

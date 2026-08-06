@@ -19,12 +19,22 @@ from librewxr.api.models import (
     RadarData,
     RadarTimestamp,
     SatelliteData,
+    WeatherFieldInfo,
     WeatherMapsResponse,
+    WeatherMetadataResponse,
+    WeatherPaletteInfo,
+    WeatherPaletteStop,
 )
 from librewxr.api.conditional import compute_etag, conditional_response
 from librewxr.colors.schemes import SCHEME_NAMES
+from librewxr.colors.weather_palettes import (
+    PUBLIC_WEATHER_FIELDS,
+    WEATHER_PALETTES,
+    palettes_for_field,
+)
 from librewxr.config import settings
 from librewxr.data.store import FrameStore
+from librewxr.data.weather_fields import field_spec
 from librewxr.mcp.discovery import build_ai_catalog
 from librewxr.memory import detect_memory_limit_mb
 from librewxr.tiles.cache import CachedRender, TileCache
@@ -38,6 +48,10 @@ from librewxr.tiles.request_tracker import TileRequestTracker
 from librewxr.tiles.satellite_renderer import (
     render_gmgsi_composite_tile,
     render_gmgsi_tile,
+)
+from librewxr.tiles.weather_renderer import (
+    WEATHER_RENDERER_VERSION,
+    render_scalar_weather_tile,
 )
 
 logger = logging.getLogger(__name__)
@@ -338,6 +352,201 @@ async def health():
 
 def _content_type(ext: str) -> str:
     return "image/webp" if ext == "webp" else "image/png"
+
+
+_WEATHER_TILE_SIZES = (256, 512)
+_WEATHER_TILE_FORMATS = ("png", "webp")
+_WEATHER_TILE_MAX_AGE = 21_600
+_WEATHER_ATTRIBUTION = "ECMWF IFS data via Open-Meteo"
+
+
+def _weather_available_timestamps() -> list[int]:
+    if ecmwf_grid is None:
+        return []
+    getter = getattr(ecmwf_grid, "available_timestamps", None)
+    if getter is None:
+        return []
+    return sorted(int(timestamp) for timestamp in getter())
+
+
+@router.get("/v2/weather/metadata.json", response_model=WeatherMetadataResponse)
+async def weather_metadata(response: Response) -> WeatherMetadataResponse:
+    """Metadata and legend definitions for scalar global weather tiles."""
+
+    now = int(time.time())
+    timestamps = _weather_available_timestamps()
+    health = (
+        ecmwf_grid.health_status(now)
+        if ecmwf_grid is not None and hasattr(ecmwf_grid, "health_status")
+        else {"stale": True}
+    )
+    default_timestamp = (
+        ecmwf_grid.default_timestamp(now)
+        if ecmwf_grid is not None and hasattr(ecmwf_grid, "default_timestamp")
+        else (min(timestamps, key=lambda value: abs(value - now)) if timestamps else None)
+    )
+    fields = []
+    for public_id, field in PUBLIC_WEATHER_FIELDS.items():
+        spec = field_spec(field)
+        fields.append(
+            WeatherFieldInfo(
+                id=public_id,
+                display_name=spec.public_name,
+                unit=spec.unit,
+                palette_ids=[palette.id for palette in palettes_for_field(field)],
+            )
+        )
+    palettes = [
+        WeatherPaletteInfo(
+            id=palette.id,
+            display_name=palette.display_name,
+            unit=palette.unit,
+            minimum=palette.minimum,
+            maximum=palette.maximum,
+            below_color=palette.below_color,
+            above_color=palette.above_color,
+            nodata_color=palette.nodata_color,
+            opacity=palette.opacity,
+            stops=[
+                WeatherPaletteStop(value=stop.value, color=stop.color)
+                for stop in palette.stops
+            ],
+        )
+        for palette in WEATHER_PALETTES.values()
+    ]
+    host = settings.public_url.rstrip("/")
+    response.headers["Cache-Control"] = "public, max-age=60"
+    return WeatherMetadataResponse(
+        active_model_run=(
+            ecmwf_grid.reference_time if ecmwf_grid is not None else None
+        ),
+        generated=now,
+        stale=bool(health.get("stale", True)),
+        attribution=_WEATHER_ATTRIBUTION,
+        fields=fields,
+        available_timestamps=timestamps,
+        default_timestamp=default_timestamp,
+        palette_ids=list(WEATHER_PALETTES),
+        palettes=palettes,
+        tile_url_template=(
+            f"{host}/v2/weather/{{field}}/{{timestamp}}/{{size}}/"
+            "{z}/{x}/{y}/{palette}.{ext}"
+        ),
+        sizes=list(_WEATHER_TILE_SIZES),
+        formats=list(_WEATHER_TILE_FORMATS),
+        min_zoom=0,
+        max_zoom=settings.max_zoom,
+    )
+
+
+@router.get(
+    "/v2/weather/{field}/{timestamp}/{size}/{z}/{x}/{y}/{palette}.{ext}"
+)
+async def weather_field_tile(
+    request: Request,
+    field: str,
+    timestamp: int,
+    size: int,
+    z: int = Path(ge=0),
+    x: int = Path(ge=0),
+    y: int = Path(ge=0),
+    palette: str = Path(min_length=1),
+    ext: str = Path(pattern=r"^(png|webp)$"),
+) -> Response:
+    """Render a continuous global weather field without changing radar APIs."""
+
+    weather_field = PUBLIC_WEATHER_FIELDS.get(field)
+    if weather_field is None:
+        raise HTTPException(status_code=404, detail=f"Unknown weather field: {field}")
+    if size not in _WEATHER_TILE_SIZES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported tile size: {size}; use 256 or 512",
+        )
+    if z > settings.max_zoom:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Zoom {z} exceeds max {settings.max_zoom}",
+        )
+    max_tiles = 2**z
+    if x >= max_tiles or y >= max_tiles:
+        raise HTTPException(status_code=400, detail="Tile coordinates out of range")
+
+    selected_palette = WEATHER_PALETTES.get(palette)
+    if selected_palette is None or selected_palette.field is not weather_field:
+        allowed = [item.id for item in palettes_for_field(weather_field)]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported palette for {field}; allowed: {', '.join(allowed)}",
+        )
+    timestamps = _weather_available_timestamps()
+    if not timestamps or ecmwf_grid is None or nwp_chain is None:
+        raise HTTPException(status_code=503, detail="Weather field data not available")
+    if timestamp < timestamps[0] or timestamp > timestamps[-1]:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Timestamp {timestamp} outside available range "
+                f"[{timestamps[0]}, {timestamps[-1]}]"
+            ),
+        )
+    if not nwp_chain.has_field(weather_field):
+        raise HTTPException(status_code=503, detail=f"Field {field} not available")
+
+    model_version = getattr(ecmwf_grid, "model_version", None)
+    if model_version is None:
+        model_version = (
+            f"{getattr(ecmwf_grid, 'reference_time', None)}:"
+            f"g{getattr(ecmwf_grid, 'grid_version', 0)}"
+        )
+    cache_key = (
+        "weather",
+        field,
+        model_version,
+        timestamp,
+        z,
+        x,
+        y,
+        size,
+        palette,
+        ext,
+        WEATHER_RENDERER_VERSION,
+    )
+    cached = tile_cache.get(cache_key) if tile_cache is not None else None
+    if isinstance(cached, CachedRender):
+        tile_bytes = cached.data
+        etag = cached.etag
+    else:
+        try:
+            tile_bytes = await asyncio.to_thread(
+                render_scalar_weather_tile,
+                source=nwp_chain,
+                field=weather_field,
+                palette=selected_palette,
+                timestamp=timestamp,
+                z=z,
+                x=x,
+                y=y,
+                tile_size=size,
+                fmt=ext,
+            )
+        except Exception as exc:
+            logger.exception("Weather field tile render failed: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Weather field tile rendering failed",
+            ) from exc
+        etag = compute_etag(tile_bytes)
+        if tile_cache is not None:
+            tile_cache.put(cache_key, CachedRender(tile_bytes, etag))
+
+    return conditional_response(
+        request=request,
+        body=tile_bytes,
+        etag=etag,
+        content_type=_content_type(ext),
+        max_age=_WEATHER_TILE_MAX_AGE,
+    )
 
 
 @router.get("/public/weather-maps.json")
