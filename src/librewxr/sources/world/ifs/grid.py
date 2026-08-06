@@ -22,11 +22,19 @@ from earthkit.regrid import interpolate
 from omfiles import OmFileReader
 
 from librewxr.config import settings
+from librewxr.data.weather_sampling import (
+    SamplingPlan,
+    build_regular_sampling_plan,
+    cached_regular_tile_sampling_plan,
+    web_mercator_tile_latlons,
+)
 from librewxr.data.weather_fields import (
     WeatherField,
     decode_field,
     encode_field,
     field_spec,
+    relative_humidity_from_temperature_dewpoint,
+    wind_speed_from_uv,
 )
 from librewxr.sources.world.ifs.models import (
     ECMWF_STATE_FORMAT_VERSION,
@@ -44,6 +52,7 @@ SOUTH = -90.0
 GRID_WIDTH = int((EAST - WEST) / PIXEL_SIZE)  # 3600
 GRID_HEIGHT = int((NORTH - SOUTH) / PIXEL_SIZE) + 1  # 1801
 GRID_SHAPE = (GRID_HEIGHT, GRID_WIDTH)
+GRID_GEOMETRY_VERSION = 1
 
 # Z-R relationship constants (Marshall-Palmer)
 ZR_A_RAIN = 200.0
@@ -100,6 +109,7 @@ class ECMWFGrid:
 
     def __init__(self, cache_dir: Path | None = None):
         self._timesteps: dict[int, WeatherFrame] = _WeatherFrameDict()
+        self._grid_version = GRID_GEOMETRY_VERSION
         self._reference_time: str | None = None
         self._last_modified_time: str | None = None
         self._last_successful_update: int | None = None
@@ -369,7 +379,14 @@ class ECMWFGrid:
         return totals
 
     def available_fields(self) -> frozenset[WeatherField]:
-        return frozenset({WeatherField.PRECIPITATION, *REQUIRED_WEATHER_FIELDS})
+        return frozenset(
+            {
+                WeatherField.PRECIPITATION,
+                WeatherField.RELATIVE_HUMIDITY_2M,
+                WeatherField.WIND_SPEED_10M,
+                *REQUIRED_WEATHER_FIELDS,
+            }
+        )
 
     def has_field(self, field: WeatherField) -> bool:
         try:
@@ -813,74 +830,191 @@ class ECMWFGrid:
             if frame.snow_mask.shape != GRID_SHAPE or frame.snow_mask.dtype != bool:
                 raise ValueError("snow_mask has invalid shape or dtype")
 
+    @property
+    def grid_version(self) -> int:
+        """Version of the spatial geometry used in sampling-plan cache keys."""
+
+        return self._grid_version
+
+    @property
+    def sampling_grid_identity(self) -> str:
+        """Stable identity for the regular IFS output grid."""
+
+        return f"{self.name}:regular_global"
+
+    def invalidate_sampling_plans(self) -> None:
+        """Advance the geometry version so old cached plans cannot be reused."""
+
+        self._grid_version += 1
+
+    @staticmethod
+    def _build_sampling_plan(lat: np.ndarray, lon: np.ndarray) -> SamplingPlan:
+        return build_regular_sampling_plan(
+            lat,
+            lon,
+            west=WEST,
+            north=NORTH,
+            pixel_size_x=PIXEL_SIZE,
+            pixel_size_y=PIXEL_SIZE,
+            width=GRID_WIDTH,
+            height=GRID_HEIGHT,
+            wrap_longitude=True,
+        )
+
     @staticmethod
     def _spatial_indices(
         lat: np.ndarray, lon: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Legacy clamped indexes used by precipitation and nowcast."""
+
         row_f = (NORTH - lat) / PIXEL_SIZE
         col_f = (lon - WEST) / PIXEL_SIZE
         row_floor = np.floor(row_f)
         col_floor = np.floor(col_f)
         r0_raw = row_floor.astype(np.int32)
         c0_raw = col_floor.astype(np.int32)
-        r1_raw = r0_raw + 1
-        c1_raw = c0_raw + 1
         r0 = np.clip(r0_raw, 0, GRID_HEIGHT - 1)
         c0 = np.clip(c0_raw, 0, GRID_WIDTH - 1)
-        r1 = np.clip(r1_raw, 0, GRID_HEIGHT - 1)
-        c1 = np.clip(c1_raw, 0, GRID_WIDTH - 1)
+        r1 = np.clip(r0_raw + 1, 0, GRID_HEIGHT - 1)
+        c1 = np.clip(c0_raw + 1, 0, GRID_WIDTH - 1)
         dr = np.clip(row_f - row_floor, 0.0, 1.0).astype(np.float32)
         dc = np.clip(col_f - col_floor, 0.0, 1.0).astype(np.float32)
         return r0, c0, r1, c1, dr, dc
+
+    def sampling_plan(
+        self,
+        z: int,
+        x: int,
+        y: int,
+        tile_size: int = 256,
+        padding: int = 0,
+    ) -> SamplingPlan:
+        """Return reusable geometry for an XYZ tile on the IFS grid."""
+
+        return cached_regular_tile_sampling_plan(
+            self.sampling_grid_identity,
+            self._grid_version,
+            z,
+            x,
+            y,
+            tile_size,
+            padding,
+            "regular_latlon",
+            WEST,
+            NORTH,
+            PIXEL_SIZE,
+            PIXEL_SIZE,
+            GRID_WIDTH,
+            GRID_HEIGHT,
+            True,
+        )
 
     def _sample_physical_frame(
         self,
         frame: WeatherFrame,
         field: WeatherField,
-        lat: np.ndarray,
-        lon: np.ndarray,
+        plan: SamplingPlan,
         bilinear: bool,
     ) -> np.ndarray:
         encoded = frame.field(field)
         if not bilinear:
-            row = np.clip(
-                ((NORTH - lat) / PIXEL_SIZE).astype(np.int32),
-                0,
-                GRID_HEIGHT - 1,
+            result = decode_field(field, encoded[plan.r0, plan.c0])
+            return np.where(plan.valid, result, np.nan).astype(
+                np.float32, copy=False
             )
-            col = np.clip(
-                ((lon - WEST) / PIXEL_SIZE).astype(np.int32),
-                0,
-                GRID_WIDTH - 1,
-            )
-            return decode_field(field, encoded[row, col])
 
-        r0, c0, r1, c1, dr, dc = self._spatial_indices(lat, lon)
         values = np.stack(
             [
-                decode_field(field, encoded[r0, c0]),
-                decode_field(field, encoded[r0, c1]),
-                decode_field(field, encoded[r1, c0]),
-                decode_field(field, encoded[r1, c1]),
+                decode_field(field, encoded[plan.r0, plan.c0]),
+                decode_field(field, encoded[plan.r0, plan.c1]),
+                decode_field(field, encoded[plan.r1, plan.c0]),
+                decode_field(field, encoded[plan.r1, plan.c1]),
             ]
         )
         weights = np.stack(
             [
-                (1.0 - dr) * (1.0 - dc),
-                (1.0 - dr) * dc,
-                dr * (1.0 - dc),
-                dr * dc,
+                (1.0 - plan.dr) * (1.0 - plan.dc),
+                (1.0 - plan.dr) * plan.dc,
+                plan.dr * (1.0 - plan.dc),
+                plan.dr * plan.dc,
             ]
         ).astype(np.float32)
         valid = np.isfinite(values)
         weight_sum = np.sum(np.where(valid, weights, 0.0), axis=0)
         weighted = np.sum(np.where(valid, values * weights, 0.0), axis=0)
-        return np.divide(
+        result = np.divide(
             weighted,
             weight_sum,
-            out=np.full(lat.shape, np.nan, dtype=np.float32),
-            where=weight_sum > 0.0,
+            out=np.full(plan.shape, np.nan, dtype=np.float32),
+            where=(weight_sum > 0.0) & plan.valid,
         ).astype(np.float32, copy=False)
+        result[~plan.valid] = np.nan
+        return result
+
+    def _sample_field_with_plan(
+        self,
+        field: WeatherField,
+        plan: SamplingPlan,
+        timestamp: int | None,
+        bilinear: bool,
+    ) -> np.ndarray:
+        """Sample native frames, interpolate requested points, then derive."""
+
+        spec = field_spec(field)
+        if spec.derived:
+            dependencies = [
+                self._sample_field_with_plan(
+                    dependency, plan, timestamp, bilinear
+                )
+                for dependency in spec.dependencies
+            ]
+            if field is WeatherField.RELATIVE_HUMIDITY_2M:
+                return relative_humidity_from_temperature_dewpoint(*dependencies)
+            if field is WeatherField.WIND_SPEED_10M:
+                return wind_speed_from_uv(*dependencies)
+            raise ValueError(f"No derivation function for {field.value}")
+
+        if field not in REQUIRED_WEATHER_FIELDS:
+            raise KeyError(f"{self.name} does not provide {field.value}")
+
+        frames = self._timesteps
+        timestamps = self._field_timestamps(field, frames)
+        if not timestamps:
+            return np.full(plan.shape, np.nan, dtype=np.float32)
+        if timestamp is None:
+            timestamp = timestamps[-1]
+        idx = int(np.searchsorted(timestamps, timestamp))
+        if idx == 0:
+            return self._sample_physical_frame(
+                frames[timestamps[0]], field, plan, bilinear
+            )
+        if idx >= len(timestamps):
+            return self._sample_physical_frame(
+                frames[timestamps[-1]], field, plan, bilinear
+            )
+        before = timestamps[idx - 1]
+        after = timestamps[idx]
+        if timestamp == after:
+            return self._sample_physical_frame(
+                frames[after], field, plan, bilinear
+            )
+        before_values = self._sample_physical_frame(
+            frames[before], field, plan, bilinear
+        )
+        after_values = self._sample_physical_frame(
+            frames[after], field, plan, bilinear
+        )
+        fraction = np.float32((timestamp - before) / (after - before))
+        valid_before = np.isfinite(before_values)
+        valid_after = np.isfinite(after_values)
+        result = np.full(plan.shape, np.nan, dtype=np.float32)
+        both = valid_before & valid_after
+        result[both] = before_values[both] + fraction * (
+            after_values[both] - before_values[both]
+        )
+        result[valid_before & ~valid_after] = before_values[valid_before & ~valid_after]
+        result[valid_after & ~valid_before] = after_values[valid_after & ~valid_before]
+        return result
 
     def sample_field(
         self,
@@ -891,49 +1025,41 @@ class ECMWFGrid:
         bilinear: bool = True,
     ) -> np.ndarray:
         normalized = WeatherField(field)
+        if lat.shape != lon.shape:
+            raise ValueError("lat and lon must have identical shapes")
         if normalized is WeatherField.PRECIPITATION:
             return decode_field(normalized, self.sample(lat, lon, timestamp, bilinear))
-        if normalized not in REQUIRED_WEATHER_FIELDS:
-            raise KeyError(f"{self.name} does not provide {normalized.value}")
+        plan = self._build_sampling_plan(lat, lon)
+        return self._sample_field_with_plan(
+            normalized, plan, timestamp, bilinear
+        )
 
-        frames = self._timesteps
-        timestamps = self._field_timestamps(normalized, frames)
-        if not timestamps:
-            return np.full(lat.shape, np.nan, dtype=np.float32)
-        if timestamp is None:
-            timestamp = timestamps[-1]
-        idx = int(np.searchsorted(timestamps, timestamp))
-        if idx == 0:
-            return self._sample_physical_frame(
-                frames[timestamps[0]], normalized, lat, lon, bilinear
+    def sample_tile_field(
+        self,
+        field: WeatherField,
+        z: int,
+        x: int,
+        y: int,
+        timestamp: int | None = None,
+        tile_size: int = 256,
+        padding: int = 0,
+        bilinear: bool = True,
+    ) -> np.ndarray:
+        """Sample one tile without materialising an interpolated global frame."""
+
+        normalized = WeatherField(field)
+        plan = self.sampling_plan(z, x, y, tile_size, padding)
+        if normalized is WeatherField.PRECIPITATION:
+            # Precipitation retains its legacy nearest-time semantics. Generic
+            # continuous weather layers use the optimized plan path above.
+            lat, lon = web_mercator_tile_latlons(z, x, y, tile_size, padding)
+            return decode_field(
+                normalized,
+                self.sample(lat, lon, timestamp, bilinear),
             )
-        if idx >= len(timestamps):
-            return self._sample_physical_frame(
-                frames[timestamps[-1]], normalized, lat, lon, bilinear
-            )
-        before = timestamps[idx - 1]
-        after = timestamps[idx]
-        if timestamp == after:
-            return self._sample_physical_frame(
-                frames[after], normalized, lat, lon, bilinear
-            )
-        before_values = self._sample_physical_frame(
-            frames[before], normalized, lat, lon, bilinear
+        return self._sample_field_with_plan(
+            normalized, plan, timestamp, bilinear
         )
-        after_values = self._sample_physical_frame(
-            frames[after], normalized, lat, lon, bilinear
-        )
-        fraction = np.float32((timestamp - before) / (after - before))
-        valid_before = np.isfinite(before_values)
-        valid_after = np.isfinite(after_values)
-        result = np.full(lat.shape, np.nan, dtype=np.float32)
-        both = valid_before & valid_after
-        result[both] = before_values[both] + fraction * (
-            after_values[both] - before_values[both]
-        )
-        result[valid_before & ~valid_after] = before_values[valid_before & ~valid_after]
-        result[valid_after & ~valid_before] = after_values[valid_after & ~valid_before]
-        return result
 
     def sample(
         self,
@@ -997,13 +1123,43 @@ class ECMWFGrid:
         return snow_mask[row, col]
 
     def domain_mask(self, lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
-        return np.ones(lat.shape, dtype=bool)
+        if lat.shape != lon.shape:
+            raise ValueError("lat and lon must have identical shapes")
+        return (
+            np.isfinite(lat)
+            & np.isfinite(lon)
+            & (lat >= -90.0)
+            & (lat <= 90.0)
+        )
 
     def feather_mask(self, lat: np.ndarray, lon: np.ndarray) -> np.ndarray:
-        return np.ones(lat.shape, dtype=np.float32)
+        return self.domain_mask(lat, lon).astype(np.float32)
 
     def has_data_at(self, timestamp: int) -> bool:
         return self._nearest_timestamp(timestamp) is not None
+
+    def has_field_at(
+        self,
+        field: WeatherField,
+        timestamp: int | None,
+    ) -> bool:
+        """Whether the last complete run can answer this field and valid time.
+
+        Continuous IFS fields deliberately clamp outside their available time
+        range, so a stale but complete run remains the global catch-all while a
+        newer run is unavailable.
+        """
+
+        normalized = WeatherField(field)
+        if normalized is WeatherField.PRECIPITATION:
+            return bool(self._precip_timestamps())
+        spec = field_spec(normalized)
+        if spec.derived:
+            return all(
+                bool(self._field_timestamps(dependency))
+                for dependency in spec.dependencies
+            )
+        return bool(self._field_timestamps(normalized))
 
     def has_data(self) -> bool:
         return bool(self._precip_timestamps())
@@ -1062,6 +1218,7 @@ class ECMWFGrid:
             }
         return {
             "format_version": ECMWF_STATE_FORMAT_VERSION,
+            "grid_version": self._grid_version,
             "memmap_dir": str(self._memmap_dir),
             "reference_time": self._reference_time,
             "last_modified_time": self._last_modified_time,
@@ -1119,6 +1276,7 @@ class ECMWFGrid:
         for ts, frame in new_timesteps.items():
             restored[ts] = frame
         self._timesteps = restored
+        self._grid_version = int(state.get("grid_version", GRID_GEOMETRY_VERSION))
         self._reference_time = state.get("reference_time")
         self._last_modified_time = state.get("last_modified_time")
         self._last_successful_update = state.get("last_successful_update")

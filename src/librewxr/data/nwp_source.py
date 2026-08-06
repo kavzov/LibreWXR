@@ -11,6 +11,7 @@ Each source handles its own quirks internally — Z-R conversion, projection
 sampling, fetch cadence — so the renderer talks to a single uniform interface.
 """
 
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 import numpy as np
@@ -22,6 +23,16 @@ from librewxr.data.weather_fields import (
     relative_humidity_from_temperature_dewpoint,
     wind_speed_from_uv,
 )
+from librewxr.data.weather_sampling import web_mercator_tile_latlons
+
+
+@dataclass(frozen=True)
+class _TileSamplingContext:
+    z: int
+    x: int
+    y: int
+    tile_size: int
+    padding: int
 
 
 @runtime_checkable
@@ -165,7 +176,14 @@ class NWPChain:
         return field in cls._source_fields(src)
 
     @staticmethod
-    def _source_has_data(src: NWPSource, timestamp: int | None) -> bool:
+    def _source_has_data(
+        src: NWPSource,
+        field: WeatherField,
+        timestamp: int | None,
+    ) -> bool:
+        has_field_at = getattr(src, "has_field_at", None)
+        if has_field_at is not None:
+            return bool(has_field_at(field, timestamp))
         if timestamp is None:
             return src.has_data()
         return src.has_data_at(timestamp)
@@ -209,22 +227,69 @@ class NWPChain:
         Categorical specifications use hard priority selection instead.
         """
 
-        normalized = WeatherField(field)
-        spec = field_spec(normalized)
-
         if lat.shape != lon.shape:
             raise ValueError("lat and lon must have identical shapes")
+        return self._sample_field(
+            WeatherField(field),
+            lat,
+            lon,
+            timestamp,
+            bilinear,
+            tile_context=None,
+        )
+
+    def sample_tile_field(
+        self,
+        field: WeatherField,
+        z: int,
+        x: int,
+        y: int,
+        timestamp: int | None = None,
+        tile_size: int = 256,
+        padding: int = 0,
+        bilinear: bool = True,
+    ) -> np.ndarray:
+        """Sample a complete XYZ tile through the same field chain.
+
+        Regular-grid sources may consume the tile context directly and reuse a
+        cached spatial plan. Other sources keep using coordinate-array sampling.
+        """
+
+        lat, lon = web_mercator_tile_latlons(z, x, y, tile_size, padding)
+        context = _TileSamplingContext(z, x, y, tile_size, padding)
+        return self._sample_field(
+            WeatherField(field),
+            lat,
+            lon,
+            timestamp,
+            bilinear,
+            tile_context=context,
+        )
+
+    def _sample_field(
+        self,
+        normalized: WeatherField,
+        lat: np.ndarray,
+        lon: np.ndarray,
+        timestamp: int | None,
+        bilinear: bool,
+        tile_context: _TileSamplingContext | None,
+    ) -> np.ndarray:
+        """Shared coordinate/tile implementation for continuous fields."""
+
+        spec = field_spec(normalized)
 
         if spec.derived:
             if not set(spec.dependencies) <= self.available_fields():
                 return np.full(lat.shape, np.nan, dtype=np.float32)
             dependencies = [
-                self.sample_field(
+                self._sample_field(
                     dependency,
                     lat,
                     lon,
-                    timestamp=timestamp,
-                    bilinear=bilinear,
+                    timestamp,
+                    bilinear,
+                    tile_context,
                 )
                 for dependency in spec.dependencies
             ]
@@ -236,7 +301,11 @@ class NWPChain:
 
         if spec.categorical:
             return self._sample_categorical_field(
-                normalized, lat, lon, timestamp=timestamp
+                normalized,
+                lat,
+                lon,
+                timestamp=timestamp,
+                tile_context=tile_context,
             )
 
         weighted_sum = np.zeros(lat.shape, dtype=np.float32)
@@ -248,7 +317,7 @@ class NWPChain:
                 break
             if not self._source_has_field(src, normalized):
                 continue
-            if not self._source_has_data(src, timestamp):
+            if not self._source_has_data(src, normalized, timestamp):
                 continue
 
             feather = np.asarray(src.feather_mask(lat, lon), dtype=np.float32)
@@ -259,22 +328,16 @@ class NWPChain:
             if not relevant.any():
                 continue
 
-            sampler = getattr(src, "sample_field", None)
-            if sampler is None:
-                # A transition-only adapter for older precipitation sources.
-                encoded = src.sample(
-                    lat[relevant], lon[relevant], timestamp, bilinear
-                )
-                sampled = decode_field(normalized, encoded)
-            else:
-                sampled = sampler(
-                    normalized,
-                    lat[relevant],
-                    lon[relevant],
-                    timestamp,
-                    bilinear,
-                )
-            sampled = np.asarray(sampled, dtype=np.float32)
+            sampled = self._sample_source_field(
+                src,
+                normalized,
+                lat,
+                lon,
+                relevant,
+                timestamp,
+                bilinear,
+                tile_context,
+            )
             valid = np.isfinite(sampled)
             if not valid.any():
                 continue
@@ -295,12 +358,65 @@ class NWPChain:
         result[valid_result] = weighted_sum[valid_result] / weight_sum[valid_result]
         return result
 
+    @staticmethod
+    def _sample_source_field(
+        src: NWPSource,
+        field: WeatherField,
+        lat: np.ndarray,
+        lon: np.ndarray,
+        relevant: np.ndarray,
+        timestamp: int | None,
+        bilinear: bool,
+        tile_context: _TileSamplingContext | None,
+    ) -> np.ndarray:
+        """Sample relevant pixels, using a source tile plan when available."""
+
+        tile_sampler = getattr(src, "sample_tile_field", None)
+        if tile_context is not None and tile_sampler is not None:
+            full = np.asarray(
+                tile_sampler(
+                    field,
+                    tile_context.z,
+                    tile_context.x,
+                    tile_context.y,
+                    timestamp,
+                    tile_context.tile_size,
+                    tile_context.padding,
+                    bilinear,
+                ),
+                dtype=np.float32,
+            )
+            if full.shape != lat.shape:
+                raise ValueError(
+                    f"{src.name} returned tile shape {full.shape}, expected {lat.shape}"
+                )
+            return full[relevant]
+
+        sampler = getattr(src, "sample_field", None)
+        if sampler is None:
+            # A transition-only adapter for older precipitation sources.
+            encoded = src.sample(
+                lat[relevant], lon[relevant], timestamp, bilinear
+            )
+            return np.asarray(decode_field(field, encoded), dtype=np.float32)
+        return np.asarray(
+            sampler(
+                field,
+                lat[relevant],
+                lon[relevant],
+                timestamp,
+                bilinear,
+            ),
+            dtype=np.float32,
+        )
+
     def _sample_categorical_field(
         self,
         field: WeatherField,
         lat: np.ndarray,
         lon: np.ndarray,
         timestamp: int | None,
+        tile_context: _TileSamplingContext | None = None,
     ) -> np.ndarray:
         """Select categorical data from the first valid source per pixel."""
 
@@ -311,21 +427,21 @@ class NWPChain:
                 break
             if not self._source_has_field(src, field):
                 continue
-            if not self._source_has_data(src, timestamp):
+            if not self._source_has_data(src, field, timestamp):
                 continue
             feather = np.asarray(src.feather_mask(lat, lon), dtype=np.float32)
             covered = unfilled & np.isfinite(feather) & (feather > 0.0)
             if not covered.any():
                 continue
-            sampled = np.asarray(
-                src.sample_field(
-                    field,
-                    lat[covered],
-                    lon[covered],
-                    timestamp,
-                    False,
-                ),
-                dtype=np.float32,
+            sampled = self._sample_source_field(
+                src,
+                field,
+                lat,
+                lon,
+                covered,
+                timestamp,
+                False,
+                tile_context,
             )
             valid = np.isfinite(sampled)
             covered_indices = np.flatnonzero(covered)
