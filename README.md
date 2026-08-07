@@ -310,11 +310,14 @@ endpoint below for model weather maps.
 ```text
 GET /v2/weather/metadata.json
 GET /v2/weather/{field}/{timestamp}/{size}/{z}/{x}/{y}/{palette}.{ext}
+GET /v2/weather/{field}/{timestamp}/point.json?lat={lat}&lon={lon}
 ```
 
 The metadata response advertises the active IFS run, stale status, attribution,
 available timestamps, fields, units, palettes, legend stops, tile sizes,
-formats, and the complete tile URL template. Public fields are:
+formats, and complete tile and point URL templates. The point endpoint returns
+the bilinearly interpolated physical value used by the tile renderer. Public
+fields are:
 
 | Field | Unit | Palette |
 |---|---|---|

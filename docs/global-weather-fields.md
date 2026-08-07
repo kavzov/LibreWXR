@@ -100,6 +100,7 @@ Abbreviated response:
     }
   ],
   "tile_url_template": "http://localhost:8080/v2/weather/{field}/{timestamp}/{size}/{z}/{x}/{y}/{palette}.{ext}",
+  "point_url_template": "http://localhost:8080/v2/weather/{field}/{timestamp}/point.json?lat={lat}&lon={lon}",
   "sizes": [256, 512],
   "formats": ["png", "webp"],
   "min_zoom": 0,
@@ -126,6 +127,19 @@ Use a timestamp listed by metadata. The renderer also accepts an intermediate
 Unix timestamp within the advertised range and linearly interpolates the two
 surrounding native valid times. Supported sizes are 256 and 512; formats are
 PNG and WebP; zoom is limited by `LIBREWXR_MAX_ZOOM`.
+
+For an exact physical value at one coordinate, use the point template from
+metadata:
+
+```http
+GET /v2/weather/{field}/{timestamp}/point.json?lat={lat}&lon={lon}
+```
+
+The response includes the field, timestamp, requested coordinates, value,
+unit, active model run, and stale flag. `value` is `null` for nodata. Sampling
+uses the same bilinear spatial and temporal interpolation path as the tiles;
+point responses use `Cache-Control: no-store` so an active model update can
+revise the same valid timestamp immediately.
 
 ## Attribution
 

@@ -139,6 +139,9 @@ def test_metadata_schema_and_legend(weather_api):
     assert body["min_zoom"] == 0
     assert body["max_zoom"] == settings.max_zoom
     assert "{field}" in body["tile_url_template"]
+    assert body["point_url_template"].endswith(
+        "/v2/weather/{field}/{timestamp}/point.json?lat={lat}&lon={lon}"
+    )
     assert body["palette_ids"] == list(WEATHER_PALETTES)
 
     fields = {field["id"]: field for field in body["fields"]}
@@ -157,6 +160,65 @@ def test_metadata_schema_and_legend(weather_api):
     assert palettes["humidity"]["minimum"] == 0.0
     assert palettes["humidity"]["maximum"] == 100.0
     assert response.headers["cache-control"] == "public, max-age=60"
+
+
+@pytest.mark.parametrize(
+    ("field", "expected", "unit"),
+    [
+        ("temperature_2m", 17.0, "°C"),
+        ("dewpoint_2m", 12.0, "°C"),
+        (
+            "relative_humidity_2m",
+            float(relative_humidity_from_temperature_dewpoint(17.0, 12.0)),
+            "%",
+        ),
+        ("pressure_msl", 1005.0, "hPa"),
+        ("wind_speed_10m", 5.0, "m/s"),
+    ],
+)
+def test_weather_point_returns_interpolated_physical_value(
+    weather_api,
+    field,
+    expected,
+    unit,
+):
+    response = weather_api["client"].get(
+        f"/v2/weather/{field}/{weather_api['midpoint']}/point.json",
+        params={"lat": 54.6872, "lon": 25.2797},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["field"] == field
+    assert body["timestamp"] == weather_api["midpoint"]
+    assert body["latitude"] == pytest.approx(54.6872)
+    assert body["longitude"] == pytest.approx(25.2797)
+    assert body["value"] == pytest.approx(expected, abs=0.11)
+    assert body["unit"] == unit
+    assert body["active_model_run"] == weather_api["grid"].reference_time
+    assert body["stale"] is False
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.parametrize(
+    ("path", "status"),
+    [
+        ("/v2/weather/unknown/{ts}/point.json?lat=0&lon=0", 404),
+        ("/v2/weather/temperature_2m/{before}/point.json?lat=0&lon=0", 404),
+        ("/v2/weather/temperature_2m/{ts}/point.json?lat=91&lon=0", 422),
+        ("/v2/weather/temperature_2m/{ts}/point.json?lat=0&lon=181", 422),
+        ("/v2/weather/temperature_2m/{ts}/point.json?lat=0", 422),
+    ],
+)
+def test_weather_point_validation(weather_api, path, status):
+    response = weather_api["client"].get(
+        path.format(
+            ts=weather_api["midpoint"],
+            before=weather_api["t0"] - 1,
+        )
+    )
+
+    assert response.status_code == status
 
 
 def test_rain_viewer_metadata_has_no_weather_extension(weather_api):

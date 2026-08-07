@@ -165,6 +165,7 @@ Fetch this endpoint before creating a scalar layer. Important response fields:
 | `default_timestamp` | Valid time nearest the server's current time. |
 | `palettes` | Complete legend ranges, stops, below/above/nodata colours, and opacity. |
 | `tile_url_template` | Full URL with `{field}`, `{timestamp}`, `{size}`, `{z}`, `{x}`, `{y}`, `{palette}`, `{ext}` placeholders. |
+| `point_url_template` | Full URL with `{field}`, `{timestamp}`, `{lat}`, and `{lon}` placeholders. |
 | `sizes`, `formats`, `min_zoom`, `max_zoom` | Values accepted by the tile endpoint. |
 
 Public field IDs and units are:
@@ -203,6 +204,17 @@ run may revise the same valid timestamp, so let the CDN honour the origin TTL
 and revalidate instead of overriding it with an indefinite immutable policy.
 See [Global weather map layers](global-weather-fields.md) for storage, stale
 publication, single/multi deployment, and precision details.
+
+### Global Weather Point Value
+
+```text
+GET /v2/weather/{field}/{timestamp}/point.json?lat={lat}&lon={lon}
+```
+
+Use this endpoint for pinned or inspected coordinates that require the
+physical model value rather than a value inferred from tile colour. It uses
+the same bilinear spatial and temporal interpolation as the tile renderer and
+returns `value: null` for nodata. Point responses are not cached.
 
 ### Tile URL Format
 

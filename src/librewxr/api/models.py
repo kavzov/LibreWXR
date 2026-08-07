@@ -90,7 +90,19 @@ class WeatherMetadataResponse(BaseModel):
     palette_ids: list[str]
     palettes: list[WeatherPaletteInfo]
     tile_url_template: str
+    point_url_template: str
     sizes: list[int]
     formats: list[str]
     min_zoom: int
     max_zoom: int
+
+
+class WeatherPointResponse(BaseModel):
+    field: str
+    timestamp: int
+    latitude: float
+    longitude: float
+    value: float | None
+    unit: str
+    active_model_run: str | None
+    stale: bool

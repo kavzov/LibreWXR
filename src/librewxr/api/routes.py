@@ -25,6 +25,7 @@ from librewxr.api.models import (
     WeatherMetadataResponse,
     WeatherPaletteInfo,
     WeatherPaletteStop,
+    WeatherPointResponse,
 )
 from librewxr.api.conditional import compute_etag, conditional_response
 from librewxr.colors.schemes import SCHEME_NAMES
@@ -53,6 +54,7 @@ from librewxr.tiles.satellite_renderer import (
 from librewxr.tiles.weather_renderer import (
     WEATHER_RENDERER_VERSION,
     render_scalar_weather_tile,
+    sample_scalar_weather_point,
 )
 
 logger = logging.getLogger(__name__)
@@ -467,10 +469,78 @@ async def weather_metadata(response: Response) -> WeatherMetadataResponse:
             f"{host}/v2/weather/{{field}}/{{timestamp}}/{{size}}/"
             "{z}/{x}/{y}/{palette}.{ext}"
         ),
+        point_url_template=(
+            f"{host}/v2/weather/{{field}}/{{timestamp}}/point.json"
+            "?lat={lat}&lon={lon}"
+        ),
         sizes=list(_WEATHER_TILE_SIZES),
         formats=list(_WEATHER_TILE_FORMATS),
         min_zoom=0,
         max_zoom=settings.max_zoom,
+    )
+
+
+@router.get(
+    "/v2/weather/{field}/{timestamp}/point.json",
+    response_model=WeatherPointResponse,
+)
+async def weather_field_point(
+    response: Response,
+    field: str,
+    timestamp: int,
+    lat: float = Query(ge=-90.0, le=90.0),
+    lon: float = Query(ge=-180.0, le=180.0),
+) -> WeatherPointResponse:
+    """Return the bilinearly interpolated physical value at one coordinate."""
+
+    weather_field = PUBLIC_WEATHER_FIELDS.get(field)
+    if weather_field is None:
+        raise HTTPException(status_code=404, detail=f"Unknown weather field: {field}")
+    timestamps = _weather_available_timestamps()
+    if not timestamps or ecmwf_grid is None or nwp_chain is None:
+        raise HTTPException(status_code=503, detail="Weather field data not available")
+    if timestamp < timestamps[0] or timestamp > timestamps[-1]:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Timestamp {timestamp} outside available range "
+                f"[{timestamps[0]}, {timestamps[-1]}]"
+            ),
+        )
+    if not nwp_chain.has_field(weather_field):
+        raise HTTPException(status_code=503, detail=f"Field {field} not available")
+
+    try:
+        value = await asyncio.to_thread(
+            sample_scalar_weather_point,
+            source=nwp_chain,
+            field=weather_field,
+            timestamp=timestamp,
+            latitude=lat,
+            longitude=lon,
+        )
+    except Exception as exc:
+        logger.exception("Weather field point sampling failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Weather field point sampling failed",
+        ) from exc
+    now = int(time.time())
+    health = (
+        ecmwf_grid.health_status(now)
+        if hasattr(ecmwf_grid, "health_status")
+        else {"stale": True}
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return WeatherPointResponse(
+        field=field,
+        timestamp=timestamp,
+        latitude=lat,
+        longitude=lon,
+        value=value,
+        unit=field_spec(weather_field).unit,
+        active_model_run=getattr(ecmwf_grid, "reference_time", None),
+        stale=bool(health.get("stale", True)),
     )
 
 

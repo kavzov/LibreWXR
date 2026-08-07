@@ -17,6 +17,31 @@ from librewxr.tiles.png_palette import encode_png
 WEATHER_RENDERER_VERSION = 3
 
 
+def sample_scalar_weather_point(
+    source,
+    field: WeatherField,
+    timestamp: int,
+    latitude: float,
+    longitude: float,
+) -> float | None:
+    """Sample one point through the same physical-value path as weather tiles."""
+
+    values = np.asarray(
+        source.sample_field(
+            WeatherField(field),
+            np.asarray([latitude], dtype=np.float64),
+            np.asarray([longitude], dtype=np.float64),
+            timestamp=timestamp,
+            bilinear=True,
+        ),
+        dtype=np.float32,
+    )
+    if values.shape != (1,):
+        raise ValueError(f"weather source returned {values.shape}, expected (1,)")
+    value = float(values[0])
+    return value if np.isfinite(value) else None
+
+
 def colorize_weather_values(
     values: np.ndarray,
     palette: WeatherPalette,
