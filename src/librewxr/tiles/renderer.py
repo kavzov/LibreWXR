@@ -939,6 +939,12 @@ def _draw_motion_arrows(
 
     for ty in range(spacing // 2, tile_size, spacing):
         for tx in range(spacing // 2, tile_size, spacing):
+            # The final post-blend geometry is the visual source of truth.
+            # A nowcast's raw extrapolated radar can remain above the
+            # threshold after its model-blended presentation has faded out;
+            # never leave an orphan motion arrow over an invisible area.
+            if geom_values is not None and geom_values[ty, tx] < noise_threshold:
+                continue
             arrow_dx = arrow_dy = 0.0
             found = False
 

@@ -38,7 +38,7 @@ from librewxr.colors.weather_palettes import (
 from librewxr.config import settings
 from librewxr.data.point_nowcast import build_point_nowcast
 from librewxr.data.store import FrameStore
-from librewxr.data.weather_fields import field_spec
+from librewxr.data.weather_fields import WeatherField, field_spec
 from librewxr.mcp.discovery import build_ai_catalog
 from librewxr.memory import detect_memory_limit_mb
 from librewxr.tiles.cache import CachedRender, TileCache
@@ -559,12 +559,25 @@ async def weather_field_tile(
     y: int = Path(ge=0),
     palette: str = Path(min_length=1),
     ext: str = Path(pattern=r"^(png|webp)$"),
+    vectors: str = Query(default=""),
 ) -> Response:
     """Render a continuous global weather field without changing radar APIs."""
 
     weather_field = PUBLIC_WEATHER_FIELDS.get(field)
     if weather_field is None:
         raise HTTPException(status_code=404, detail=f"Unknown weather field: {field}")
+    vector_style = ""
+    if vectors in ("1", "true", "light"):
+        vector_style = "light"
+    elif vectors == "dark":
+        vector_style = "dark"
+    elif vectors:
+        raise HTTPException(status_code=400, detail="Unsupported wind vector style")
+    if vector_style and weather_field is not WeatherField.WIND_SPEED_10M:
+        raise HTTPException(
+            status_code=400,
+            detail="Wind vectors are only supported for wind_speed_10m",
+        )
     if size not in _WEATHER_TILE_SIZES:
         raise HTTPException(
             status_code=400,
@@ -616,6 +629,7 @@ async def weather_field_tile(
         y,
         size,
         palette,
+        vector_style,
         ext,
         (
             settings.webp_quality
@@ -645,6 +659,7 @@ async def weather_field_tile(
                 y=y,
                 tile_size=size,
                 fmt=ext,
+                vector_style=vector_style,
             )
             rendered = CachedRender(tile_bytes, compute_etag(tile_bytes))
             if tile_cache is not None:

@@ -380,6 +380,10 @@ Example:
 http://localhost:8080/v2/weather/temperature_2m/1785996000/256/4/8/5/temperature.png
 ```
 
+The wind-speed tile accepts `?vectors=light` or `?vectors=dark` to overlay
+compact direction arrows derived from the same 10 m U/V components. Other
+weather fields reject this option.
+
 These are ECMWF IFS model fields delivered through Open-Meteo bulk data, not
 observations. Display the metadata attribution (`ECMWF IFS data via
 Open-Meteo`) and construct legends from `palettes[].stops`. See

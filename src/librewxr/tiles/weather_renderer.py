@@ -5,16 +5,17 @@
 from __future__ import annotations
 
 import io
+import math
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from librewxr.colors.weather_palettes import WeatherPalette
 from librewxr.config import settings
 from librewxr.data.weather_fields import WeatherField
 from librewxr.tiles.png_palette import encode_png
 
-WEATHER_RENDERER_VERSION = 3
+WEATHER_RENDERER_VERSION = 4
 
 
 def sample_scalar_weather_point(
@@ -92,27 +93,77 @@ def encode_weather_image(rgba: np.ndarray, fmt: str) -> bytes:
     )
 
 
-def render_scalar_weather_tile(
+def draw_wind_vectors(
+    rgba: np.ndarray,
+    u_values: np.ndarray,
+    v_values: np.ndarray,
+    style: str,
+) -> np.ndarray:
+    """Overlay compact arrows showing the direction air is moving toward."""
+
+    if style not in ("light", "dark"):
+        raise ValueError(f"unsupported wind vector style: {style}")
+    height, width = rgba.shape[:2]
+    if u_values.shape != (height, width) or v_values.shape != (height, width):
+        raise ValueError("wind vector components must match the RGBA tile shape")
+
+    image = Image.fromarray(rgba, "RGBA")
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    color = (36, 44, 55, 185) if style == "dark" else (255, 255, 255, 190)
+    spacing = 40 if width <= 256 else 56
+    line_width = 1 if width <= 256 else 2
+    maximum_length = 10.0 if width <= 256 else 14.0
+    head_length = 3.0 if width <= 256 else 4.0
+    head_width = 2.0 if width <= 256 else 3.0
+
+    for y in range(spacing // 2, height, spacing):
+        for x in range(spacing // 2, width, spacing):
+            u = float(u_values[y, x])
+            v = float(v_values[y, x])
+            if not math.isfinite(u) or not math.isfinite(v):
+                continue
+            speed = math.hypot(u, v)
+            if speed < 0.5:
+                continue
+
+            length = min(maximum_length, 4.0 + speed * 0.35)
+            unit_x = u / speed
+            unit_y = -v / speed  # northward wind points up on a map tile
+            half_x = unit_x * length / 2.0
+            half_y = unit_y * length / 2.0
+            tail = (x - half_x, y - half_y)
+            tip = (x + half_x, y + half_y)
+            draw.line((tail, tip), fill=color, width=line_width)
+
+            base_x = tip[0] - unit_x * head_length
+            base_y = tip[1] - unit_y * head_length
+            perpendicular_x = -unit_y * head_width
+            perpendicular_y = unit_x * head_width
+            draw.polygon(
+                (
+                    tip,
+                    (base_x + perpendicular_x, base_y + perpendicular_y),
+                    (base_x - perpendicular_x, base_y - perpendicular_y),
+                ),
+                fill=color,
+            )
+
+    return np.asarray(Image.alpha_composite(image, overlay))
+
+
+def _sample_tile_field(
     source,
     field: WeatherField,
-    palette: WeatherPalette,
     timestamp: int,
     z: int,
     x: int,
     y: int,
     tile_size: int,
-    fmt: str,
-) -> bytes:
-    """Sample one physical field tile, LUT-colorize it, and encode it."""
-
-    normalized = WeatherField(field)
-    if palette.field is not normalized:
-        raise ValueError(
-            f"palette {palette.id} does not support {normalized.value}"
-        )
+) -> np.ndarray:
     values = np.asarray(
         source.sample_tile_field(
-            normalized,
+            field,
             z,
             x,
             y,
@@ -128,4 +179,40 @@ def render_scalar_weather_tile(
         raise ValueError(
             f"weather source returned {values.shape}, expected {expected_shape}"
         )
-    return encode_weather_image(colorize_weather_values(values, palette), fmt)
+    return values
+
+
+def render_scalar_weather_tile(
+    source,
+    field: WeatherField,
+    palette: WeatherPalette,
+    timestamp: int,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    fmt: str,
+    vector_style: str = "",
+) -> bytes:
+    """Sample one physical field tile, LUT-colorize it, and encode it."""
+
+    normalized = WeatherField(field)
+    if palette.field is not normalized:
+        raise ValueError(
+            f"palette {palette.id} does not support {normalized.value}"
+        )
+    if vector_style and normalized is not WeatherField.WIND_SPEED_10M:
+        raise ValueError("wind vectors are only supported for wind_speed_10m")
+    values = _sample_tile_field(
+        source, normalized, timestamp, z, x, y, tile_size,
+    )
+    rgba = colorize_weather_values(values, palette)
+    if vector_style:
+        u_values = _sample_tile_field(
+            source, WeatherField.WIND_U_10M, timestamp, z, x, y, tile_size,
+        )
+        v_values = _sample_tile_field(
+            source, WeatherField.WIND_V_10M, timestamp, z, x, y, tile_size,
+        )
+        rgba = draw_wind_vectors(rgba, u_values, v_values, vector_style)
+    return encode_weather_image(rgba, fmt)

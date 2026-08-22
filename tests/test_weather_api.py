@@ -276,6 +276,18 @@ def test_png_and_webp_content_types_and_signatures(weather_api):
     assert Image.open(io.BytesIO(large.content)).size == (512, 512)
 
 
+def test_wind_vectors_are_optional_and_only_valid_for_wind(weather_api):
+    base = _url(weather_api, "wind_speed_10m", "wind_speed")
+    plain = weather_api["client"].get(base)
+    vectors = weather_api["client"].get(f"{base}?vectors=dark")
+
+    assert plain.status_code == vectors.status_code == 200
+    assert plain.content != vectors.content
+    assert weather_api["client"].get(f"{base}?vectors=large").status_code == 400
+    temperature = _url(weather_api, "temperature_2m", "temperature")
+    assert weather_api["client"].get(f"{temperature}?vectors=dark").status_code == 400
+
+
 def test_weather_tile_etag_and_conditional_request(weather_api):
     url = _url(weather_api, "pressure_msl", "pressure")
     first = weather_api["client"].get(url)

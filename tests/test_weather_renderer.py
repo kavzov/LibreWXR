@@ -18,6 +18,7 @@ from librewxr.config import settings
 from librewxr.tiles.png_palette import encode_png
 from librewxr.tiles.weather_renderer import (
     colorize_weather_values,
+    draw_wind_vectors,
     encode_weather_image,
     render_scalar_weather_tile,
 )
@@ -197,3 +198,54 @@ def test_renderer_webp_signature():
 
     assert rendered[:4] == b"RIFF"
     assert rendered[8:12] == b"WEBP"
+
+
+def test_wind_vectors_are_compact_and_point_with_uv_components():
+    rgba = np.zeros((40, 40, 4), dtype=np.uint8)
+    u_values = np.full((40, 40), 10.0, dtype=np.float32)
+    v_values = np.zeros((40, 40), dtype=np.float32)
+
+    rendered = draw_wind_vectors(rgba, u_values, v_values, "dark")
+    changed_y, changed_x = np.nonzero(rendered[..., 3])
+
+    assert changed_x.min() >= 14
+    assert changed_x.max() <= 26
+    assert changed_y.min() >= 17
+    assert changed_y.max() <= 23
+    # Eastward U means the arrowhead adds more ink to the right of centre.
+    assert (changed_x > 20).sum() > (changed_x < 20).sum()
+
+
+def test_wind_tile_vectors_sample_speed_and_both_components():
+    source = _ConstantTileSource(5.0)
+    plain = render_scalar_weather_tile(
+        source=source,
+        field=WeatherField.WIND_SPEED_10M,
+        palette=WEATHER_PALETTES["wind_speed"],
+        timestamp=1,
+        z=0,
+        x=0,
+        y=0,
+        tile_size=40,
+        fmt="png",
+    )
+    source.calls.clear()
+    with_vectors = render_scalar_weather_tile(
+        source=source,
+        field=WeatherField.WIND_SPEED_10M,
+        palette=WEATHER_PALETTES["wind_speed"],
+        timestamp=1,
+        z=0,
+        x=0,
+        y=0,
+        tile_size=40,
+        fmt="png",
+        vector_style="dark",
+    )
+
+    assert plain != with_vectors
+    assert [call[0] for call in source.calls] == [
+        WeatherField.WIND_SPEED_10M,
+        WeatherField.WIND_U_10M,
+        WeatherField.WIND_V_10M,
+    ]

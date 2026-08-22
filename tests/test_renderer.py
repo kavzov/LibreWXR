@@ -138,6 +138,39 @@ class TestTileGeometryCache:
             assert img.size == (256, 256)
             assert img.mode == "RGBA"
 
+    def test_arrows_follow_final_visible_geometry(self, sample_frame_data):
+        sample_frame_data.fill(200)
+        geom = compute_tile_geometry(
+            {"USCOMP": sample_frame_data}, z=5, x=7, y=12, tile_size=256,
+        )
+        flow = np.full((1, 1, 2), 20.0, dtype=np.float32)
+        kwargs = {
+            "color_scheme": 2,
+            "fmt": "png",
+            "display_min_dbz": 22,
+            "arrow_style": "dark",
+            "flow_regions": {"USCOMP": flow},
+            "frame_regions": {"USCOMP": sample_frame_data},
+            "z": 5,
+            "x": 7,
+            "y": 12,
+        }
+        visible = present_tile(geom, **kwargs)
+        plain = present_tile(
+            geom, color_scheme=2, fmt="png", display_min_dbz=22,
+        )
+        assert visible != plain, "fixture must exercise the arrow path"
+
+        hidden_geom = TileGeometry(
+            values=np.zeros_like(geom.values),
+            snow_mask=None,
+            tile_size=geom.tile_size,
+            pad=0,
+            blur_radius=0.0,
+        )
+        hidden = Image.open(io.BytesIO(present_tile(hidden_geom, **kwargs))).convert("RGBA")
+        assert np.asarray(hidden)[..., 3].max() == 0
+
     def test_present_can_hide_values_below_display_threshold(self):
         values = np.array([[99, 108], [107, 120]], dtype=np.uint8)
         geom = TileGeometry(

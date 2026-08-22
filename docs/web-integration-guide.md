@@ -199,6 +199,11 @@ Use a palette listed in the chosen field's `palette_ids`, a size of 256 or
 timestamps inside the range are accepted and interpolated between surrounding
 model times. Responses carry an ETag and support `If-None-Match`.
 
+For `wind_speed_10m`, append `?vectors=light` or `?vectors=dark` to draw a
+compact direction overlay. The arrow points toward the direction the air is
+moving; its colour is selected independently from the wind-speed palette.
+The parameter is rejected for non-wind fields.
+
 Metadata is cacheable for 60 seconds and tiles for six hours. A future model
 run may revise the same valid timestamp, so let the CDN honour the origin TTL
 and revalidate instead of overriding it with an indefinite immutable policy.
