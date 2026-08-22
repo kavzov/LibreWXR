@@ -392,7 +392,9 @@ class Settings(BaseSettings):
     jma_msm_publish_delay_minutes: int = 300          # ~5 h after init for full run write-out
     jma_msm_dbz_offset: float = 6.0                   # same Marshall-Palmer caveat as DINI/ICON-EU
     nowcast_enabled: bool = True  # Generate precipitation nowcast via radar extrapolation + IFS
-    nowcast_frames: int = 6  # Number of 10-min forecast frames (6 = 60 min)
+    # One frame per fetch interval: 6 = 60 min at the default 10-min cadence,
+    # or 30 min when fetch_interval is overridden to 300 seconds.
+    nowcast_frames: int = 6
     nowcast_blend_mode: str = "blended"  # "radar", "blended", or "model"
     # Separate optical-flow computation used by the /v2/radar motion-arrow
     # overlay.  Arrows key off per-region Farneback flow between the two

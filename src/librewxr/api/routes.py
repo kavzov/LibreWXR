@@ -18,6 +18,7 @@ from librewxr.api.models import (
     ColorScheme,
     GeoJSONFeature,
     RadarData,
+    RadarPointNowcastResponse,
     RadarTimestamp,
     SatelliteData,
     WeatherFieldInfo,
@@ -35,6 +36,7 @@ from librewxr.colors.weather_palettes import (
     palettes_for_field,
 )
 from librewxr.config import settings
+from librewxr.data.point_nowcast import build_point_nowcast
 from librewxr.data.store import FrameStore
 from librewxr.data.weather_fields import field_spec
 from librewxr.mcp.discovery import build_ai_catalog
@@ -715,6 +717,50 @@ async def weather_maps() -> WeatherMapsResponse:
         radar=RadarData(past=past, nowcast=nowcast, colorSchemes=color_schemes),
         satellite=SatelliteData(infrared=infrared),
     )
+
+
+@router.get(
+    "/v2/radar/point-nowcast.json",
+    response_model=RadarPointNowcastResponse,
+)
+async def radar_point_nowcast(
+    response: Response,
+    lat: float = Query(ge=-90.0, le=90.0),
+    lon: float = Query(ge=-180.0, le=180.0),
+    radius_km: float = Query(default=2.0, gt=0.0, le=10.0),
+    past_minutes: int = Query(default=30, ge=0, le=120),
+    future_minutes: int = Query(default=60, ge=0, le=60),
+) -> RadarPointNowcastResponse:
+    """Return observed and forecast radar summaries around one coordinate.
+
+    Offsets are relative to the latest observed radar frame rather than wall
+    clock time.  This keeps a delayed ingest visible through
+    ``latest_age_seconds``/``stale`` instead of silently shortening or
+    lengthening the advertised forecast horizon.
+    """
+
+    try:
+        payload = await build_point_nowcast(
+            frame_store=frame_store,
+            nowcast_store=nowcast_store,
+            enabled_regions=enabled_regions or [],
+            lat=lat,
+            lon=lon,
+            radius_km=radius_km,
+            past_minutes=past_minutes,
+            future_minutes=future_minutes,
+            noise_floor_dbz=settings.noise_floor_dbz,
+            fetch_interval=settings.fetch_interval,
+        )
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Radar observations not available",
+        ) from exc
+    # Exact coordinates may represent a user's location.  Keep the short cache
+    # browser-private so shared intermediaries do not retain query URLs.
+    response.headers["Cache-Control"] = "private, max-age=60"
+    return RadarPointNowcastResponse(**payload)
 
 
 async def _latest_timestamps_cached() -> list[int]:

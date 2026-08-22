@@ -305,6 +305,53 @@ Global scalar layers deliberately do not add fields to this response. Existing
 Rain Viewer clients continue to receive the same schema; use the separate
 endpoint below for model weather maps.
 
+#### Radar Point Nowcast (LibreWXR extension)
+
+```text
+GET /v2/radar/point-nowcast.json?lat={lat}&lon={lon}
+    &radius_km=2&past_minutes=30&future_minutes=60
+```
+
+Returns summaries from the native dBZ grids for a circular neighbourhood
+around one coordinate. Each frame includes its observed/forecast period,
+minute offset from the latest observation, radar coverage, region, sampled and
+wet pixel counts, wet fraction, maximum dBZ/rain rate, and nowcast blend
+weight. The response also reports the latest observation age, stale status,
+and the history/forecast horizons actually available.
+
+`radius_km` accepts `(0, 10]`, `past_minutes` accepts `0-120`, and
+`future_minutes` accepts `0-60`. The endpoint only filters frames already held
+by LibreWXR; requesting 60 minutes does not manufacture a longer forecast when
+the configured `LIBREWXR_NOWCAST_FRAMES * LIBREWXR_FETCH_INTERVAL` horizon is
+shorter. Exact-coordinate responses use a browser-private 60-second cache.
+
+Example response fields:
+
+```json
+{
+  "latest_observation_time": 1787372400,
+  "latest_age_seconds": 221,
+  "stale": false,
+  "history_minutes_available": 30,
+  "forecast_minutes_available": 30,
+  "frames": [
+    {
+      "time": 1787372700,
+      "minutes_offset": 5,
+      "period": "forecast",
+      "coverage": "in_range",
+      "region": "OPERA",
+      "sample_count": 9,
+      "wet_pixel_count": 2,
+      "wet_fraction": 0.2222,
+      "max_dbz": 24.5,
+      "max_rate_mmh": 1.15,
+      "blend_weight": 0.92
+    }
+  ]
+}
+```
+
 #### Global Weather Map Layers (LibreWXR extension)
 
 ```text
@@ -516,7 +563,7 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_NATIVE_RENDER` | `auto` | Optional sampling backend: `auto`, `on`, or `off` |
 | **Nowcast** | | |
 | `LIBREWXR_NOWCAST_ENABLED` | `true` | Enable experimental precipitation nowcast |
-| `LIBREWXR_NOWCAST_FRAMES` | `6` | Number of nowcast frames (6 × 10 min = 60 min forecast) |
+| `LIBREWXR_NOWCAST_FRAMES` | `6` | Number of nowcast frames, one per fetch interval (60 min at the default 10-min cadence; 30 min at a 5-min cadence) |
 | `LIBREWXR_NOWCAST_BLEND_MODE` | `blended` | `radar`, `blended`, or `model`. Beyond 60 min always uses pure model |
 | **Satellite + alerts** | | |
 | `LIBREWXR_SATELLITE_ENABLED` | `true` | Master switch for the GMGSI satellite layer (LW + VIS composite) |

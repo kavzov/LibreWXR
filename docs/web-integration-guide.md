@@ -216,6 +216,28 @@ physical model value rather than a value inferred from tile colour. It uses
 the same bilinear spatial and temporal interpolation as the tile renderer and
 returns `value: null` for nodata. Point responses are not cached.
 
+### Radar Point Nowcast
+
+```text
+GET /v2/radar/point-nowcast.json?lat=54.6872&lon=25.2797
+    &radius_km=2&past_minutes=30&future_minutes=60
+```
+
+Use this endpoint for location-specific precipitation hints instead of
+decoding colours from radar PNG tiles. It samples the native dBZ grids in a
+small circle and returns observed and forecast frames relative to the latest
+observation. Check `stale` and each frame's `coverage` before using its
+`wet_fraction`, `max_dbz`, or `max_rate_mmh` values.
+
+The returned forecast horizon is data-driven. With a five-minute fetch
+interval and six configured nowcast frames it is 30 minutes; use twelve frames
+to publish 60 minutes. Increasing the count extends the existing optical-flow
+and NWP-blended extrapolation, so clients should communicate lower confidence
+at longer lead times rather than treating every frame as equally precise.
+
+Responses use `Cache-Control: private, max-age=60` because query coordinates
+may represent a user's location.
+
 ### Tile URL Format
 
 ```

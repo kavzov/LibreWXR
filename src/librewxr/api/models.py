@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Joshua Kimsey
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -106,3 +106,31 @@ class WeatherPointResponse(BaseModel):
     unit: str
     active_model_run: str | None
     stale: bool
+
+
+class RadarPointNowcastFrame(BaseModel):
+    time: int
+    minutes_offset: int
+    period: Literal["observed", "forecast"]
+    coverage: Literal["in_range", "out_of_range"]
+    region: str | None
+    sample_count: int
+    wet_pixel_count: int
+    wet_fraction: float | None
+    max_dbz: float | None
+    max_rate_mmh: float | None
+    blend_weight: float
+
+
+class RadarPointNowcastResponse(BaseModel):
+    generated: int
+    latitude: float
+    longitude: float
+    radius_km: float
+    noise_floor_dbz: float
+    latest_observation_time: int
+    latest_age_seconds: int
+    stale: bool
+    history_minutes_available: int
+    forecast_minutes_available: int
+    frames: list[RadarPointNowcastFrame]
