@@ -1,0 +1,11 @@
+services:
+  pipeline:
+    environment:
+      LIBREWXR_NOWCAST_FRAMES: "12"
+      LIBREWXR_NOWCAST_BLEND_MODE: "radar"
+      LIBREWXR_RADAR_ANIMATION_SUBSTEPS: "2"
+  renderer:
+    environment:
+      LIBREWXR_NOWCAST_FRAMES: "12"
+      LIBREWXR_NOWCAST_BLEND_MODE: "radar"
+      LIBREWXR_RADAR_ANIMATION_SUBSTEPS: "2"
