@@ -213,6 +213,14 @@ class TestRadarTileEndpoint:
         assert etag.endswith('"')
         assert len(etag) == 18
 
+    def test_radar_tile_accepts_bounded_display_threshold(self, client):
+        c, ts, _ = client
+        url = f"/v2/radar/{ts}/256/4/3/5/2/0_0.png"
+        filtered = c.get(f"{url}?min_dbz=22")
+        assert filtered.status_code == 200
+        assert filtered.headers.get("etag") is not None
+        assert c.get(f"{url}?min_dbz=96").status_code == 422
+
 
 class TestCoverageTileEndpoint:
     def test_valid_coverage_request(self, client):

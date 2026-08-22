@@ -292,6 +292,7 @@ def present_tile(
     color_scheme: int,
     fmt: str,
     *,
+    display_min_dbz: float | None = None,
     arrow_style: str = "",
     flow_regions: dict[str, np.ndarray] | None = None,
     frame_regions: dict[str, np.ndarray] | None = None,
@@ -325,12 +326,18 @@ def present_tile(
     if geom.is_transparent:
         return _transparent_tile(geom.tile_size, fmt)
 
+    display_values = geom.values
+    if display_min_dbz is not None:
+        pixel_threshold = max(1, int(math.ceil((display_min_dbz + 32.0) * 2.0)))
+        display_values = geom.values.copy()
+        display_values[display_values < pixel_threshold] = 0
+
     if geom.snow_mask is not None:
-        rgba_rain = colorize(geom.values, color_scheme, snow=False)
-        rgba_snow = colorize(geom.values, color_scheme, snow=True)
+        rgba_rain = colorize(display_values, color_scheme, snow=False)
+        rgba_snow = colorize(display_values, color_scheme, snow=True)
         rgba = np.where(geom.snow_mask[..., np.newaxis], rgba_snow, rgba_rain)
     else:
-        rgba = colorize(geom.values, color_scheme, snow=False)
+        rgba = colorize(display_values, color_scheme, snow=False)
 
     img = Image.fromarray(rgba, "RGBA")
 
@@ -359,6 +366,7 @@ def present_tile(
             nwp_flow=nwp_flow,
             nwp_chain=nwp_chain,
             frame_timestamp=frame_timestamp,
+            display_min_dbz=display_min_dbz,
             # The geometry is still padded when blur is applied; the arrow
             # overlay works in cropped tile coordinates, so slice the pad
             # border off before handing it to the presence gate.
@@ -408,6 +416,7 @@ def render_tile(
     flow_regions: dict[str, np.ndarray] | None = None,
     nwp_flow: np.ndarray | None = None,
     arrow_style: str = "light",
+    display_min_dbz: float | None = None,
 ) -> bytes:
     """Compute geometry and present it in a single call.
 
@@ -430,6 +439,7 @@ def render_tile(
         geom,
         color_scheme=color_scheme,
         fmt=fmt,
+        display_min_dbz=display_min_dbz,
         arrow_style=arrow_style if (flow_regions or nwp_flow is not None) else "",
         flow_regions=flow_regions,
         frame_regions=frame_regions,
@@ -833,6 +843,7 @@ def _draw_motion_arrows(
     nwp_chain=None,
     frame_timestamp: int | None = None,
     geom_values: np.ndarray | None = None,
+    display_min_dbz: float | None = None,
 ) -> Image.Image:
     """Draw precipitation motion vector arrows on the tile.
 
@@ -910,6 +921,11 @@ def _draw_motion_arrows(
     noise_threshold = 0
     if settings.noise_floor_dbz > -32:
         noise_threshold = int((settings.noise_floor_dbz + 32) * 2)
+    if display_min_dbz is not None:
+        noise_threshold = max(
+            noise_threshold,
+            int(math.ceil((display_min_dbz + 32.0) * 2.0)),
+        )
 
     spacing = 32 if tile_size <= 256 else 48
     line_w = 2 if tile_size <= 256 else 3

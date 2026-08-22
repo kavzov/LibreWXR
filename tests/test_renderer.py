@@ -138,6 +138,27 @@ class TestTileGeometryCache:
             assert img.size == (256, 256)
             assert img.mode == "RGBA"
 
+    def test_present_can_hide_values_below_display_threshold(self):
+        values = np.array([[99, 108], [107, 120]], dtype=np.uint8)
+        geom = TileGeometry(
+            values=values,
+            snow_mask=None,
+            tile_size=2,
+            pad=0,
+            blur_radius=0.0,
+        )
+        tile = present_tile(
+            geom,
+            color_scheme=2,
+            fmt="png",
+            display_min_dbz=22.0,
+        )
+        rgba = np.asarray(Image.open(io.BytesIO(tile)).convert("RGBA"))
+        assert rgba[0, 0, 3] == 0
+        assert rgba[1, 0, 3] == 0
+        assert rgba[0, 1, 3] > 0
+        assert rgba[1, 1, 3] > 0
+
     def test_one_geometry_serves_all_color_schemes(self, sample_frame_data):
         """The whole point of the refactor: compute once, present in any color."""
         regions = {"USCOMP": sample_frame_data}

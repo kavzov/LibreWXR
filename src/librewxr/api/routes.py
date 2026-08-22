@@ -815,6 +815,7 @@ async def radar_tile(
     ext: str = Path(pattern=r"^(png|webp)$"),
     arrows: str = Query(default=""),
     cells: str = Query(default=""),
+    min_dbz: float | None = Query(default=None, ge=-32.0, le=95.5),
 ) -> Response:
     """Rain Viewer-compatible tile endpoint."""
     logger.debug("Tile request: z=%d x=%d y=%d color=%d smooth_snow=%s ext=%s", z, x, y, color, smooth_snow, ext)
@@ -845,6 +846,11 @@ async def radar_tile(
         cell_style = "light"
     elif cells == "dark":
         cell_style = "dark"
+
+    display_min_dbz = (
+        max(settings.noise_floor_dbz, min_dbz)
+        if min_dbz is not None else None
+    )
 
     # Geometry cache: keyed only on inputs that affect the sampled values
     # (radar source + viewport + smoothing + snow-mask presence).  Color
@@ -930,7 +936,7 @@ async def radar_tile(
         # cache hit skips both ``present_tile`` and the ETag hash.
         present_key = (
             timestamp, z, x, y, tile_size, smooth, snow,
-            color, ext, settings.webp_quality,
+            color, ext, settings.webp_quality, display_min_dbz,
         )
         cached = tile_cache.get(present_key)
         if isinstance(cached, CachedRender):
@@ -941,6 +947,7 @@ async def radar_tile(
                 geom,
                 color_scheme=color,
                 fmt=ext,
+                display_min_dbz=display_min_dbz,
                 arrow_style=arrow_style if (flow_regions or nwp_flow is not None) else "",
                 flow_regions=flow_regions,
                 frame_regions=frame.regions if frame is not None else None,
@@ -962,6 +969,7 @@ async def radar_tile(
             geom,
             color_scheme=color,
             fmt=ext,
+            display_min_dbz=display_min_dbz,
             arrow_style=arrow_style if (flow_regions or nwp_flow is not None) else "",
             flow_regions=flow_regions,
             frame_regions=frame.regions if frame is not None else None,
