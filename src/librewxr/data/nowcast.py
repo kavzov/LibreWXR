@@ -40,6 +40,8 @@ import cv2
 import numpy as np
 
 from librewxr.config import settings
+from librewxr.data.nwp_interpolation import interpolate_pair_at_fraction
+from librewxr.data.store import RadarFrame
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +182,10 @@ class NowcastFrame:
     timestamp: int
     regions: dict[str, np.ndarray] = field(default_factory=dict)
     blend_weight: float = 1.0  # 1.0 = trust radar, 0.0 = trust IFS
+    # ``past`` is used only by display-only animation frames.  Ordinary
+    # nowcast frames keep the default and point-nowcast never reads the
+    # separate animation collection.
+    period: str = "forecast"
 
 
 class NowcastStore:
@@ -195,6 +201,7 @@ class NowcastStore:
         self, cache_dir: Path | None = None, *, cleanup_tmp: bool = True,
     ):
         self._frames: dict[int, NowcastFrame] = {}
+        self._animation_frames: dict[int, NowcastFrame] = {}
         # Per-region optical flow, stored at the resolution it was
         # COMPUTED at (longest dim ≤ _TARGET_FLOW_DIM, vectors in
         # full-res pixel units) — consumers upscale at the point of use.
@@ -277,6 +284,64 @@ class NowcastStore:
         async with self._lock:
             return sorted(self._frames.keys())
 
+    async def get_animation_frame(self, timestamp: int) -> NowcastFrame | None:
+        """Return one display-only interpolated frame, if available."""
+        async with self._lock:
+            return self._animation_frames.get(timestamp)
+
+    async def get_animation_frames(self) -> list[NowcastFrame]:
+        """Return display-only frames in chronological order."""
+        async with self._lock:
+            return [self._animation_frames[ts] for ts in sorted(self._animation_frames)]
+
+    async def get_animation_timestamps(self) -> list[int]:
+        async with self._lock:
+            return sorted(self._animation_frames)
+
+    async def update_animation(
+        self,
+        frames: list[NowcastFrame],
+        valid_timestamps: set[int],
+    ) -> set[int]:
+        """Upsert changed animation frames and evict timestamps off the timeline.
+
+        Historical interpolation is immutable once both observed endpoints are
+        known, so callers only pass newly-created/changed frames here.  Forecast
+        interpolation is regenerated every fetch cycle.  Keeping untouched
+        historical memmaps avoids rewriting the entire animation history every
+        five minutes.
+
+        Returns every timestamp whose cached tile geometry must be invalidated.
+        """
+        async with self._lock:
+            old_timestamps = set(self._animation_frames)
+            changed = old_timestamps ^ valid_timestamps
+
+            for timestamp in old_timestamps - valid_timestamps:
+                for path in self._memmap_dir.glob(f"animation_{timestamp}_*.dat"):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                self._animation_frames.pop(timestamp, None)
+
+            for frame in frames:
+                changed.add(frame.timestamp)
+                for path in self._memmap_dir.glob(
+                    f"animation_{frame.timestamp}_*.dat"
+                ):
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                for name, data in list(frame.regions.items()):
+                    frame.regions[name] = self._to_memmap(
+                        f"animation_{frame.timestamp}_{name}", data,
+                    )
+                self._animation_frames[frame.timestamp] = frame
+
+            return changed
+
     async def replace_flows(self, flows: dict[str, np.ndarray]) -> None:
         """Update the latest optical flow vectors.
 
@@ -336,6 +401,9 @@ class NowcastStore:
         for frame in self._frames.values():
             for arr in frame.regions.values():
                 total += arr.nbytes
+        for frame in self._animation_frames.values():
+            for arr in frame.regions.values():
+                total += arr.nbytes
         for arr in self._flows.values():
             total += arr.nbytes
         if self._nwp_flow is not None:
@@ -344,6 +412,7 @@ class NowcastStore:
 
     def clear(self) -> None:
         self._frames.clear()
+        self._animation_frames.clear()
         self._flows.clear()
         self._nwp_flow = None
 
@@ -361,6 +430,22 @@ class NowcastStore:
             frames_state.append({
                 "timestamp": ts,
                 "blend_weight": frame.blend_weight,
+                "period": frame.period,
+                "regions": regions,
+            })
+        animation_state: list[dict] = []
+        for ts, frame in self._animation_frames.items():
+            regions: dict[str, list] = {}
+            for name, arr in frame.regions.items():
+                regions[name] = [
+                    os.path.basename(str(arr.filename)),
+                    arr.dtype.str,
+                    list(arr.shape),
+                ]
+            animation_state.append({
+                "timestamp": ts,
+                "blend_weight": frame.blend_weight,
+                "period": frame.period,
                 "regions": regions,
             })
         flows_state: dict[str, list] = {}
@@ -380,6 +465,7 @@ class NowcastStore:
         return {
             "memmap_dir": str(self._memmap_dir),
             "frames": frames_state,
+            "animation_frames": animation_state,
             "flows": flows_state,
             "nwp_flow": nwp_flow_state,
         }
@@ -404,6 +490,7 @@ class NowcastStore:
             frame = NowcastFrame(
                 timestamp=ts,
                 blend_weight=float(f_info["blend_weight"]),
+                period=f_info.get("period", "forecast"),
             )
             try:
                 for name, (basename, dtype_str, shape) in f_info["regions"].items():
@@ -419,6 +506,26 @@ class NowcastStore:
                 logger.debug("Nowcast: skipping stale frame %d", ts)
                 continue
             new_frames[ts] = frame
+
+        new_animation_frames: dict[int, NowcastFrame] = {}
+        for f_info in state.get("animation_frames", []):
+            ts = int(f_info["timestamp"])
+            frame = NowcastFrame(
+                timestamp=ts,
+                blend_weight=float(f_info["blend_weight"]),
+                period=f_info.get("period", "forecast"),
+            )
+            try:
+                for name, (basename, dtype_str, shape) in f_info["regions"].items():
+                    frame.regions[name] = np.memmap(
+                        memmap_dir / basename,
+                        dtype=np.dtype(dtype_str), mode="r",
+                        shape=tuple(shape),
+                    )
+            except FileNotFoundError:
+                logger.debug("Nowcast: skipping stale animation frame %d", ts)
+                continue
+            new_animation_frames[ts] = frame
 
         new_flows: dict[str, np.ndarray] = {}
         for name, (basename, dtype_str, shape) in state["flows"].items():
@@ -452,6 +559,7 @@ class NowcastStore:
 
         self._memmap_dir = memmap_dir
         self._frames = new_frames
+        self._animation_frames = new_animation_frames
         self._flows = new_flows
         self._nwp_flow = new_nwp_flow
         self._persistent = True
@@ -638,6 +746,51 @@ class NowcastGenerator:
                 "Arrow flow updated: %d region%s (nowcast disabled)",
                 len(flows), "s" if len(flows) != 1 else "",
             )
+
+        # Display-only motion-compensated frames live beside, not inside,
+        # the analytical nowcast timeline.  Point-nowcast and alert sampling
+        # therefore continue to see only native observed/forecast timestamps.
+        substeps = settings.radar_animation_substeps
+        if extrapolate and substeps > 1:
+            observed_frames = []
+            for timestamp in timestamps:
+                observed = await self._store.get_frame(timestamp)
+                if observed is not None:
+                    observed_frames.append(observed)
+            existing_animation = set(
+                await self._nowcast_store.get_animation_timestamps()
+            )
+            animation_frames, valid_animation = await asyncio.to_thread(
+                self._generate_animation_sync,
+                observed_frames,
+                nowcast_frames,
+                flows,
+                interval,
+                substeps,
+                existing_animation,
+            )
+            changed_animation = await self._nowcast_store.update_animation(
+                animation_frames,
+                valid_animation,
+            )
+            if self._cache is not None:
+                for timestamp in changed_animation:
+                    self._cache.invalidate_timestamp(timestamp)
+            logger.info(
+                "Radar animation updated: %d display frames (%dx substeps)",
+                len(valid_animation), substeps,
+            )
+        else:
+            existing_animation = set(
+                await self._nowcast_store.get_animation_timestamps()
+            )
+            if existing_animation:
+                changed_animation = await self._nowcast_store.update_animation(
+                    [], set(),
+                )
+                if self._cache is not None:
+                    for timestamp in changed_animation:
+                        self._cache.invalidate_timestamp(timestamp)
 
     @staticmethod
     def _generate_sync(
@@ -876,6 +1029,162 @@ class NowcastGenerator:
             len(flows), len(external_by_region), elapsed,
         )
         return frames, flows
+
+    @staticmethod
+    def _generate_animation_sync(
+        observed_frames: list[RadarFrame],
+        nowcast_frames: list[NowcastFrame],
+        flows: dict[str, np.ndarray],
+        interval: int,
+        substeps: int,
+        existing_timestamps: set[int] | None = None,
+    ) -> tuple[list[NowcastFrame], set[int]]:
+        """Build display-only frames between native timeline timestamps.
+
+        The newest observed pair uses bidirectional motion-compensated
+        interpolation and reuses the optical flow already computed for
+        nowcast generation.  Older immutable frames are retained, but missing
+        historical intermediates are not backfilled in one CPU-heavy startup
+        burst; they accumulate one native interval per fetch cycle.
+
+        Forecast intermediates extrapolate the latest observed radar by a
+        fractional step along that same flow.  This keeps motion continuous
+        across every forecast boundary without another Farneback pass per
+        interval.  A region lacking flow falls back to pair interpolation.
+        """
+        if substeps <= 1 or interval <= 0:
+            return [], set()
+
+        existing_timestamps = existing_timestamps or set()
+        generated: list[NowcastFrame] = []
+        valid_timestamps: set[int] = set()
+
+        observed_frames = sorted(observed_frames, key=lambda frame: frame.timestamp)
+        last_observed_pair = len(observed_frames) - 2
+
+        # Observed history: once both endpoints are real, an intermediate is
+        # immutable.  Retain already-generated older timestamps, but generate
+        # only the newest pair this cycle.  This avoids 10-12 extra Farneback
+        # passes per region after every restart; the full rolling history
+        # naturally fills as new native observations arrive.
+        for pair_index in range(max(0, len(observed_frames) - 1)):
+            frame0 = observed_frames[pair_index]
+            frame1 = observed_frames[pair_index + 1]
+            gap = frame1.timestamp - frame0.timestamp
+            if gap <= 0:
+                continue
+            target_times = [
+                frame0.timestamp + round(gap * part / substeps)
+                for part in range(1, substeps)
+            ]
+            if pair_index != last_observed_pair:
+                valid_timestamps.update(
+                    timestamp for timestamp in target_times
+                    if timestamp in existing_timestamps
+                )
+                continue
+            valid_timestamps.update(target_times)
+
+            common_regions = frame0.regions.keys() & frame1.regions.keys()
+            flow_cache: dict[str, np.ndarray] = {}
+            for part, timestamp in enumerate(target_times, start=1):
+                fraction = part / substeps
+                regions: dict[str, np.ndarray] = {}
+                for region_name in common_regions:
+                    data0 = frame0.regions[region_name]
+                    data1 = frame1.regions[region_name]
+                    flow = flow_cache.get(region_name)
+                    if flow is None and pair_index == last_observed_pair:
+                        flow_low = flows.get(region_name)
+                        if flow_low is not None:
+                            flow = _upscale_flow(flow_low, data0.shape)
+                    interpolated, flow = interpolate_pair_at_fraction(
+                        data0, data1, fraction, flow=flow,
+                    )
+                    flow_cache[region_name] = flow
+                    regions[region_name] = interpolated
+                generated.append(NowcastFrame(
+                    timestamp=timestamp,
+                    regions=regions,
+                    blend_weight=1.0,
+                    period="past",
+                ))
+
+        if not observed_frames or not nowcast_frames:
+            return generated, valid_timestamps
+
+        latest = observed_frames[-1]
+        flow_cache: dict[str, np.ndarray] = {}
+        coord_grids: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        fallback_flows: dict[tuple[int, str], np.ndarray] = {}
+        previous_frame = NowcastFrame(
+            timestamp=latest.timestamp,
+            regions=latest.regions,
+            blend_weight=1.0,
+            period="past",
+        )
+
+        for pair_index, next_frame in enumerate(nowcast_frames):
+            gap = next_frame.timestamp - previous_frame.timestamp
+            if gap <= 0:
+                previous_frame = next_frame
+                continue
+            for part in range(1, substeps):
+                fraction = part / substeps
+                timestamp = previous_frame.timestamp + round(gap * fraction)
+                valid_timestamps.add(timestamp)
+                total_step = pair_index + fraction
+                regions: dict[str, np.ndarray] = {}
+                region_names = latest.regions.keys() | (
+                    previous_frame.regions.keys() & next_frame.regions.keys()
+                )
+                for region_name in region_names:
+                    data = latest.regions.get(region_name)
+                    flow_low = flows.get(region_name)
+                    if data is not None and flow_low is not None:
+                        flow = flow_cache.get(region_name)
+                        if flow is None:
+                            flow = _upscale_flow(flow_low, data.shape)
+                            flow_cache[region_name] = flow
+                        grids = coord_grids.get(region_name)
+                        if grids is None:
+                            h, w = data.shape
+                            ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+                            grids = (ys, xs)
+                            coord_grids[region_name] = grids
+                        ys, xs = grids
+                        regions[region_name] = _extrapolate_forward(
+                            data, flow, total_step, xs=xs, ys=ys,
+                        )
+                        continue
+
+                    data0 = previous_frame.regions.get(region_name)
+                    data1 = next_frame.regions.get(region_name)
+                    if data0 is None or data1 is None:
+                        continue
+                    key = (pair_index, region_name)
+                    interpolated, fallback_flow = interpolate_pair_at_fraction(
+                        data0,
+                        data1,
+                        fraction,
+                        flow=fallback_flows.get(key),
+                    )
+                    fallback_flows[key] = fallback_flow
+                    regions[region_name] = interpolated
+
+                blend_weight = (
+                    (1.0 - fraction) * previous_frame.blend_weight
+                    + fraction * next_frame.blend_weight
+                )
+                generated.append(NowcastFrame(
+                    timestamp=timestamp,
+                    regions=regions,
+                    blend_weight=blend_weight,
+                    period="forecast",
+                ))
+            previous_frame = next_frame
+
+        return generated, valid_timestamps
 
     def _compute_nwp_flow_sync(
         self, prev_ts: int, latest_ts: int, interval: int,

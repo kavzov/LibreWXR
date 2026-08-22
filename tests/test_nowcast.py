@@ -22,6 +22,7 @@ from librewxr.data.nowcast import (
     _extrapolate_forward,
     _max_flow_pixels,
 )
+from librewxr.data.store import RadarFrame
 
 
 # Small grids for fast tests
@@ -102,9 +103,98 @@ class TestNowcastStore:
     @pytest.mark.asyncio
     async def test_clear(self, store):
         await store.replace_all([NowcastFrame(timestamp=100)])
+        await store.update_animation(
+            [NowcastFrame(timestamp=50, period="past")], {50},
+        )
         store.clear()
         timestamps = await store.get_timestamps()
         assert timestamps == []
+        assert await store.get_animation_timestamps() == []
+
+    @pytest.mark.asyncio
+    async def test_animation_frames_are_separate_from_point_nowcast_timeline(
+        self, store,
+    ):
+        await store.replace_all([NowcastFrame(timestamp=300)])
+        changed = await store.update_animation([
+            NowcastFrame(
+                timestamp=150,
+                regions={"R": np.ones((3, 3), dtype=np.uint8)},
+                period="past",
+            ),
+            NowcastFrame(
+                timestamp=450,
+                regions={"R": np.ones((3, 3), dtype=np.uint8)},
+                blend_weight=0.8,
+                period="forecast",
+            ),
+        ], {150, 450})
+
+        assert changed == {150, 450}
+        assert await store.get_timestamps() == [300]
+        assert await store.get_animation_timestamps() == [150, 450]
+        frames = await store.get_animation_frames()
+        assert [frame.period for frame in frames] == ["past", "forecast"]
+        assert await store.get_animation_frame(999) is None
+
+
+def test_animation_generator_inserts_midpoints_without_changing_native_frames():
+    observed0 = RadarFrame(
+        timestamp=0,
+        regions={"R": np.full((8, 8), 20, dtype=np.uint8)},
+    )
+    observed1 = RadarFrame(
+        timestamp=300,
+        regions={"R": np.full((8, 8), 24, dtype=np.uint8)},
+    )
+    forecast = NowcastFrame(
+        timestamp=600,
+        regions={"R": np.full((8, 8), 24, dtype=np.uint8)},
+        blend_weight=0.8,
+    )
+    flows = {"R": np.zeros((8, 8, 2), dtype=np.float32)}
+
+    frames, valid = NowcastGenerator._generate_animation_sync(
+        [observed0, observed1], [forecast], flows,
+        interval=300, substeps=2, existing_timestamps=set(),
+    )
+
+    assert valid == {150, 450}
+    assert [(frame.timestamp, frame.period) for frame in frames] == [
+        (150, "past"),
+        (450, "forecast"),
+    ]
+    assert frames[0].regions["R"].mean() == pytest.approx(22, abs=1)
+    assert frames[1].blend_weight == pytest.approx(0.9)
+
+
+def test_animation_generator_backfills_history_incrementally():
+    observed = [
+        RadarFrame(
+            timestamp=timestamp,
+            regions={"R": np.full((6, 6), value, dtype=np.uint8)},
+        )
+        for timestamp, value in [(0, 20), (300, 22), (600, 24)]
+    ]
+    flows = {"R": np.zeros((6, 6, 2), dtype=np.float32)}
+
+    first, first_valid = NowcastGenerator._generate_animation_sync(
+        observed, [], flows,
+        interval=300, substeps=2, existing_timestamps=set(),
+    )
+    assert [(frame.timestamp, frame.period) for frame in first] == [
+        (450, "past"),
+    ]
+    assert first_valid == {450}
+
+    retained, retained_valid = NowcastGenerator._generate_animation_sync(
+        observed, [], flows,
+        interval=300, substeps=2, existing_timestamps={150, 450},
+    )
+    assert [(frame.timestamp, frame.period) for frame in retained] == [
+        (450, "past"),
+    ]
+    assert retained_valid == {150, 450}
 
 
 # ---------------------------------------------------------------------------

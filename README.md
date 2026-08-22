@@ -286,6 +286,15 @@ Returns available radar timestamps and the host URL, matching Rain Viewer's resp
       {"time": 1773038400, "path": "/v2/radar/1773038400"},
       ...
     ],
+    "animation": {
+      "substeps": 2,
+      "past": [
+        {"time": 1773030750, "path": "/v2/radar/1773030750"}
+      ],
+      "nowcast": [
+        {"time": 1773038250, "path": "/v2/radar/1773038250"}
+      ]
+    },
     "colorSchemes": [
       {"id": 0, "name": "Black and White"},
       {"id": 7, "name": "Rainbow @ Selex SI"},
@@ -301,9 +310,11 @@ Returns available radar timestamps and the host URL, matching Rain Viewer's resp
 }
 ```
 
-Global scalar layers deliberately do not add fields to this response. Existing
-Rain Viewer clients continue to receive the same schema; use the separate
-endpoint below for model weather maps.
+`radar.animation` is an optional LibreWXR extension containing display-only,
+motion-compensated frames between the native `past` and `nowcast` timestamps.
+Clients that do not recognise it continue to use the Rain Viewer-compatible
+arrays unchanged. These synthetic frames are never returned by point-nowcast
+or used for alerts. Global scalar layers use the separate endpoint below.
 
 #### Radar Point Nowcast (LibreWXR extension)
 
@@ -569,6 +580,7 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_NOWCAST_ENABLED` | `true` | Enable experimental precipitation nowcast |
 | `LIBREWXR_NOWCAST_FRAMES` | `6` | Number of nowcast frames, one per fetch interval (60 min at the default 10-min cadence; 30 min at a 5-min cadence) |
 | `LIBREWXR_NOWCAST_BLEND_MODE` | `blended` | `radar`, `blended`, or `model`. Beyond 60 min always uses pure model |
+| `LIBREWXR_RADAR_ANIMATION_SUBSTEPS` | `1` | Display-only motion interpolation: `1` disables it; `2` inserts one midpoint between native frames (recommended first deployment) |
 | **Satellite + alerts** | | |
 | `LIBREWXR_SATELLITE_ENABLED` | `true` | Master switch for the GMGSI satellite layer (LW + VIS composite) |
 | `LIBREWXR_GMGSI_LW_ENABLED` | `true` | GMGSI longwave IR channel (24/7 base of the composite) |

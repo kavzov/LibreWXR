@@ -131,6 +131,14 @@ class TestNowcastStorePersistence:
         flow = np.full((4, 6, 2), 1.5, dtype=np.float32)
         frame = NowcastFrame(timestamp=1700000600, blend_weight=0.6, regions={"R1": radar})
         await producer.replace_all([frame])
+        await producer.update_animation([
+            NowcastFrame(
+                timestamp=1700000300,
+                blend_weight=1.0,
+                regions={"R1": radar.copy()},
+                period="past",
+            ),
+        ], {1700000300})
         await producer.replace_flows({"R1": flow})
 
         snapshot = _roundtrip(producer.__getstate__())
@@ -145,6 +153,11 @@ class TestNowcastStorePersistence:
         np.testing.assert_array_equal(nc_frame.regions["R1"], radar)
         flows = await consumer.get_flows()
         np.testing.assert_array_equal(flows["R1"], flow)
+        animation = await consumer.get_animation_frames()
+        assert [(item.timestamp, item.period) for item in animation] == [
+            (1700000300, "past"),
+        ]
+        np.testing.assert_array_equal(animation[0].regions["R1"], radar)
 
 
 # ──────────────────────────────────────────────────────────────────────────

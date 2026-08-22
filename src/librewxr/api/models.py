@@ -36,9 +36,16 @@ class ColorScheme(BaseModel):
     name: str
 
 
+class RadarAnimationData(BaseModel):
+    substeps: int
+    past: list[RadarTimestamp]
+    nowcast: list[RadarTimestamp]
+
+
 class RadarData(BaseModel):
     past: list[RadarTimestamp]
     nowcast: list[RadarTimestamp]
+    animation: RadarAnimationData | None = None
     colorSchemes: list[ColorScheme]
 
 

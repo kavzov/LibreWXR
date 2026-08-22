@@ -1188,6 +1188,30 @@ Number of nowcast frames to generate. Each frame covers one `LIBREWXR_FETCH_INTE
 
 At the default 10-minute cadence, 6 frames = 60 minutes of forecast. More frames extend the forecast range but accuracy decreases at the far end.
 
+### `LIBREWXR_RADAR_ANIMATION_SUBSTEPS`
+
+Controls display-only motion-compensated interpolation between native radar
+and nowcast timestamps. The generated frames appear only in the optional
+`radar.animation` block of `/public/weather-maps.json`; point-nowcast, alerts,
+and the native `radar.past` / `radar.nowcast` arrays remain unchanged.
+
+| | |
+|---|---|
+| **Default** | `1` (disabled) |
+| **Type** | integer, 1–5 |
+
+`2` inserts one midpoint between each pair and is the recommended first
+deployment. With a five-minute fetch interval this produces a 2.5-minute map
+cadence while roughly doubling radar-frame storage rather than multiplying it
+fivefold. Values up to `5` provide denser visual motion at proportionally
+higher memmap, render, tile-cache, and client-network cost.
+
+After a cold restart LibreWXR generates the newest observed interval and the
+complete forecast animation immediately. Older historical intermediates then
+accumulate one native interval per fetch cycle, avoiding a CPU-heavy optical-
+flow backfill burst; with a five-minute source cadence the full rolling hour is
+smooth after about one hour of uninterrupted operation.
+
 ### `LIBREWXR_NOWCAST_BLEND_MODE`
 
 Controls how radar extrapolation and the NWP model forecast are combined during the first 60 minutes of the nowcast window. Beyond 60 minutes, the pure NWP model is always used regardless of this setting.

@@ -18,6 +18,7 @@ from librewxr.api.models import (
     ColorScheme,
     GeoJSONFeature,
     RadarData,
+    RadarAnimationData,
     RadarPointNowcastResponse,
     RadarTimestamp,
     SatelliteData,
@@ -318,6 +319,10 @@ async def health():
             "nwp_flow": await nowcast_store.get_nwp_flow() is not None if nowcast_store else False,
             "frames": await nowcast_store.get_timestamps() if nowcast_store else [],
             "count": len(await nowcast_store.get_timestamps()) if nowcast_store else 0,
+            "animation_frames": (
+                await nowcast_store.get_animation_timestamps()
+                if nowcast_store else []
+            ),
         },
         "satellite": {
             "enabled": settings.satellite_enabled,
@@ -701,12 +706,34 @@ async def weather_maps() -> WeatherMapsResponse:
     ]
 
     nowcast = []
+    animation = None
     if nowcast_store is not None:
         nc_timestamps = await nowcast_store.get_timestamps()
         nowcast = [
             RadarTimestamp(time=ts, path=f"/v2/radar/{ts}")
             for ts in nc_timestamps
         ]
+        animation_frames = await nowcast_store.get_animation_frames()
+        if animation_frames:
+            animation = RadarAnimationData(
+                substeps=settings.radar_animation_substeps,
+                past=[
+                    RadarTimestamp(
+                        time=frame.timestamp,
+                        path=f"/v2/radar/{frame.timestamp}",
+                    )
+                    for frame in animation_frames
+                    if frame.period == "past"
+                ],
+                nowcast=[
+                    RadarTimestamp(
+                        time=frame.timestamp,
+                        path=f"/v2/radar/{frame.timestamp}",
+                    )
+                    for frame in animation_frames
+                    if frame.period == "forecast"
+                ],
+            )
 
     infrared = []
     # Catalog timestamps come from GMGSI LW since LW is the always-on
@@ -729,7 +756,12 @@ async def weather_maps() -> WeatherMapsResponse:
         version="2.0",
         generated=int(time.time()),
         host=host,
-        radar=RadarData(past=past, nowcast=nowcast, colorSchemes=color_schemes),
+        radar=RadarData(
+            past=past,
+            nowcast=nowcast,
+            animation=animation,
+            colorSchemes=color_schemes,
+        ),
         satellite=SatelliteData(infrared=infrared),
     )
 
@@ -900,6 +932,12 @@ async def radar_tile(
             if nc_frame is not None:
                 frame = nc_frame
                 is_nowcast = True
+        if frame is None and nowcast_store is not None:
+            animation_frame = await nowcast_store.get_animation_frame(timestamp)
+            if animation_frame is not None:
+                frame = animation_frame
+                is_nowcast = animation_frame.period == "forecast"
+                nowcast_blend = animation_frame.blend_weight if is_nowcast else None
         if frame is None:
             raise HTTPException(status_code=404, detail="Frame not found")
 

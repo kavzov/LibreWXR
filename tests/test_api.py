@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Joshua Kimsey
+import asyncio
 import time
 
 import numpy as np
@@ -11,6 +12,7 @@ pytestmark = pytest.mark.api
 
 from librewxr.api import routes
 from librewxr.data.store import FrameStore, RadarFrame
+from librewxr.data.nowcast import NowcastFrame, NowcastStore
 from librewxr.tiles.cache import TileCache
 from librewxr.tiles.coordinates import COMPOSITE_HEIGHT, COMPOSITE_WIDTH
 
@@ -117,6 +119,38 @@ class TestWeatherMapsEndpoint:
         # past is sorted oldest-first; ts_prev was added first (earlier)
         assert past[0]["time"] == ts_prev
         assert past[0]["path"] == f"/v2/radar/{ts_prev}"
+
+    def test_animation_metadata_is_separate_and_tile_is_renderable(self, client):
+        c, ts, ts_prev = client
+        animation_ts = ts_prev + (ts - ts_prev) // 2
+        data = np.zeros((COMPOSITE_HEIGHT, COMPOSITE_WIDTH), dtype=np.uint8)
+        data[2500:2700, 6000:6200] = 128
+        store = NowcastStore()
+        asyncio.run(store.update_animation([
+            NowcastFrame(
+                timestamp=animation_ts,
+                regions={"USCOMP": data},
+                period="past",
+            ),
+        ], {animation_ts}))
+        previous = routes.nowcast_store
+        routes.nowcast_store = store
+        try:
+            metadata = c.get("/public/weather-maps.json").json()
+            animation = metadata["radar"]["animation"]
+            assert animation["past"] == [{
+                "time": animation_ts,
+                "path": f"/v2/radar/{animation_ts}",
+            }]
+            assert animation["nowcast"] == []
+
+            tile = c.get(
+                f"/v2/radar/{animation_ts}/256/4/3/5/2/0_0.png"
+            )
+            assert tile.status_code == 200
+        finally:
+            routes.nowcast_store = previous
+            store.cleanup()
 
 
 class TestRadarTileEndpoint:

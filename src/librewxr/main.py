@@ -261,6 +261,24 @@ def _compute_cache_invalidation(
     }
     invalidate |= prev_nowcast | cur_nowcast
 
+    # Display-only animation frames are regenerated for the sliding forecast
+    # leg and when a formerly-forecast midpoint becomes bracketed by two real
+    # observations.  Treat every timestamp in either snapshot as stale, just
+    # like the analytical nowcast frames above.
+    prev_animation = {
+        int(f["timestamp"])
+        for f in prev_stores.get("nowcast_store", {}).get(
+            "animation_frames", []
+        )
+    }
+    cur_animation = {
+        int(f["timestamp"])
+        for f in cur_stores.get("nowcast_store", {}).get(
+            "animation_frames", []
+        )
+    }
+    invalidate |= prev_animation | cur_animation
+
     return invalidate, False
 
 

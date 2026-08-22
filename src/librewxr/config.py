@@ -396,6 +396,11 @@ class Settings(BaseSettings):
     # or 30 min when fetch_interval is overridden to 300 seconds.
     nowcast_frames: int = 6
     nowcast_blend_mode: str = "blended"  # "radar", "blended", or "model"
+    # Display-only motion-compensated frames inserted between each pair of
+    # native radar/nowcast timestamps.  1 disables interpolation; 2 adds one
+    # midpoint (2.5-minute display cadence when fetch_interval=300).  These
+    # frames never enter point-nowcast sampling or alert logic.
+    radar_animation_substeps: int = Field(default=1, ge=1, le=5)
     # Separate optical-flow computation used by the /v2/radar motion-arrow
     # overlay.  Arrows key off per-region Farneback flow between the two
     # most recent radar frames; that flow is otherwise computed only as a
