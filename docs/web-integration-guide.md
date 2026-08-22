@@ -116,6 +116,13 @@ This is the starting point for any integration. It returns metadata about all av
       { "time": 1700001000, "path": "/v2/radar/1700001000" },
       { "time": 1700001600, "path": "/v2/radar/1700001600" }
     ],
+    "motion": {
+      "path_template": "/v2/radar/motion/{from}/{to}/{size}/{z}/{x}/{y}.png",
+      "encoding": "rgb12-offset-2048",
+      "vector_scale": 2.0,
+      "vector_offset": 2048,
+      "max_interval_seconds": 600
+    },
     "colorSchemes": [
       { "id": 0, "name": "Black and White" },
       { "id": 1, "name": "Rainviewer Original" },
@@ -277,6 +284,23 @@ http://localhost:8080/v2/radar/1700000400/256/5/8/12/7/1_0.png
 ```
 
 This requests a 256px PNG tile at zoom 5, column 8, row 12, using color scheme 7 (Rainbow @ Selex SI), with smoothing enabled and snow coloring disabled.
+
+### Continuous WebGL Radar Motion
+
+When `radar.motion` is present, a client can request dense displacement data
+for each adjacent pair of displayed radar frames:
+
+```text
+GET /v2/radar/motion/{from}/{to}/{size}/{z}/{x}/{y}.png
+```
+
+Decode the RGB data according to the advertised `encoding`, then use the
+resulting X/Y displacement in a fragment shader: sample the earlier colour
+texture backwards by `displacement * progress`, sample the later texture
+forwards by `displacement * (1 - progress)`, and mix the two samples. Updating
+`progress` with `requestAnimationFrame` produces continuous motion without
+requesting intermediate rendered radar frames. Keep ordinary raster animation
+as a fallback when WebGL or motion tiles are unavailable.
 
 ### Satellite Tile URL Format
 

@@ -295,6 +295,13 @@ Returns available radar timestamps and the host URL, matching Rain Viewer's resp
         {"time": 1773038250, "path": "/v2/radar/1773038250"}
       ]
     },
+    "motion": {
+      "path_template": "/v2/radar/motion/{from}/{to}/{size}/{z}/{x}/{y}.png",
+      "encoding": "rgb12-offset-2048",
+      "vector_scale": 2.0,
+      "vector_offset": 2048,
+      "max_interval_seconds": 300
+    },
     "colorSchemes": [
       {"id": 0, "name": "Black and White"},
       {"id": 7, "name": "Rainbow @ Selex SI"},
@@ -315,6 +322,12 @@ motion-compensated frames between the native `past` and `nowcast` timestamps.
 Clients that do not recognise it continue to use the Rain Viewer-compatible
 arrays unchanged. These synthetic frames are never returned by point-nowcast
 or used for alerts. Global scalar layers use the separate endpoint below.
+
+`radar.motion` is an optional LibreWXR extension for continuous client-side
+animation. It describes compact displacement-vector tiles between adjacent
+radar timestamps. Clients that support WebGL can warp the two coloured radar
+frames along those vectors on every display refresh instead of cross-fading
+whole PNG frames. Other clients can ignore this block.
 
 #### Radar Point Nowcast (LibreWXR extension)
 
@@ -438,6 +451,25 @@ https://api.librewxr.net/v2/radar/{timestamp}/256/{z}/{x}/{y}/10/1_1.png?cells=l
 # Combined: motion arrows + storm cells
 https://api.librewxr.net/v2/radar/{timestamp}/256/{z}/{x}/{y}/10/1_1.png?arrows=light&cells=light
 ```
+
+#### Radar Motion Tiles (LibreWXR extension)
+
+```text
+GET /v2/radar/motion/{from}/{to}/{size}/{z}/{x}/{y}.png
+```
+
+The endpoint returns an opaque RGB PNG containing dense pixel displacement
+from the earlier radar frame to the later one. Both timestamps must be present
+in the current radar/animation catalogue, ordered, and no farther apart than
+`radar.motion.max_interval_seconds` from the metadata response.
+
+For the `rgb12-offset-2048` encoding, combine each pixel's RGB bytes into one
+24-bit integer. Zero means that no reliable motion vector is available. For a
+non-zero value, the upper 12 bits are X and the lower 12 bits are Y; subtract
+`vector_offset` and divide by `vector_scale` to obtain displacement in tile
+pixels. The vector describes the full interval from `from` to `to`. Motion
+tiles are data textures, not user-visible map images, and should be sampled
+without colour-space conversion.
 
 **Color schemes:**
 

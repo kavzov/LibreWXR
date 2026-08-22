@@ -108,6 +108,13 @@ class TestWeatherMapsEndpoint:
         assert "radar" in data
         assert "past" in data["radar"]
         assert "nowcast" in data["radar"]
+        assert data["radar"]["motion"] == {
+            "path_template": "/v2/radar/motion/{from}/{to}/{size}/{z}/{x}/{y}.png",
+            "encoding": "rgb12-offset-2048",
+            "vector_scale": 2.0,
+            "vector_offset": 2048,
+            "max_interval_seconds": 600,
+        }
         assert "satellite" in data
 
     def test_past_contains_timestamps(self, client):
@@ -154,6 +161,27 @@ class TestWeatherMapsEndpoint:
 
 
 class TestRadarTileEndpoint:
+    def test_motion_tile_is_cacheable_png(self, client):
+        c, ts, ts_prev = client
+        url = f"/v2/radar/motion/{ts_prev}/{ts}/256/4/3/5.png"
+        first = c.get(url)
+        assert first.status_code == 200
+        assert first.headers["content-type"] == "image/png"
+        assert first.content.startswith(b"\x89PNG\r\n\x1a\n")
+        etag = first.headers["etag"]
+        cached = c.get(url, headers={"If-None-Match": etag})
+        assert cached.status_code == 304
+        assert cached.content == b""
+
+    def test_motion_tile_rejects_invalid_interval(self, client):
+        c, ts, ts_prev = client
+        assert c.get(
+            f"/v2/radar/motion/{ts}/{ts_prev}/256/4/3/5.png"
+        ).status_code == 400
+        assert c.get(
+            f"/v2/radar/motion/{ts_prev - 600}/{ts}/256/4/3/5.png"
+        ).status_code == 400
+
     def test_valid_tile_request(self, client):
         c, ts, ts_prev = client
         resp = c.get(f"/v2/radar/{ts}/256/4/3/5/2/0_0.png")

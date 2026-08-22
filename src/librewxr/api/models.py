@@ -42,10 +42,19 @@ class RadarAnimationData(BaseModel):
     nowcast: list[RadarTimestamp]
 
 
+class RadarMotionData(BaseModel):
+    path_template: str
+    encoding: str
+    vector_scale: float
+    vector_offset: int
+    max_interval_seconds: int
+
+
 class RadarData(BaseModel):
     past: list[RadarTimestamp]
     nowcast: list[RadarTimestamp]
     animation: RadarAnimationData | None = None
+    motion: RadarMotionData | None = None
     colorSchemes: list[ColorScheme]
 
 

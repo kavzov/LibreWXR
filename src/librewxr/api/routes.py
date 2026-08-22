@@ -19,6 +19,7 @@ from librewxr.api.models import (
     GeoJSONFeature,
     RadarData,
     RadarAnimationData,
+    RadarMotionData,
     RadarPointNowcastResponse,
     RadarTimestamp,
     SatelliteData,
@@ -48,6 +49,13 @@ from librewxr.tiles.renderer import (
     compute_tile_geometry,
     present_tile,
     render_coverage_tile,
+)
+from librewxr.tiles.motion_renderer import (
+    MOTION_ENCODING,
+    MOTION_RENDERER_VERSION,
+    MOTION_VECTOR_OFFSET,
+    MOTION_VECTOR_SCALE,
+    render_motion_tile,
 )
 from librewxr.tiles.request_tracker import TileRequestTracker
 from librewxr.tiles.satellite_renderer import (
@@ -760,6 +768,15 @@ async def weather_maps() -> WeatherMapsResponse:
             past=past,
             nowcast=nowcast,
             animation=animation,
+            motion=RadarMotionData(
+                path_template=(
+                    "/v2/radar/motion/{from}/{to}/{size}/{z}/{x}/{y}.png"
+                ),
+                encoding=MOTION_ENCODING,
+                vector_scale=MOTION_VECTOR_SCALE,
+                vector_offset=MOTION_VECTOR_OFFSET,
+                max_interval_seconds=settings.fetch_interval,
+            ),
             colorSchemes=color_schemes,
         ),
         satellite=SatelliteData(infrared=infrared),
@@ -847,6 +864,115 @@ async def _present_tile_async(geom, **kwargs) -> bytes:
             functools.partial(present_tile, geom, **kwargs),
         )
     return await asyncio.to_thread(present_tile, geom, **kwargs)
+
+
+async def _motion_geometry(
+    timestamp: int,
+    *,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+):
+    """Load one cached post-composite geometry for the motion endpoint."""
+    # Match the public site's smooth + snow-capable radar geometry so the
+    # expensive composite can be reused. Its overlap padding also gives
+    # optical flow context across tile edges, avoiding visible motion seams.
+    geom_key = (timestamp, z, x, y, tile_size, True, True)
+    geometry = tile_cache.get(geom_key)
+    if geometry is not None:
+        return geometry
+
+    frame = await frame_store.get_frame(timestamp)
+    nowcast_blend = None
+    if frame is None and nowcast_store is not None:
+        frame, nowcast_blend = await nowcast_store.get_frame(timestamp)
+    if frame is None and nowcast_store is not None:
+        animation_frame = await nowcast_store.get_animation_frame(timestamp)
+        if animation_frame is not None:
+            frame = animation_frame
+            if animation_frame.period == "forecast":
+                nowcast_blend = animation_frame.blend_weight
+    if frame is None:
+        raise HTTPException(status_code=404, detail="Frame not found")
+
+    geometry = await asyncio.to_thread(
+        compute_tile_geometry,
+        frame_regions=frame.regions,
+        z=z,
+        x=x,
+        y=y,
+        tile_size=tile_size,
+        smooth=True,
+        snow=True,
+        nwp_chain=nwp_chain,
+        enabled_regions=enabled_regions,
+        frame_timestamp=timestamp,
+        nowcast_blend=nowcast_blend,
+        precip_mask=precip_mask,
+    )
+    tile_cache.put(geom_key, geometry)
+    return geometry
+
+
+@router.get("/v2/radar/motion/{previous}/{following}/{size}/{z}/{x}/{y}.png")
+async def radar_motion_tile(
+    request: Request,
+    previous: int = Path(ge=1_000_000_000, le=9_999_999_999),
+    following: int = Path(ge=1_000_000_000, le=9_999_999_999),
+    size: int = Path(ge=256, le=512),
+    z: int = Path(ge=0),
+    x: int = Path(ge=0),
+    y: int = Path(ge=0),
+) -> Response:
+    """Return signed pixel displacement between two adjacent radar frames."""
+    if following <= previous:
+        raise HTTPException(status_code=400, detail="Motion timestamps out of order")
+    if following - previous > settings.fetch_interval:
+        raise HTTPException(status_code=400, detail="Motion interval is too large")
+    if z > settings.max_zoom:
+        raise HTTPException(status_code=400, detail=f"Zoom {z} exceeds max {settings.max_zoom}")
+    max_tiles = 2**z
+    if x >= max_tiles or y >= max_tiles:
+        raise HTTPException(status_code=400, detail="Tile coordinates out of range")
+
+    tile_size = 512 if size >= 512 else 256
+    cache_key = (
+        "radar-motion",
+        MOTION_RENDERER_VERSION,
+        previous,
+        following,
+        z,
+        x,
+        y,
+        tile_size,
+    )
+    cached = tile_cache.get(cache_key)
+    if isinstance(cached, CachedRender):
+        rendered = cached
+    else:
+        previous_geometry, following_geometry = await asyncio.gather(
+            _motion_geometry(previous, z=z, x=x, y=y, tile_size=tile_size),
+            _motion_geometry(following, z=z, x=x, y=y, tile_size=tile_size),
+        )
+        tile_bytes = await asyncio.to_thread(
+            render_motion_tile,
+            previous_geometry,
+            following_geometry,
+        )
+        rendered = CachedRender(data=tile_bytes, etag=compute_etag(tile_bytes))
+        tile_cache.put(cache_key, rendered)
+
+    timestamps = await _latest_timestamps_cached()
+    latest_ts = max(timestamps) if timestamps else None
+    max_age = 7200 if latest_ts is not None and following < latest_ts else 300
+    return conditional_response(
+        request=request,
+        body=rendered.data,
+        etag=rendered.etag,
+        content_type="image/png",
+        max_age=max_age,
+    )
 
 
 @router.get("/v2/radar/{timestamp}/{size}/{z}/{x}/{y}/{color}/{smooth_snow}.{ext}")
