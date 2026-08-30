@@ -453,6 +453,11 @@ class Settings(BaseSettings):
     # Seconds to wait for the data pipeline to write its first state.json
     # before failing loudly.  0 = wait forever.
     state_wait_timeout: float = 300.0
+    # Number of complete immutable snapshots to retain, including current.
+    # Three means current + two previous generations.  Must stay >= 2 so a
+    # renderer racing the atomic pointer switch can still finish opening the
+    # prior generation's memmaps.
+    state_retention_generations: int = Field(default=3, ge=2)
 
     # WMO CAP Weather Alerts
     alerts_enabled: bool = True

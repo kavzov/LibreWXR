@@ -960,7 +960,11 @@ async def lifespan(app: FastAPI):
 
         async def on_cycle_complete() -> None:
             try:
-                dump_state(state_stores, state_cache_dir)
+                dump_state(
+                    state_stores,
+                    state_cache_dir,
+                    retention_generations=settings.state_retention_generations,
+                )
             except Exception:
                 logger.exception("Failed to dump state snapshot (single mode)")
 

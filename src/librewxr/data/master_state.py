@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Joshua Kimsey
-"""Cross-process state snapshot for the multi-worker tile-server split.
+"""Cross-process state snapshots for the multi-worker tile-server split.
 
-The data pipeline writes a single ``state.json`` file under the shared
-cache volume after each fetch cycle.  Render-only tile-server workers
-poll its mtime, re-read it on change, and call ``apply_state`` to
-refresh every store in place — existing references stay valid so
-in-flight renders are never interrupted.
+The data pipeline publishes immutable generations under the shared cache
+volume after each fetch cycle.  Every generation contains a manifest plus
+hardlinks to the memmap files referenced by that manifest.  Only after the
+generation is complete is the top-level ``state.json`` atomically replaced.
+Render-only workers therefore see either the complete old generation or the
+complete new one, never a manifest whose files were already evicted.
 
 Format::
 
@@ -35,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -43,15 +45,200 @@ logger = logging.getLogger(__name__)
 
 STATE_FILENAME = "state.json"
 STATE_VERSION = 1
+STATE_GENERATIONS_DIRNAME = "state-generations"
+DEFAULT_STATE_RETENTION_GENERATIONS = 3
+_PATH_KEYS = frozenset({"memmap_dir", "cache_root"})
+_DESCRIPTOR_STATE_KEYS = frozenset({
+    "frames",
+    "animation_frames",
+    "flows",
+    "nwp_flow",
+    "masks",
+    "cells",
+    "timesteps",
+})
 
 
-def dump_state(stores: dict[str, Any], cache_dir: Path) -> Path:
-    """Atomically write a snapshot of every store's ``__getstate__`` to disk.
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    """Durably write *payload* to *path* (which must not be visible yet)."""
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, default=str)
+        handle.flush()
+        os.fsync(handle.fileno())
 
-    The write goes to ``<cache_dir>/.state.json.tmp`` first and is then
-    atomically renamed to ``state.json``.  Concurrent readers either see
-    the old file (if they read before the rename) or the new file
-    (after) — never a partial write.
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes across a host crash."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _path_under(path: Path, root: Path) -> Path | None:
+    """Return *path* relative to *root*, or ``None`` when it is external."""
+    try:
+        return path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None
+
+
+def _descriptor_paths(value: Any) -> set[Path]:
+    """Find relative ``[filename, dtype, shape]`` memmap descriptors."""
+    paths: set[Path] = set()
+    if isinstance(value, dict):
+        for child in value.values():
+            paths.update(_descriptor_paths(child))
+    elif isinstance(value, list):
+        if (
+            len(value) == 3
+            and isinstance(value[0], str)
+            and isinstance(value[2], list)
+        ):
+            candidate = Path(value[0])
+            if not candidate.is_absolute() and ".." not in candidate.parts:
+                paths.add(candidate)
+        else:
+            for child in value:
+                paths.update(_descriptor_paths(child))
+    return paths
+
+
+def _snapshot_sources(
+    value: Any,
+    cache_dir: Path,
+) -> dict[Path, set[Path] | None]:
+    """Collect persistent roots and, where possible, exact files to retain.
+
+    Most stores advertise a ``memmap_dir`` and reopen either explicit
+    descriptors or every matching file below it.  ``None`` means a legacy
+    rescan-based store needs the complete tree.  GMGSI advertises the cache
+    root and timestamp list instead, so its small ``gmgsi`` subtree is kept.
+    """
+    sources: dict[Path, set[Path] | None] = {}
+    if isinstance(value, dict):
+        memmap_dir = value.get("memmap_dir")
+        if isinstance(memmap_dir, str):
+            root = Path(memmap_dir)
+            if _path_under(root, cache_dir) is not None:
+                files = (
+                    _descriptor_paths(value)
+                    if _DESCRIPTOR_STATE_KEYS.intersection(value)
+                    else None
+                )
+                existing = sources.get(root, set())
+                sources[root] = (
+                    None
+                    if existing is None or files is None
+                    else existing | files
+                )
+        cache_root = value.get("cache_root")
+        if isinstance(cache_root, str):
+            root = Path(cache_root) / "gmgsi"
+            if _path_under(root, cache_dir) is not None:
+                sources[root] = None
+        for child in value.values():
+            for root, files in _snapshot_sources(child, cache_dir).items():
+                existing = sources.get(root, set())
+                sources[root] = (
+                    None
+                    if existing is None or files is None
+                    else existing | files
+                )
+    elif isinstance(value, list):
+        for child in value:
+            for root, files in _snapshot_sources(child, cache_dir).items():
+                existing = sources.get(root, set())
+                sources[root] = (
+                    None
+                    if existing is None or files is None
+                    else existing | files
+                )
+    return sources
+
+
+def _hardlink_tree(source: Path, destination: Path) -> int:
+    """Mirror regular files below *source* into *destination* as hardlinks."""
+    destination.mkdir(parents=True, exist_ok=True)
+    if not source.exists():
+        return 0
+    linked = 0
+    for root, dirnames, filenames in os.walk(source):
+        root_path = Path(root)
+        target_root = destination / root_path.relative_to(source)
+        target_root.mkdir(parents=True, exist_ok=True)
+        # Snapshot only complete files.  Every persistent writer uses a .tmp
+        # followed by os.replace, so a .tmp is never part of a valid state.
+        dirnames[:] = [name for name in dirnames if not name.endswith(".tmp")]
+        for filename in filenames:
+            if filename.endswith(".tmp"):
+                continue
+            src = root_path / filename
+            dst = target_root / filename
+            os.link(src, dst)
+            linked += 1
+    return linked
+
+
+def _hardlink_selected(
+    source: Path,
+    destination: Path,
+    relative_paths: set[Path],
+) -> int:
+    """Hardlink only manifest-referenced files, preserving subdirectories."""
+    destination.mkdir(parents=True, exist_ok=True)
+    linked = 0
+    for relative in sorted(relative_paths):
+        if relative.name.endswith(".tmp"):
+            continue
+        src = source / relative
+        dst = destination / relative
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.link(src, dst)
+        linked += 1
+    return linked
+
+
+def _rewrite_store_paths(value: Any, cache_dir: Path, snapshot_root: Path) -> Any:
+    """Point store directory fields at the immutable generation mirror."""
+    if isinstance(value, dict):
+        rewritten: dict[str, Any] = {}
+        for key, child in value.items():
+            if key in _PATH_KEYS and isinstance(child, str):
+                relative = _path_under(Path(child), cache_dir)
+                if relative is not None:
+                    rewritten[key] = str(snapshot_root / relative)
+                    continue
+            rewritten[key] = _rewrite_store_paths(child, cache_dir, snapshot_root)
+        return rewritten
+    if isinstance(value, list):
+        return [_rewrite_store_paths(child, cache_dir, snapshot_root) for child in value]
+    return value
+
+
+def _prune_generations(generations_dir: Path, keep: int) -> None:
+    """Remove complete generations older than the newest *keep* entries."""
+    complete = sorted(
+        path for path in generations_dir.iterdir()
+        if path.is_dir() and not path.name.startswith(".")
+    )
+    for path in complete[:-keep]:
+        shutil.rmtree(path)
+
+
+def dump_state(
+    stores: dict[str, Any],
+    cache_dir: Path,
+    retention_generations: int = DEFAULT_STATE_RETENTION_GENERATIONS,
+) -> Path:
+    """Publish an immutable, atomically-selected state generation.
+
+    Store data is hardlinked into ``state-generations/<id>/files`` before
+    either manifest becomes visible.  Hardlinks make unchanged generations
+    effectively free while preserving old inodes when the pipeline replaces
+    or unlinks their live-cache names.  The top-level ``state.json`` remains
+    the compatibility/current pointer consumed by existing readers.
 
     Args:
         stores: mapping of store name → store object.  Values that are
@@ -60,9 +247,18 @@ def dump_state(stores: dict[str, Any], cache_dir: Path) -> Path:
         cache_dir: directory shared with the tile-server workers.
             ``state.json`` is written at the top level of this directory.
 
+        retention_generations: total complete generations to retain, including
+            the current one.  At least two are required so a reader that saw
+            the old manifest during the atomic switch can still open it.
+
     Returns:
-        The path to the newly-written ``state.json``.
+        The path to the newly-published top-level ``state.json``.
     """
+    if retention_generations < 2:
+        raise ValueError("retention_generations must be at least 2")
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "version": STATE_VERSION,
         "written_at": int(time.time()),
@@ -88,14 +284,64 @@ def dump_state(stores: dict[str, Any], cache_dir: Path) -> Path:
             continue
         payload["stores"][name] = store_state
 
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    generations_dir = cache_dir / STATE_GENERATIONS_DIRNAME
+    generations_dir.mkdir(parents=True, exist_ok=True)
+    for stale in generations_dir.glob(".*.tmp"):
+        if stale.is_dir():
+            shutil.rmtree(stale)
+
+    generation_id = f"{time.time_ns():020d}-{os.getpid()}"
+    staging = generations_dir / f".{generation_id}.tmp"
+    generation_dir = generations_dir / generation_id
+    staging_files = staging / "files"
+    final_files = generation_dir / "files"
+    staging_files.mkdir(parents=True)
+
+    linked = 0
+    try:
+        for source_root, relative_paths in _snapshot_sources(
+            payload, cache_dir,
+        ).items():
+            relative = _path_under(source_root, cache_dir)
+            if relative is None:
+                continue
+            destination = staging_files / relative
+            if relative_paths is None:
+                linked += _hardlink_tree(source_root, destination)
+            else:
+                linked += _hardlink_selected(
+                    source_root, destination, relative_paths,
+                )
+
+        payload["stores"] = _rewrite_store_paths(
+            payload["stores"], cache_dir, final_files,
+        )
+        payload["generation"] = {
+            "id": generation_id,
+            "path": str(generation_dir),
+            "retention_generations": retention_generations,
+        }
+        _write_json(staging / STATE_FILENAME, payload)
+        os.replace(staging, generation_dir)
+        _fsync_directory(generations_dir)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
     final = cache_dir / STATE_FILENAME
     tmp = cache_dir / f".{STATE_FILENAME}.tmp"
-    tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
+    _write_json(tmp, payload)
     os.replace(tmp, final)
+    _fsync_directory(cache_dir)
+    try:
+        _prune_generations(generations_dir, retention_generations)
+    except Exception:
+        # Publication already succeeded.  Extra old generations consume disk
+        # but cannot compromise readers, so leave cleanup for the next cycle.
+        logger.exception("Failed to prune old state generations")
     logger.debug(
-        "Wrote state.json: %d store(s) → %s", len(payload["stores"]), final,
+        "Published state generation %s: %d store(s), %d hardlink(s) → %s",
+        generation_id, len(payload["stores"]), linked, final,
     )
     return final
 

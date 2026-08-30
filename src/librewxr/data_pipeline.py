@@ -261,7 +261,11 @@ async def run_pipeline() -> None:
         except Exception:
             logger.exception("Failed to build precip mask")
         try:
-            dump_state(stores, cache_dir)
+            dump_state(
+                stores,
+                cache_dir,
+                retention_generations=settings.state_retention_generations,
+            )
         except Exception:
             logger.exception("Failed to dump master state snapshot")
 

@@ -81,6 +81,11 @@ services:
       - .env
     environment:
       LIBREWXR_CACHE_DIR: /data/cache
+      # Keep the pipeline monitor independent from the renderer's tighter
+      # cache-eviction thresholds. Both services otherwise inherit the same
+      # LIBREWXR_MEMORY_LIMIT_MB from .env despite having different cgroups.
+      LIBREWXR_MEMORY_LIMIT_MB: ${LIBREWXR_PIPELINE_MEMORY_LIMIT_MB:-0}
+      LIBREWXR_MEMORY_PRESSURE_CHECK_INTERVAL: ${LIBREWXR_PIPELINE_MEMORY_PRESSURE_CHECK_INTERVAL:-30}
     volumes:
       - librewxr-cache:/data/cache
       - earthkit-cache:/root/.cache/earthkit-regrid
@@ -114,6 +119,8 @@ services:
       - .env
     environment:
       LIBREWXR_CACHE_DIR: /data/cache
+      LIBREWXR_MEMORY_LIMIT_MB: ${LIBREWXR_RENDER_MEMORY_LIMIT_MB:-0}
+      LIBREWXR_MEMORY_PRESSURE_CHECK_INTERVAL: ${LIBREWXR_RENDER_MEMORY_PRESSURE_CHECK_INTERVAL:-30}
       # render_only skips fetcher / NWP / satellite / nowcast init —
       # the renderer reads everything from the pipeline's snapshot.
       LIBREWXR_RENDER_ONLY: "1"
@@ -135,6 +142,7 @@ services:
       resources:
         limits:
           memory: ${LIBREWXR_RENDER_MEMORY:-18G}
+          cpus: "${LIBREWXR_RENDER_CPUS:-0}"
     # The renderer reopens every cached memmap via __setstate__ on each
     # state.json refresh (see the single-mode comment above).  This is
     # the service that was hitting EMFILE in production — the nofile

@@ -16,7 +16,9 @@ import numpy as np
 import pytest
 
 from librewxr.data.master_state import (
+    DEFAULT_STATE_RETENTION_GENERATIONS,
     STATE_FILENAME,
+    STATE_GENERATIONS_DIRNAME,
     STATE_VERSION,
     apply_state,
     dump_state,
@@ -76,8 +78,17 @@ def test_dump_state_atomic_replaces_existing(tmp_path: Path) -> None:
     dump_state({}, tmp_path)
 
     files = sorted(p.name for p in tmp_path.iterdir())
-    # Only the final state.json — never a stray .tmp afterwards.
-    assert files == [STATE_FILENAME]
+    assert files == [STATE_GENERATIONS_DIRNAME, STATE_FILENAME]
+    generations = list((tmp_path / STATE_GENERATIONS_DIRNAME).iterdir())
+    assert len(generations) == 2
+    assert all(not path.name.startswith(".") for path in generations)
+
+
+def test_dump_state_rejects_unsafe_single_generation_retention(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="at least 2"):
+        dump_state({}, tmp_path, retention_generations=1)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -135,6 +146,86 @@ class TestRoundTripWithFrameStore:
         # Same consumer object — state must update in place.
         apply_state(load_state(cache), {"frame_store": consumer})
         assert await consumer.get_timestamps() == [1700000000, 1700000600]
+
+    @pytest.mark.asyncio
+    async def test_previous_generation_survives_live_frame_eviction(
+        self, tmp_path: Path,
+    ) -> None:
+        """An old manifest must keep its evicted memmap inode loadable."""
+        cache = tmp_path / "cache"
+        producer = FrameStore(max_frames=1, cache_dir=cache)
+
+        first = np.full((4, 4), 11, dtype=np.uint8)
+        await producer.add_frame(
+            RadarFrame(timestamp=100, regions={"R": first}),
+        )
+        dump_state({"frame_store": producer}, cache, retention_generations=2)
+        first_payload = load_state(cache)
+        first_generation = first_payload["generation"]["id"]
+
+        await producer.add_frame(
+            RadarFrame(timestamp=200, regions={"R": np.full((4, 4), 22, np.uint8)}),
+        )
+        assert not (cache / "radar" / "100_R.dat").exists()
+        dump_state({"frame_store": producer}, cache, retention_generations=2)
+
+        retained_manifest = (
+            cache / STATE_GENERATIONS_DIRNAME / first_generation / STATE_FILENAME
+        )
+        retained_payload = json.loads(retained_manifest.read_text())
+        consumer = FrameStore(max_frames=1)
+        assert apply_state(retained_payload, {"frame_store": consumer}) == [
+            "frame_store"
+        ]
+        restored = await consumer.get_frame(100)
+        assert restored is not None
+        np.testing.assert_array_equal(restored.regions["R"], first)
+
+        await producer.add_frame(
+            RadarFrame(timestamp=300, regions={"R": np.full((4, 4), 33, np.uint8)}),
+        )
+        dump_state({"frame_store": producer}, cache, retention_generations=2)
+        assert not retained_manifest.exists()
+        assert len(list((cache / STATE_GENERATIONS_DIRNAME).iterdir())) == 2
+
+    @pytest.mark.asyncio
+    async def test_current_manifest_points_only_at_generation_files(
+        self, tmp_path: Path,
+    ) -> None:
+        cache = tmp_path / "cache"
+        producer = FrameStore(max_frames=1, cache_dir=cache)
+        await producer.add_frame(
+            RadarFrame(timestamp=100, regions={"R": np.zeros((2, 2), np.uint8)}),
+        )
+
+        dump_state({"frame_store": producer}, cache)
+        payload = load_state(cache)
+        memmap_dir = Path(payload["stores"]["frame_store"]["memmap_dir"])
+
+        assert STATE_GENERATIONS_DIRNAME in memmap_dir.parts
+        assert payload["generation"]["retention_generations"] == (
+            DEFAULT_STATE_RETENTION_GENERATIONS
+        )
+        assert (memmap_dir / "100_R.dat").exists()
+
+    @pytest.mark.asyncio
+    async def test_generation_omits_unreferenced_memmaps(
+        self, tmp_path: Path,
+    ) -> None:
+        cache = tmp_path / "cache"
+        producer = FrameStore(max_frames=1, cache_dir=cache)
+        await producer.add_frame(
+            RadarFrame(timestamp=100, regions={"R": np.zeros((2, 2), np.uint8)}),
+        )
+        stale = cache / "radar" / "stale.dat"
+        stale.write_bytes(b"not referenced by the manifest")
+
+        dump_state({"frame_store": producer}, cache)
+        payload = load_state(cache)
+        generation_radar = Path(payload["stores"]["frame_store"]["memmap_dir"])
+
+        assert (generation_radar / "100_R.dat").exists()
+        assert not (generation_radar / stale.name).exists()
 
 
 # ──────────────────────────────────────────────────────────────────────────

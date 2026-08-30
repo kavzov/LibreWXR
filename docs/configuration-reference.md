@@ -522,7 +522,9 @@ Production observation on an 80-core / 32 GB rack in multi mode (32 render worke
 
 ## Multi-mode Tile-Server Split
 
-Runs the data pipeline as one process and N tile-server worker processes alongside it, all sharing `LIBREWXR_CACHE_DIR` via memmap files + a single `state.json` snapshot. Bypasses Python's GIL on the tile-render path so the rack's full core count can actually do work.
+Runs the data pipeline as one process and N tile-server worker processes alongside it, all sharing `LIBREWXR_CACHE_DIR` via memmap files and an atomically selected `state.json` generation. Bypasses Python's GIL on the tile-render path so the rack's full core count can actually do work.
+
+Each completed generation lives under `state-generations/<id>/`: its manifest points only at immutable hardlinks inside that generation. The pipeline publishes the top-level `state.json` only after every referenced file is present, then prunes expired generations. Consequently a renderer sees either the complete old snapshot or the complete new snapshot, including when it restarts during a fetch-cycle rollover. Hardlinks do not duplicate unchanged data blocks; only files replaced between retained generations consume additional disk.
 
 To enable:
 1. Set `LIBREWXR_CACHE_DIR` to a shared directory (required).
@@ -561,6 +563,15 @@ Seconds for render workers to wait for the first `state.json` on cold start befo
 | **Default** | `300` |
 | **Type** | float |
 | **Unit** | seconds |
+
+### `LIBREWXR_STATE_RETENTION_GENERATIONS`
+
+Total number of complete immutable state generations retained on disk, including the current generation. The default `3` keeps current + two previous snapshots. The minimum is `2`: a renderer that read the old `state.json` immediately before an atomic pointer switch must still be able to open that generation's memmaps.
+
+| | |
+|---|---|
+| **Default** | `3` |
+| **Type** | integer (minimum 2) |
 
 ---
 
