@@ -145,6 +145,11 @@ class FrameStore:
         async with self._lock:
             return [f.timestamp for f in self._frames]
 
+    async def get_frame_versions(self) -> dict[int, int]:
+        """Return stable per-timestamp content versions for HTTP cache keys."""
+        async with self._lock:
+            return dict(self._frame_versions)
+
     async def get_region_keys(self) -> dict[int, set[str]]:
         """Return a mapping of timestamp -> set of region names present."""
         async with self._lock:

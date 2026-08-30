@@ -129,6 +129,7 @@ def test_metadata_schema_and_legend(weather_api):
     assert response.status_code == 200
     body = response.json()
     assert body["active_model_run"] == weather_api["grid"].reference_time
+    assert body["model_version"] == weather_api["grid"].model_version
     assert isinstance(body["generated"], int)
     assert body["stale"] is False
     assert "ECMWF" in body["attribution"]

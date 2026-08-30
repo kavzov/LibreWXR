@@ -29,6 +29,7 @@ class AlertsResponse(BaseModel):
 class RadarTimestamp(BaseModel):
     time: int
     path: str
+    version: str
 
 
 class ColorScheme(BaseModel):
@@ -97,6 +98,7 @@ class WeatherFieldInfo(BaseModel):
 
 class WeatherMetadataResponse(BaseModel):
     active_model_run: str | None
+    model_version: str
     generated: int
     stale: bool
     attribution: str

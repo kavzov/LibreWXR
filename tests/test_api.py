@@ -126,6 +126,7 @@ class TestWeatherMapsEndpoint:
         # past is sorted oldest-first; ts_prev was added first (earlier)
         assert past[0]["time"] == ts_prev
         assert past[0]["path"] == f"/v2/radar/{ts_prev}"
+        assert past[0]["version"] == f"r{ts_prev}.1"
 
     def test_animation_metadata_is_separate_and_tile_is_renderable(self, client):
         c, ts, ts_prev = client
@@ -148,6 +149,7 @@ class TestWeatherMapsEndpoint:
             assert animation["past"] == [{
                 "time": animation_ts,
                 "path": f"/v2/radar/{animation_ts}",
+                "version": f"a{animation_ts}",
             }]
             assert animation["nowcast"] == []
 

@@ -411,6 +411,15 @@ def _weather_available_timestamps() -> list[int]:
     return sorted(int(timestamp) for timestamp in getter())
 
 
+def _weather_model_version() -> str:
+    if ecmwf_grid is None:
+        return "unavailable"
+    version = getattr(ecmwf_grid, "model_version", None)
+    if version:
+        return str(version)
+    return f"{getattr(ecmwf_grid, 'reference_time', None)}:g{getattr(ecmwf_grid, 'grid_version', 0)}"
+
+
 @router.get("/v2/weather/metadata.json", response_model=WeatherMetadataResponse)
 async def weather_metadata(response: Response) -> WeatherMetadataResponse:
     """Metadata and legend definitions for scalar global weather tiles."""
@@ -468,6 +477,7 @@ async def weather_metadata(response: Response) -> WeatherMetadataResponse:
         active_model_run=(
             ecmwf_grid.reference_time if ecmwf_grid is not None else None
         ),
+        model_version=_weather_model_version(),
         generated=now,
         stale=bool(health.get("stale", True)),
         attribution=_WEATHER_ATTRIBUTION,
@@ -706,19 +716,30 @@ async def weather_field_tile(
 async def weather_maps() -> WeatherMapsResponse:
     """Rain Viewer-compatible metadata endpoint."""
     timestamps = await frame_store.get_timestamps()
+    frame_versions = await frame_store.get_frame_versions()
     host = settings.public_url.rstrip("/")
 
     past = [
-        RadarTimestamp(time=ts, path=f"/v2/radar/{ts}")
+        RadarTimestamp(
+            time=ts,
+            path=f"/v2/radar/{ts}",
+            version=f"r{ts}.{frame_versions.get(ts, 0)}",
+        )
         for ts in sorted(timestamps)
     ]
 
     nowcast = []
     animation = None
+    latest_observation = max(timestamps) if timestamps else 0
+    nowcast_version = f"n{latest_observation}.{_weather_model_version()}"
     if nowcast_store is not None:
         nc_timestamps = await nowcast_store.get_timestamps()
         nowcast = [
-            RadarTimestamp(time=ts, path=f"/v2/radar/{ts}")
+            RadarTimestamp(
+                time=ts,
+                path=f"/v2/radar/{ts}",
+                version=nowcast_version,
+            )
             for ts in nc_timestamps
         ]
         animation_frames = await nowcast_store.get_animation_frames()
@@ -729,6 +750,7 @@ async def weather_maps() -> WeatherMapsResponse:
                     RadarTimestamp(
                         time=frame.timestamp,
                         path=f"/v2/radar/{frame.timestamp}",
+                        version=f"a{frame.timestamp}",
                     )
                     for frame in animation_frames
                     if frame.period == "past"
@@ -737,6 +759,7 @@ async def weather_maps() -> WeatherMapsResponse:
                     RadarTimestamp(
                         time=frame.timestamp,
                         path=f"/v2/radar/{frame.timestamp}",
+                        version=nowcast_version,
                     )
                     for frame in animation_frames
                     if frame.period == "forecast"
@@ -751,7 +774,11 @@ async def weather_maps() -> WeatherMapsResponse:
     gmgsi_lw = satellite_grids.get("gmgsi_lw_grid") if satellite_grids else None
     if gmgsi_lw is not None and gmgsi_lw.timestamps:
         infrared = [
-            RadarTimestamp(time=ts, path=f"/v2/satellite/{ts}")
+            RadarTimestamp(
+                time=ts,
+                path=f"/v2/satellite/{ts}",
+                version=f"s{ts}",
+            )
             for ts in gmgsi_lw.timestamps
         ]
 
