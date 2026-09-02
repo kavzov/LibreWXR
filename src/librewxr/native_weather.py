@@ -370,3 +370,123 @@ def sample_wind_speed(
             wind_v.reshape(1, wind_v.size),
         ).reshape(wind_u.shape)
     return wind_speed_from_uv(wind_u, wind_v)
+
+
+def sample_radar_bilinear(
+    frame: np.ndarray,
+    row: np.ndarray,
+    col: np.ndarray,
+    *,
+    implementation: Implementation | None = None,
+) -> np.ndarray:
+    """Sample an encoded uint8 radar grid with zero-aware interpolation.
+
+    A zero corner makes the result fall back to the nearest value. This keeps
+    the native path pixel-identical to the historical NumPy renderer and
+    avoids interpolating precipitation across nodata / clear-sky boundaries.
+    """
+
+    frame = np.asarray(frame)
+    row = np.asarray(row)
+    col = np.asarray(col)
+    if frame.ndim != 2 or frame.dtype != np.uint8:
+        raise TypeError("frame must be a two-dimensional uint8 array")
+    if row.ndim != 2 or row.dtype != np.float32:
+        raise TypeError("row must be a two-dimensional float32 array")
+    if col.shape != row.shape or col.dtype != np.float32:
+        raise TypeError("col must be a float32 array matching row")
+    for name, array in (("frame", frame), ("row", row), ("col", col)):
+        if not array.flags.c_contiguous:
+            raise ValueError(f"{name} must be C-contiguous")
+
+    if active_implementation(implementation) == "rust":
+        return _native.sample_radar_bilinear_u8(frame, row, col)
+
+    r0 = np.floor(row).astype(np.int32)
+    c0 = np.floor(col).astype(np.int32)
+    r1 = np.minimum(r0 + 1, frame.shape[0] - 1)
+    c1 = np.minimum(c0 + 1, frame.shape[1] - 1)
+    dr = (row - r0).astype(np.float32)
+    dc = (col - c0).astype(np.float32)
+    v00 = frame[r0, c0].astype(np.float32)
+    v01 = frame[r0, c1].astype(np.float32)
+    v10 = frame[r1, c0].astype(np.float32)
+    v11 = frame[r1, c1].astype(np.float32)
+    any_zero = (v00 == 0) | (v01 == 0) | (v10 == 0) | (v11 == 0)
+    interpolated = (
+        v00 * (1 - dr) * (1 - dc)
+        + v01 * (1 - dr) * dc
+        + v10 * dr * (1 - dc)
+        + v11 * dr * dc
+    )
+    return np.clip(np.where(any_zero, v00, interpolated) + 0.5, 0, 255).astype(
+        np.uint8
+    )
+
+
+def colorize_radar(
+    values: np.ndarray,
+    rain_lut: np.ndarray,
+    *,
+    snow_lut: np.ndarray | None = None,
+    snow_mask: np.ndarray | None = None,
+    display_threshold: int | None = None,
+    implementation: Implementation | None = None,
+) -> np.ndarray:
+    """Apply radar LUT, phase mask, and display threshold in one kernel."""
+
+    values = np.asarray(values)
+    rain_lut = np.asarray(rain_lut)
+    if values.ndim != 2 or values.dtype != np.uint8:
+        raise TypeError("values must be a two-dimensional uint8 array")
+    if rain_lut.shape != (256, 4) or rain_lut.dtype != np.uint8:
+        raise TypeError("rain_lut must be a uint8 array with shape (256, 4)")
+    if (snow_lut is None) != (snow_mask is None):
+        raise ValueError("snow_lut and snow_mask must be provided together")
+    if snow_lut is not None:
+        snow_lut = np.asarray(snow_lut)
+        snow_mask = np.asarray(snow_mask)
+        if snow_lut.shape != (256, 4) or snow_lut.dtype != np.uint8:
+            raise TypeError("snow_lut must be a uint8 array with shape (256, 4)")
+        if snow_mask.shape != values.shape or snow_mask.dtype != np.bool_:
+            raise TypeError("snow_mask must be a bool array matching values")
+    if display_threshold is not None and not 0 <= display_threshold <= 255:
+        raise ValueError("display_threshold must be within [0, 255]")
+    arrays = [("values", values), ("rain_lut", rain_lut)]
+    if snow_lut is not None:
+        arrays.extend((("snow_lut", snow_lut), ("snow_mask", snow_mask)))
+    for name, array in arrays:
+        if not array.flags.c_contiguous:
+            raise ValueError(f"{name} must be C-contiguous")
+
+    if active_implementation(implementation) == "rust":
+        return _native.colorize_radar_u8(
+            values, rain_lut, snow_lut, snow_mask, display_threshold
+        )
+
+    display_values = values
+    if display_threshold is not None:
+        display_values = values.copy()
+        display_values[display_values < display_threshold] = 0
+    rain = rain_lut[display_values]
+    if snow_mask is None:
+        return rain
+    snow = snow_lut[display_values]
+    return np.where(snow_mask[..., np.newaxis], snow, rain)
+
+
+def encode_radar_png(
+    rgba: np.ndarray,
+    *,
+    implementation: Implementation | None = None,
+) -> bytes | None:
+    """Encode RGBA through Rust, or return ``None`` for the Pillow fallback."""
+
+    if active_implementation(implementation) == "python":
+        return None
+    rgba = np.asarray(rgba)
+    if rgba.ndim != 3 or rgba.shape[2] != 4 or rgba.dtype != np.uint8:
+        raise TypeError("rgba must be a uint8 array with shape (height, width, 4)")
+    if not rgba.flags.c_contiguous:
+        rgba = np.ascontiguousarray(rgba)
+    return bytes(_native.encode_png_rgba(rgba))

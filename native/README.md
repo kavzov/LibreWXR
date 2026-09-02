@@ -1,4 +1,4 @@
-# Optional native weather sampling
+# Optional native rendering kernels
 
 LibreWXR's base Hatchling package does not build or install this crate. The
 application always includes a NumPy implementation and therefore installs and
@@ -13,10 +13,15 @@ maturin build --release --manifest-path native/Cargo.toml \
 ```
 
 Production images should build the wheel in a separate builder stage and copy
-only the wheel into the runtime image. The extension has no Rayon dependency,
-creates no thread pool, and releases the GIL around each sampling or derived
-field kernel. Existing Uvicorn worker and request-executor limits remain the
-only concurrency controls.
+only the wheel into the runtime image. In addition to weather-field sampling,
+the extension accelerates radar bilinear sampling, LUT colour composition, and
+lossless RGBA PNG encoding. Low-colour tiles keep the smaller Pillow PNG8 path;
+the native encoder handles blurred and overlay tiles where PNG compression is
+the dominant presentation cost.
+
+The extension has no Rayon dependency, creates no thread pool, and releases the
+GIL around every kernel. Existing Uvicorn worker and request-executor limits
+remain the only concurrency controls.
 
 Use `LIBREWXR_NATIVE_RENDER=auto` (default) for automatic fallback, `on` to
 require the wheel at startup, or `off` to force NumPy.

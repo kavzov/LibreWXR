@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import io
+
 import numpy as np
 import pytest
+from PIL import Image
 
 from librewxr.config import settings
 from librewxr.data.weather_fields import WeatherField, field_spec
@@ -14,6 +17,9 @@ from librewxr import native_weather
 from librewxr.native_weather import (
     active_implementation,
     ensure_native_render_available,
+    colorize_radar,
+    encode_radar_png,
+    sample_radar_bilinear,
     sample_bilinear_regular_grid,
     sample_derived_humidity,
     sample_temporal_bilinear,
@@ -203,6 +209,46 @@ def test_native_humidity_and_wind_speed_match_numpy(require_native):
 
     _assert_parity(humidity_python, humidity_rust, 1.0)
     _assert_parity(wind_python, wind_rust, 0.1)
+
+
+def test_native_radar_bilinear_matches_numpy(require_native):
+    rng = np.random.default_rng(314159)
+    frame = rng.integers(0, 256, (73, 91), dtype=np.uint8)
+    frame[frame < 48] = 0
+    row = np.ascontiguousarray(
+        rng.uniform(0, frame.shape[0] - 1, (37, 43)).astype(np.float32)
+    )
+    col = np.ascontiguousarray(
+        rng.uniform(0, frame.shape[1] - 1, (37, 43)).astype(np.float32)
+    )
+
+    python = sample_radar_bilinear(frame, row, col, implementation="python")
+    rust = sample_radar_bilinear(frame, row, col, implementation="rust")
+
+    np.testing.assert_array_equal(rust, python)
+
+
+def test_native_radar_colorize_and_png_are_lossless(require_native):
+    rng = np.random.default_rng(271828)
+    values = rng.integers(0, 256, (47, 59), dtype=np.uint8)
+    snow_mask = np.ascontiguousarray(rng.random(values.shape) > 0.7)
+    rain_lut = rng.integers(0, 256, (256, 4), dtype=np.uint8)
+    snow_lut = rng.integers(0, 256, (256, 4), dtype=np.uint8)
+    kwargs = {
+        "snow_lut": snow_lut,
+        "snow_mask": snow_mask,
+        "display_threshold": 108,
+    }
+
+    python = colorize_radar(
+        values, rain_lut, implementation="python", **kwargs
+    )
+    rust = colorize_radar(values, rain_lut, implementation="rust", **kwargs)
+    np.testing.assert_array_equal(rust, python)
+
+    encoded = encode_radar_png(rust, implementation="rust")
+    decoded = np.asarray(Image.open(io.BytesIO(encoded)).convert("RGBA"))
+    np.testing.assert_array_equal(decoded, rust)
 
 
 def test_native_rejects_wrong_dtype_noncontiguous_shape_and_bounds(require_native):

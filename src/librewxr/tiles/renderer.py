@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
-from librewxr.colors.schemes import colorize
+from librewxr.colors.schemes import get_lut
 from librewxr.config import settings
 from librewxr.data.coverage import sample_coverage, sample_feather
 from librewxr.data.regions import RegionDef
@@ -25,6 +25,11 @@ from librewxr.tiles.coordinates import (
     tile_pixel_latlons_padded,
 )
 from librewxr.tiles.png_palette import encode_png
+from librewxr.native_weather import (
+    colorize_radar,
+    encode_radar_png,
+    sample_radar_bilinear,
+)
 
 if TYPE_CHECKING:
     from librewxr.data.precip_mask import PrecipMaskStore
@@ -371,18 +376,22 @@ def present_tile(
     if geom.is_transparent:
         return _transparent_tile(geom.tile_size, fmt)
 
-    display_values = geom.values
+    display_threshold = None
     if display_min_dbz is not None:
-        pixel_threshold = max(1, int(math.ceil((display_min_dbz + 32.0) * 2.0)))
-        display_values = geom.values.copy()
-        display_values[display_values < pixel_threshold] = 0
+        display_threshold = max(
+            1, int(math.ceil((display_min_dbz + 32.0) * 2.0))
+        )
 
-    if geom.snow_mask is not None:
-        rgba_rain = colorize(display_values, color_scheme, snow=False)
-        rgba_snow = colorize(display_values, color_scheme, snow=True)
-        rgba = np.where(geom.snow_mask[..., np.newaxis], rgba_snow, rgba_rain)
-    else:
-        rgba = colorize(display_values, color_scheme, snow=False)
+    rgba = colorize_radar(
+        geom.values,
+        get_lut(color_scheme, snow=False),
+        snow_lut=(
+            get_lut(color_scheme, snow=True)
+            if geom.snow_mask is not None else None
+        ),
+        snow_mask=geom.snow_mask,
+        display_threshold=display_threshold,
+    )
 
     img = Image.fromarray(rgba, "RGBA")
 
@@ -836,36 +845,7 @@ def _bilinear_sample(
     else:
         row_f, col_f = region_pixel_indices_fractional(region, z, x, y, tile_size)
 
-    r0 = np.floor(row_f).astype(np.int32)
-    c0 = np.floor(col_f).astype(np.int32)
-    r1 = np.minimum(r0 + 1, region.height - 1)
-    c1 = np.minimum(c0 + 1, region.width - 1)
-
-    # Fractional offsets must stay float32: the four corner values are
-    # float32, and without the cast the int32 subtract would promote the
-    # whole interpolation to float64.  The final clip + 0.5 -> uint8
-    # rounding is unchanged.
-    dr = (row_f - r0).astype(np.float32)
-    dc = (col_f - c0).astype(np.float32)
-
-    v00 = frame_data[r0, c0].astype(np.float32)
-    v01 = frame_data[r0, c1].astype(np.float32)
-    v10 = frame_data[r1, c0].astype(np.float32)
-    v11 = frame_data[r1, c1].astype(np.float32)
-
-    any_zero = (v00 == 0) | (v01 == 0) | (v10 == 0) | (v11 == 0)
-
-    interp = (
-        v00 * (1 - dr) * (1 - dc)
-        + v01 * (1 - dr) * dc
-        + v10 * dr * (1 - dc)
-        + v11 * dr * dc
-    )
-
-    nearest = v00
-    result = np.where(any_zero, nearest, interp)
-
-    return np.clip(result + 0.5, 0, 255).astype(np.uint8)
+    return sample_radar_bilinear(frame_data, row_f, col_f)
 
 
 def _sample_flow_at(
@@ -1373,7 +1353,10 @@ def _transparent_tile(tile_size: int, fmt: str) -> bytes:
     cached = _TRANSPARENT_TILE_BYTES.get(key)
     if cached is None:
         img = Image.new("RGBA", (tile_size, tile_size), (0, 0, 0, 0))
-        cached = _encode_image(img, fmt)
+        # This process-wide constant favours the compact Pillow level-6
+        # result. Native fast PNG compression is reserved for real tiles,
+        # where encode latency matters and the result cannot be memoized.
+        cached = encode_png(img) if fmt == "png" else _encode_image(img, fmt)
         _TRANSPARENT_TILE_BYTES[key] = cached
     return cached
 
@@ -1390,6 +1373,13 @@ def _encode_image(img: Image.Image, fmt: str) -> bytes:
         else:
             img.save(buf, format="WEBP", quality=q)
         return buf.getvalue()
-    # PNG: adaptive lossless — exact 8-bit palette when the tile has few
-    # enough unique colors, otherwise plain 32-bit RGBA (see png_palette).
+    # Preserve the compact exact PNG8 path for unsmoothed / low-colour radar
+    # tiles. Rust's fast RGBA encoder targets blurred and overlay tiles with
+    # more than 256 colours, where Pillow's level-6 DEFLATE dominated present
+    # latency in production profiling.
+    if img.getcolors(maxcolors=256) is not None:
+        return encode_png(img)
+    native_png = encode_radar_png(np.asarray(img))
+    if native_png is not None:
+        return native_png
     return encode_png(img)

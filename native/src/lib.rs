@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Joshua Kimsey
-//! Optional single-threaded weather sampling kernels for LibreWXR.
+//! Optional single-threaded weather and radar rendering kernels for LibreWXR.
 
-use numpy::{ndarray::Array2, IntoPyArray, PyArray2, PyReadonlyArray2, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyIndexError, PyValueError};
+use numpy::{
+    ndarray::{Array2, Array3},
+    IntoPyArray, PyArray2, PyArray3, PyReadonlyArray2, PyReadonlyArray3, PyUntypedArrayMethods,
+};
+use pyo3::exceptions::{PyIndexError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 struct Plan<'a> {
     r0: &'a [i32],
@@ -347,6 +351,188 @@ fn sample_wind_speed<'py>(
     Ok(array.into_pyarray(py))
 }
 
+#[pyfunction]
+fn sample_radar_bilinear_u8<'py>(
+    py: Python<'py>,
+    frame: PyReadonlyArray2<'py, u8>,
+    row: PyReadonlyArray2<'py, f32>,
+    col: PyReadonlyArray2<'py, f32>,
+) -> PyResult<Bound<'py, PyArray2<u8>>> {
+    if row.shape() != col.shape() {
+        return Err(PyValueError::new_err(format!(
+            "col shape {:?} does not match row {:?}",
+            col.shape(),
+            row.shape(),
+        )));
+    }
+    let (frame, height, width) = frame_slice(&frame, "frame")?;
+    let rows = row.shape()[0];
+    let cols = row.shape()[1];
+    let row = row
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("row must be C-contiguous"))?;
+    let col = col
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("col must be C-contiguous"))?;
+    let result = py
+        .allow_threads(|| {
+            let mut output = Vec::with_capacity(row.len());
+            for (&row_f, &col_f) in row.iter().zip(col) {
+                if !row_f.is_finite()
+                    || !col_f.is_finite()
+                    || row_f < 0.0
+                    || col_f < 0.0
+                    || row_f > (height - 1) as f32
+                    || col_f > (width - 1) as f32
+                {
+                    return Err(format!(
+                        "radar sample coordinate ({row_f}, {col_f}) is outside frame shape ({height}, {width})"
+                    ));
+                }
+                let r0 = row_f.floor() as usize;
+                let c0 = col_f.floor() as usize;
+                let r1 = (r0 + 1).min(height - 1);
+                let c1 = (c0 + 1).min(width - 1);
+                let v00 = frame[r0 * width + c0];
+                let v01 = frame[r0 * width + c1];
+                let v10 = frame[r1 * width + c0];
+                let v11 = frame[r1 * width + c1];
+                if v00 == 0 || v01 == 0 || v10 == 0 || v11 == 0 {
+                    output.push(v00);
+                    continue;
+                }
+                let dr = row_f - r0 as f32;
+                let dc = col_f - c0 as f32;
+                let interpolated = v00 as f32 * (1.0 - dr) * (1.0 - dc)
+                    + v01 as f32 * (1.0 - dr) * dc
+                    + v10 as f32 * dr * (1.0 - dc)
+                    + v11 as f32 * dr * dc;
+                output.push((interpolated + 0.5).clamp(0.0, 255.0) as u8);
+            }
+            Ok(output)
+        })
+        .map_err(PyIndexError::new_err)?;
+    let array = Array2::from_shape_vec((rows, cols), result)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(array.into_pyarray(py))
+}
+
+#[pyfunction]
+#[pyo3(signature = (values, rain_lut, snow_lut=None, snow_mask=None, display_threshold=None))]
+fn colorize_radar_u8<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, u8>,
+    rain_lut: PyReadonlyArray2<'py, u8>,
+    snow_lut: Option<PyReadonlyArray2<'py, u8>>,
+    snow_mask: Option<PyReadonlyArray2<'py, bool>>,
+    display_threshold: Option<u8>,
+) -> PyResult<Bound<'py, PyArray3<u8>>> {
+    if rain_lut.shape() != [256, 4] {
+        return Err(PyValueError::new_err("rain_lut must have shape (256, 4)"));
+    }
+    if snow_lut.as_ref().is_some_and(|lut| lut.shape() != [256, 4]) {
+        return Err(PyValueError::new_err("snow_lut must have shape (256, 4)"));
+    }
+    if snow_mask
+        .as_ref()
+        .is_some_and(|mask| mask.shape() != values.shape())
+    {
+        return Err(PyValueError::new_err(format!(
+            "snow_mask shape {:?} does not match values {:?}",
+            snow_mask
+                .as_ref()
+                .expect("shape mismatch requires mask")
+                .shape(),
+            values.shape(),
+        )));
+    }
+    if snow_mask.is_some() != snow_lut.is_some() {
+        return Err(PyValueError::new_err(
+            "snow_lut and snow_mask must either both be provided or both omitted",
+        ));
+    }
+    let rows = values.shape()[0];
+    let cols = values.shape()[1];
+    let values = values
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("values must be C-contiguous"))?;
+    let rain_lut = rain_lut
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("rain_lut must be C-contiguous"))?;
+    let snow_lut = snow_lut
+        .as_ref()
+        .map(|lut| {
+            lut.as_slice()
+                .map_err(|_| PyValueError::new_err("snow_lut must be C-contiguous"))
+        })
+        .transpose()?;
+    let snow_mask = snow_mask
+        .as_ref()
+        .map(|mask| {
+            mask.as_slice()
+                .map_err(|_| PyValueError::new_err("snow_mask must be C-contiguous"))
+        })
+        .transpose()?;
+    let output = py.allow_threads(|| {
+        let mut rgba = Vec::with_capacity(values.len() * 4);
+        for (index, &raw_value) in values.iter().enumerate() {
+            let value = if display_threshold.is_some_and(|threshold| raw_value < threshold) {
+                0
+            } else {
+                raw_value
+            };
+            let lut = if snow_mask.is_some_and(|mask| mask[index]) {
+                snow_lut.expect("snow LUT validated with mask")
+            } else {
+                rain_lut
+            };
+            rgba.extend_from_slice(&lut[value as usize * 4..value as usize * 4 + 4]);
+        }
+        rgba
+    });
+    let array = Array3::from_shape_vec((rows, cols, 4), output)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(array.into_pyarray(py))
+}
+
+fn encode_png_bytes(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, png::EncodingError> {
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        encoder.set_filter(png::FilterType::Paeth);
+        encoder.set_color(png::ColorType::Rgba);
+        let mut writer = encoder.write_header()?;
+        writer.write_image_data(rgba)?;
+    }
+    Ok(encoded)
+}
+
+#[pyfunction]
+fn encode_png_rgba<'py>(
+    py: Python<'py>,
+    rgba: PyReadonlyArray3<'py, u8>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let shape = rgba.shape();
+    if shape.len() != 3 || shape[2] != 4 || shape[0] == 0 || shape[1] == 0 {
+        return Err(PyValueError::new_err(
+            "rgba must have non-empty shape (height, width, 4)",
+        ));
+    }
+    let height = u32::try_from(shape[0])
+        .map_err(|_| PyValueError::new_err("rgba height exceeds PNG limits"))?;
+    let width = u32::try_from(shape[1])
+        .map_err(|_| PyValueError::new_err("rgba width exceeds PNG limits"))?;
+    let rgba = rgba
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("rgba must be C-contiguous"))?;
+    let encoded = py
+        .allow_threads(|| encode_png_bytes(rgba, width, height))
+        .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    Ok(PyBytes::new(py, &encoded))
+}
+
 #[pymodule]
 fn _librewxr_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -356,5 +542,8 @@ fn _librewxr_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sample_temporal_u16, module)?)?;
     module.add_function(wrap_pyfunction!(sample_derived_humidity, module)?)?;
     module.add_function(wrap_pyfunction!(sample_wind_speed, module)?)?;
+    module.add_function(wrap_pyfunction!(sample_radar_bilinear_u8, module)?)?;
+    module.add_function(wrap_pyfunction!(colorize_radar_u8, module)?)?;
+    module.add_function(wrap_pyfunction!(encode_png_rgba, module)?)?;
     Ok(())
 }
