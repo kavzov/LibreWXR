@@ -182,7 +182,7 @@ Example body:
   "description": "Precipitation nowcasts, active weather alerts, and storm-cell data for any point on Earth.",
   "version": "0.1.0",
   "websiteUrl": "http://localhost:8080",
-  "repository": { "source": "github", "url": "https://github.com/JoshuaKimsey/LibreWRX" },
+  "repository": { "source": "github", "url": "https://github.com/kavzov/LibreWXR" },
   "remotes": [
     {
       "type": "streamable-http",

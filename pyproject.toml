@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Self-hostable Rain Viewer API replacement using NEXRAD radar data"
 requires-python = ">=3.11"
 authors = [{ name = "Joshua Kimsey", email = "jkimsey@proton.me" }]
+maintainers = [{ name = "Igor Kavzov" }]
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
@@ -74,6 +75,11 @@ mcp = [
 
 [project.scripts]
 librewxr-mcp = "librewxr.mcp.server:main"
+
+[project.urls]
+Repository = "https://github.com/kavzov/LibreWXR"
+Upstream = "https://github.com/JoshuaKimsey/LibreWXR"
+License = "https://github.com/kavzov/LibreWXR/blob/main/LICENSE"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

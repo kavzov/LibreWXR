@@ -4,6 +4,16 @@
 
 # LibreWXR
 
+> [!IMPORTANT]
+> This repository is a modified fork of
+> [JoshuaKimsey/LibreWXR](https://github.com/JoshuaKimsey/LibreWXR).
+> Fork-specific development began on 2026-08-06 and includes global weather
+> fields, motion-aware radar animation, multi-worker deployment hardening,
+> shared caches, and native Rust rendering kernels. The corresponding source
+> for the version maintained and deployed by this fork is
+> [kavzov/LibreWXR](https://github.com/kavzov/LibreWXR). See
+> [NOTICE.md](NOTICE.md) for authorship and licensing details.
+
 A self-hostable, drop-in replacement for the [Rain Viewer](https://www.rainviewer.com/) API. LibreWXR serves weather radar tiles using freely available radar composite data from multiple sources, with full compatibility for any client built against the Rain Viewer v2 API.
 
 ## Contents
@@ -188,7 +198,7 @@ one runs by setting `COMPOSE_PROFILES` in your `.env`:
 | `multi`  | Any deployment with 8+ cores and meaningful traffic. The data pipeline and N tile renderers run as separate containers sharing state via memmap files — bypasses the Python GIL so the whole rack can render in parallel. | `COMPOSE_PROFILES=multi` |
 
 ```bash
-git clone https://github.com/JoshuaKimsey/LibreWXR.git
+git clone https://github.com/kavzov/LibreWXR.git
 cd LibreWXR
 cp .env.example .env
 # Edit .env — pick COMPOSE_PROFILES=single or multi (default: single)
@@ -208,7 +218,7 @@ pipeline cap, 18 GB render cap). Tune `LIBREWXR_WORKERS` and the
 Requires Python 3.11+.
 
 ```bash
-git clone https://github.com/JoshuaKimsey/LibreWXR.git
+git clone https://github.com/kavzov/LibreWXR.git
 cd LibreWXR
 python3 -m venv .venv
 source .venv/bin/activate
@@ -611,6 +621,7 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 |---|---|---|
 | **Server** | | |
 | `LIBREWXR_PUBLIC_URL` | `http://localhost:8080` | Public URL for metadata responses |
+| `LIBREWXR_SOURCE_URL` | `https://github.com/kavzov/LibreWXR` | Corresponding source for the deployed modified version |
 | `LIBREWXR_PORT` | `8080` | Server listen port |
 | `LIBREWXR_MAX_ZOOM` | `12` | Maximum tile zoom level |
 | **Radar** | | |
@@ -986,10 +997,29 @@ Built something with LibreWXR? Head over to our [Discussions post](https://githu
 
 ## License
 
-LibreWXR is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-or-later). It is free to use, self-host, modify, and redistribute under those terms, and it always will be. Note that the AGPL's network-use clause (section 13) means that if you run a *modified* version of LibreWXR as a network service, you must make your modified source available to that service's users.
+LibreWXR and the modifications in this fork are distributed under the
+[GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0-or-later). The
+original project is Copyright (C) 2026 Joshua Kimsey. Fork-specific changes
+beginning on 2026-08-06 are Copyright (C) 2026 Igor Kavzov and the other
+contributors identified in the Git history. Existing copyright and license
+notices must be preserved.
+
+The AGPL's network-use clause (section 13) requires an operator running a
+modified version as a network service to offer the corresponding source to
+users of that service. For this fork, the maintained corresponding source is
+available at [github.com/kavzov/LibreWXR](https://github.com/kavzov/LibreWXR).
+Deployments can advertise another exact source location with
+`LIBREWXR_SOURCE_URL`. See [NOTICE.md](NOTICE.md) for the fork notice and a
+summary of material modifications.
 
 ### Commercial licensing
 
-The AGPL is the right fit for the open project and the self-hosting community. But its copyleft and network-use obligations are incompatible with some commercial uses — for example, building LibreWXR into a closed-source product, or running a hosted service on top of it whose modifications you can't release.
+The upstream maintainer offers separate commercial licensing for rights they
+control in the original project. See the
+[upstream repository](https://github.com/JoshuaKimsey/LibreWXR) or contact
+<jkimsey@proton.me> for those terms.
 
-If that describes your use case, a separate commercial license is available that lifts the AGPL obligations. This changes nothing about the open project: LibreWXR stays AGPL-licensed and free for everyone else. Reach out to <jkimsey@proton.me> to discuss terms.
+That upstream commercial license does not automatically cover fork-specific
+modifications owned by other contributors. Anyone who needs to use the complete
+fork under terms other than AGPL-3.0-or-later must obtain permission from all
+relevant rightsholders.

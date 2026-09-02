@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 Joshua Kimsey
+// Modifications Copyright (C) 2026 Igor Kavzov
 //! Optional single-threaded weather and radar rendering kernels for LibreWXR.
 
 use numpy::{

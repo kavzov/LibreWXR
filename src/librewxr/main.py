@@ -1248,7 +1248,35 @@ if settings.mcp_enabled:
             "Install with `pip install -e '.[mcp]'` to enable."
         )
 
-app = FastAPI(title="LibreWXR", version="0.1.0", lifespan=combined_lifespan)
+app = FastAPI(
+    title="LibreWXR",
+    version="0.1.0",
+    description=(
+        "Self-hostable weather radar and map API. Corresponding source for "
+        f"this modified version: {settings.source_url}"
+    ),
+    license_info={
+        "name": "AGPL-3.0-or-later",
+        "url": "https://www.gnu.org/licenses/agpl-3.0.html",
+    },
+    openapi_external_docs={
+        "description": "Corresponding source code for this modified version",
+        "url": settings.source_url,
+    },
+    lifespan=combined_lifespan,
+)
+
+
+@app.get("/", include_in_schema=False)
+async def project_metadata():
+    """Offer the corresponding source at the API's conventional root."""
+    return {
+        "name": "LibreWXR",
+        "version": "0.1.0",
+        "license": "AGPL-3.0-or-later",
+        "source": settings.source_url,
+        "upstream": "https://github.com/JoshuaKimsey/LibreWXR",
+    }
 
 app.add_middleware(
     CORSMiddleware,

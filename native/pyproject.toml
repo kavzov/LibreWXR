@@ -8,6 +8,12 @@ version = "0.1.0"
 requires-python = ">=3.11"
 description = "Optional native weather sampling kernels for LibreWXR"
 license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "Igor Kavzov" }]
+
+[project.urls]
+Repository = "https://github.com/kavzov/LibreWXR"
+Upstream = "https://github.com/JoshuaKimsey/LibreWXR"
+License = "https://github.com/kavzov/LibreWXR/blob/main/LICENSE"
 
 [tool.maturin]
 bindings = "pyo3"

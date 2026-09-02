@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     host: str | None = None
     port: int = 8080
     public_url: str = "http://localhost:8080"
+    # Corresponding source offered to network users of this modified fork.
+    # Operators deploying another revision/fork should point this at the exact
+    # public repository or source archive from which their service is built.
+    source_url: str = "https://github.com/kavzov/LibreWXR"
 
     # MCP (Model Context Protocol) server.  When enabled (default) the
     # MCP HTTP transport is mounted inside the FastAPI app at

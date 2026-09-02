@@ -24,6 +24,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from librewxr.api import routes
+from librewxr.config import settings
 from librewxr.mcp.server import build_mcp_http_app
 
 SERVER_CARD_SCHEMA = (
@@ -134,6 +135,7 @@ async def test_server_card_served_through_mount(client):
     assert data["version"], "version must be non-empty"
     assert data["description"], "description must be present"
     assert len(data["description"]) <= 100
+    assert data["repository"]["url"] == settings.source_url
     assert data["remotes"][0]["type"] == "streamable-http"
     assert data["remotes"][0]["url"].endswith("/mcp/")
     assert "max-age=3600" in resp.headers["cache-control"]

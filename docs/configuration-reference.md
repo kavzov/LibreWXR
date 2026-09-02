@@ -90,6 +90,23 @@ Set this to whatever URL users will use to reach your instance (e.g., your domai
 LIBREWXR_PUBLIC_URL=https://radar.example.com
 ```
 
+### `LIBREWXR_SOURCE_URL`
+
+The public repository or source archive containing the corresponding source for
+the version served by this deployment. LibreWXR exposes this URL at `/`, in its
+OpenAPI metadata, and in the MCP server card. Operators deploying additional
+modifications should change it to the exact source they run.
+
+| | |
+|---|---|
+| **Default** | `https://github.com/kavzov/LibreWXR` |
+| **Type** | string URL |
+
+**Example:**
+```bash
+LIBREWXR_SOURCE_URL=https://github.com/example/LibreWXR
+```
+
 ### `LIBREWXR_CORS_ORIGINS`
 
 Allowed CORS origins for cross-origin requests from web browsers.

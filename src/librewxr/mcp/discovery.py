@@ -45,8 +45,6 @@ _DESCRIPTION = (
     "Precipitation nowcasts, active weather alerts, and storm-cell "
     "data for any point on Earth."
 )
-_REPOSITORY_URL = "https://github.com/JoshuaKimsey/LibreWRX"
-
 _SERVER_CARD_MEDIA_TYPE = "application/mcp-server-card+json"
 _AI_CATALOG_MEDIA_TYPE = "application/ai-catalog+json"
 _CACHE_CONTROL = "public, max-age=3600"
@@ -119,7 +117,7 @@ def build_server_card() -> dict:
         "description": _DESCRIPTION,
         "version": package_version(),
         "websiteUrl": public_base,
-        "repository": {"source": "github", "url": _REPOSITORY_URL},
+        "repository": {"source": "github", "url": settings.source_url},
         "remotes": [remote],
     }
 
