@@ -14,6 +14,7 @@ from librewxr.config import settings
 from librewxr.data.coverage import sample_coverage, sample_feather
 from librewxr.data.regions import RegionDef
 from librewxr.tiles.coordinates import (
+    compute_blur_radius,
     overlapping_regions,
     region_pixel_indices,
     region_pixel_indices_fractional,
@@ -95,6 +96,50 @@ class TileGeometry:
 # ---------------------------------------------------------------------------
 
 
+def transparent_fast_path_label(
+    frame_regions: dict[str, np.ndarray],
+    z: int,
+    x: int,
+    y: int,
+    enabled_regions: list[str] | None,
+    nwp_chain,
+    precip_mask,  # PrecipMaskStore | None - multi-mode only
+    frame_timestamp: int | None,
+    nowcast_blend: float | None,
+) -> str | None:
+    """Cheap event-loop-safe pre-check; single source of truth for the
+    transparent fast-path decision shared by ``compute_tile_geometry`` and
+    the radar-tile route.
+    """
+    regions = overlapping_regions(z, x, y, enabled_regions)
+    regions_with_data = [r for r in regions if r.name in frame_regions]
+
+    has_nwp = nwp_chain is not None and nwp_chain.has_data()
+
+    if not regions_with_data:
+        # The NWP-only path may still produce content - NOT a fast path.
+        if has_nwp:
+            return None
+        return "no_regions_no_nwp"
+
+    # Tier 2: pre-sample global precip-mask gate (multi-mode only).  The
+    # mask ORs radar regions + all NWP source samples + nowcast regions
+    # into one coarse boolean grid per timestamp, so the gate fires for
+    # the past-radar path AND the nowcast path together - Tier 3 (the
+    # nowcast bbox) is folded in.  Single mode has no mask
+    # (``precip_mask is None``) and falls through to the existing Tier 1 /
+    # Case A paths unchanged.  Hoisted ahead of the ``_sample_region``
+    # calls so clear-sky tiles bail in O(1): the mask includes the radar
+    # contribution, so no precip in the bbox guarantees the radar sample
+    # is empty and the pre-hoist ``radar_empty`` term was always true.
+    if has_nwp and precip_mask is not None:
+        if not precip_mask.has_precip_in_bbox(frame_timestamp, tile_bounds(z, x, y)):
+            label = "tier2_mask_nowcast" if nowcast_blend is not None else "tier2_mask_past"
+            return label
+
+    return None
+
+
 def compute_tile_geometry(
     frame_regions: dict[str, np.ndarray],
     z: int,
@@ -122,35 +167,25 @@ def compute_tile_geometry(
 
     has_nwp = nwp_chain is not None and nwp_chain.has_data()
 
-    if not regions_with_data:
-        if has_nwp:
-            return _compute_nwp_only_geometry(
-                nwp_chain, z, x, y, tile_size, smooth, snow, frame_timestamp,
-                precip_mask,
-            )
-        return TileGeometry.transparent(tile_size, fast_path="no_regions_no_nwp")
+    label = transparent_fast_path_label(
+        frame_regions, z, x, y, enabled_regions, nwp_chain, precip_mask,
+        frame_timestamp, nowcast_blend,
+    )
+    if label is not None:
+        return TileGeometry.transparent(tile_size, fast_path=label)
 
-    # Tier 2: pre-sample global precip-mask gate (multi-mode only).  The
-    # mask ORs radar regions + all NWP source samples + nowcast regions
-    # into one coarse boolean grid per timestamp, so the gate fires for
-    # the past-radar path AND the nowcast path together — Tier 3 (the
-    # nowcast bbox) is folded in.  Single mode has no mask
-    # (``precip_mask is None``) and falls through to the existing Tier 1 /
-    # Case A paths unchanged.  Hoisted ahead of the ``_sample_region``
-    # calls so clear-sky tiles bail in O(1): the mask includes the radar
-    # contribution, so no precip in the bbox guarantees the radar sample
-    # is empty and the pre-hoist ``radar_empty`` term was always true.
-    if has_nwp and precip_mask is not None:
-        if not precip_mask.has_precip_in_bbox(frame_timestamp, tile_bounds(z, x, y)):
-            label = "tier2_mask_nowcast" if nowcast_blend is not None else "tier2_mask_past"
-            return TileGeometry.transparent(tile_size, fast_path=label)
+    if not regions_with_data:
+        return _compute_nwp_only_geometry(
+            nwp_chain, z, x, y, tile_size, smooth, snow, frame_timestamp,
+            precip_mask,
+        )
 
     # Determine blur radius from local geometry: scale Gaussian kernel
     # to the number of tile pixels covered by a single region pixel.
     # Uses the highest-priority (finest) region's Jacobian so that mixed
     # coarse + fine tiles size their blur to the resolution that's
     # actually visible at the center.
-    blur_radius = _compute_blur_radius(
+    blur_radius = compute_blur_radius(
         regions_with_data[0], z, x, y, tile_size,
     ) if smooth else 0.0
 
@@ -188,23 +223,32 @@ def compute_tile_geometry(
 
     # Fill uncovered pixels from NWP precipitation data.  For nowcast
     # frames, blend extrapolated radar with NWP using temporal weight +
-    # spatial feathering at coverage boundaries.
+    # spatial feathering at coverage boundaries.  Only regions that
+    # actually delivered a frame this cycle take part: a region that is
+    # down or empty would otherwise still contribute its coverage mask
+    # (blocking NWP fill, leaving a hole) and its feather (suppressing
+    # the model over its footprint) (issue #24).
     if has_nwp:
         if nowcast_blend is not None:
             values = _blend_nowcast(
-                values, regions, z, x, y, tile_size, pad, nwp_chain,
+                values, regions_with_data, z, x, y, tile_size, pad, nwp_chain,
                 frame_timestamp, smooth, nowcast_blend,
             )
         else:
             values = _fill_ecmwf_fallback(
-                values, regions, z, x, y, tile_size, pad, nwp_chain,
+                values, regions_with_data, z, x, y, tile_size, pad, nwp_chain,
                 frame_timestamp, smooth,
             )
 
     if settings.noise_floor_dbz > -32:
         pixel_threshold = int((settings.noise_floor_dbz + 32) * 2)
-        values = values.copy()
-        values[values < pixel_threshold] = 0
+        if has_nwp:
+            # The fill/blend path returned a freshly allocated array,
+            # so no defensive copy is needed.
+            values[values < pixel_threshold] = 0
+        else:
+            values = values.copy()
+            values[values < pixel_threshold] = 0
 
     # Tier 1: post-NWP-fill empty check.  If after fill/blend + noise
     # floor the tile is all-zero (NWP also sampled empty, or nowcast
@@ -261,7 +305,8 @@ def _compute_nwp_only_geometry(
 
     if settings.noise_floor_dbz > -32:
         pixel_threshold = int((settings.noise_floor_dbz + 32) * 2)
-        values = values.copy()
+        # sample() returns a freshly allocated array, so no defensive
+        # copy is needed.
         values[values < pixel_threshold] = 0
 
     # Tier 1: post-sample empty check — all-zero after the noise floor
@@ -456,36 +501,6 @@ def render_tile(
 # ---------------------------------------------------------------------------
 
 
-def _compute_blur_radius(
-    region: RegionDef, z: int, x: int, y: int, tile_size: int
-) -> float:
-    """Pick a Gaussian blur radius matched to the visible region pixel size.
-
-    Reads the local Jacobian of ``region_pixel_indices_fractional`` at the
-    tile centre to find how many tile pixels a single region pixel covers
-    (``tile_per_region``).  Blur radius scales as a quarter of that span,
-    which is the σ that rounds a single region-pixel "block" at its
-    edges without merging it with its neighbours (the visible Gaussian
-    width is ~3σ, so a quarter-block σ touches half a block on each side).
-    At low zoom the ratio is < 1 and the radius collapses to
-    ``smooth_radius`` (baseline); at high zoom on a very coarse source
-    growth is capped at ``tile_size / 32`` to keep the kernel from
-    smearing unrelated cells together.
-    """
-    base = settings.smooth_radius
-    if base <= 0:
-        return 0.0
-    row_f, col_f = region_pixel_indices_fractional(region, z, x, y, tile_size)
-    cy = cx = tile_size // 2
-    drow = abs(float(row_f[cy + 1, cx] - row_f[cy - 1, cx])) / 2.0
-    dcol = abs(float(col_f[cy, cx + 1] - col_f[cy, cx - 1])) / 2.0
-    if drow < 1e-6 or dcol < 1e-6:
-        return base
-    tile_per_region = max(1.0 / drow, 1.0 / dcol)
-    raw = base * max(1.0, tile_per_region * 0.25)
-    return min(raw, tile_size / 32.0)
-
-
 def _gather_clipped(
     frame_data: np.ndarray, row_idx: np.ndarray, col_idx: np.ndarray
 ) -> np.ndarray:
@@ -614,6 +629,38 @@ def _composite_regions(
     return values
 
 
+def compute_coverage_rgba(
+    frame_regions: dict[str, np.ndarray],
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = 256,
+    enabled_regions: list[str] | None = None,
+) -> np.ndarray:
+    """Compute the RGBA uint8 array for a coverage tile (white
+    semi-transparent where radar data exists; all-zeros when nothing is
+    covered).  The array-producing half of ``render_coverage_tile``;
+    encoding is the caller's job.
+    """
+    regions = overlapping_regions(z, x, y, enabled_regions)
+    regions_with_data = [r for r in regions if r.name in frame_regions]
+
+    # Composite coverage from all regions
+    values = np.zeros((tile_size, tile_size), dtype=np.uint8)
+    for region in regions_with_data:
+        data = frame_regions[region.name]
+        row_idx, col_idx = region_pixel_indices(region, z, x, y, tile_size)
+        region_values = _gather_clipped(data, row_idx, col_idx)
+        fill_mask = (values == 0) & (region_values > 0)
+        values[fill_mask] = region_values[fill_mask]
+
+    # Coverage: non-zero = white semi-transparent
+    rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
+    mask = values > 0
+    rgba[mask] = [255, 255, 255, 128]
+    return rgba
+
+
 def render_coverage_tile(
     frame_regions: dict[str, np.ndarray],
     z: int,
@@ -629,27 +676,14 @@ def render_coverage_tile(
     if not regions_with_data:
         return _transparent_tile(tile_size, "png")
 
-    # Composite coverage from all regions
-    values = np.zeros((tile_size, tile_size), dtype=np.uint8)
-    for region in regions_with_data:
-        data = frame_regions[region.name]
-        row_idx, col_idx = region_pixel_indices(region, z, x, y, tile_size)
-        region_values = _gather_clipped(data, row_idx, col_idx)
-        fill_mask = (values == 0) & (region_values > 0)
-        values[fill_mask] = region_values[fill_mask]
-
-    # Coverage: non-zero = white semi-transparent
-    rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
-    mask = values > 0
-    rgba[mask] = [255, 255, 255, 128]
-
+    rgba = compute_coverage_rgba(frame_regions, z, x, y, tile_size, enabled_regions)
     img = Image.fromarray(rgba, "RGBA")
     return _encode_image(img, "png")
 
 
 def _fill_ecmwf_fallback(
     values: np.ndarray,
-    regions: list[RegionDef],
+    regions_with_data: list[RegionDef],
     z: int, x: int, y: int,
     tile_size: int, pad: int,
     nwp_chain,
@@ -672,11 +706,12 @@ def _fill_ecmwf_fallback(
     else:
         lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
 
-    # Union coverage from every region that overlaps this tile — even
-    # regions we don't have a frame for yet, because if a station reaches
-    # this tile we still don't want NWP overlapping with radar.
+    # Union coverage from every region that delivered a frame this
+    # cycle.  Regions without a frame are excluded by the caller so a
+    # down or empty region's coverage mask can't block the NWP fill
+    # and leave a hole (issue #24).
     covered = np.zeros(lat_grid.shape, dtype=bool)
-    for region in regions:
+    for region in regions_with_data:
         covered |= sample_coverage(region.name, lat_grid, lon_grid)
 
     uncovered = (values == 0) & ~covered
@@ -694,7 +729,7 @@ def _fill_ecmwf_fallback(
 
 def _blend_nowcast(
     radar_values: np.ndarray,
-    regions: list[RegionDef],
+    regions_with_data: list[RegionDef],
     z: int, x: int, y: int,
     tile_size: int, pad: int,
     nwp_chain,
@@ -713,6 +748,12 @@ def _blend_nowcast(
 
     The effective per-pixel radar weight is ``blend_weight × feather``.
     Outside radar coverage, NWP is used directly (same as past frames).
+
+    Where the (blurred) model is below the display noise floor and the
+    radar itself carries a live echo, the dry model term is raised to
+    the floor: echoes asymptote toward the faintest visible shade as
+    the radar weight decays instead of being diluted away, and the
+    scaled intensity gradient survives (issue #24).
     """
     if pad > 0:
         lat_grid, lon_grid = tile_pixel_latlons_padded(z, x, y, tile_size, pad)
@@ -738,11 +779,37 @@ def _blend_nowcast(
 
     # Build the spatial feather weight: union across all overlapping regions
     feather = np.zeros(lat_grid.shape, dtype=np.float32)
-    for region in regions:
+    for region in regions_with_data:
         feather = np.maximum(feather, sample_feather(region.name, lat_grid, lon_grid))
 
     # Per-pixel effective radar weight
     effective_w = blend_weight * feather
+
+    # Pixels where the model is dry must not drag real radar echoes
+    # below the display noise floor.  Model pixel value 0 encodes
+    # -32 dBZ — the bottom of the scale, NOT "no data" — so blending
+    # toward an empty model pixel pulls ``w * radar`` under the floor
+    # and the post-blend thresholding zeroes the echo entirely
+    # (issue #24).  Where the radar itself carries a live echo, raise
+    # the dry model term to the floor so the blend asymptotes toward
+    # the faintest visible shade instead of -32 dBZ: the result is
+    # ``floor + w * (radar - floor)``, which never erases the echo but
+    # still fades with the radar weight AND preserves the scaled
+    # intensity gradient (a hard clamp at the floor — the previous
+    # approach — flattened every echo to one flat color by T+40).
+    # The dry-model gate tests the BLURRED field actually being blended
+    # (the Gaussian blur leaves faint non-zero fringes around real
+    # model echoes, and a raw zero test would misfire on those); the
+    # live-radar gate (radar >= floor) keeps sub-floor radar noise and
+    # model Gaussian fringes from being promoted into painted echoes.
+    # Skipped when ``blend_weight == 0`` — "model" blend mode (or steps
+    # past the blend window) intends pure model output — and when the
+    # noise floor is disabled there is nothing to fade toward.
+    if blend_weight > 0 and settings.noise_floor_dbz > -32:
+        pixel_threshold = int((settings.noise_floor_dbz + 32) * 2)
+        dry_model = model_f < pixel_threshold
+        live_radar = radar_values >= pixel_threshold
+        model_f = np.where(dry_model & live_radar, pixel_threshold, model_f)
 
     # Blend: extrapolated radar × weight + model × (1 − weight)
     radar_f = radar_values.astype(np.float32)
@@ -937,50 +1004,110 @@ def _draw_motion_arrows(
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    for ty in range(spacing // 2, tile_size, spacing):
-        for tx in range(spacing // 2, tile_size, spacing):
+    # --- Precomputed arrow-grid arrays (R7) ------------------------------
+    # Hoist every per-point scalar numpy index read out of the double loop
+    # into 2D grids over the arrow grid points.  The inner loop reads these
+    # precomputed arrays; the values are identical to the old scalar reads.
+    gys = np.arange(spacing // 2, tile_size, spacing)
+    gxs = np.arange(spacing // 2, tile_size, spacing)
+    ty_grid, tx_grid = np.meshgrid(gys, gxs, indexing="ij")
+    tx1_arr = np.minimum(tx_grid + 1, tile_size - 1)
+    ty1_arr = np.minimum(ty_grid + 1, tile_size - 1)
+    tx0_arr = np.maximum(tx_grid - 1, 0)
+    ty0_arr = np.maximum(ty_grid - 1, 0)
+
+    # Per-region grids: region indices at every arrow grid point plus the
+    # finite-difference Jacobian terms (region pixels per tile pixel).
+    # The parallel list keeps the exact priority order of ``region_info``
+    # so the per-point short-circuit fallthrough is unchanged.
+    region_grid_info = []
+    for r, row_f, col_f, row_i, col_i in region_info:
+        frame = frame_regions[r.name]
+        flow = flow_regions[r.name]
+        ri_grid = row_i[ty_grid, tx_grid]
+        ci_grid = col_i[ty_grid, tx_grid]
+        rowf_grid = row_f[ty_grid, tx_grid]
+        colf_grid = col_f[ty_grid, tx_grid]
+        # Cast back to float32: the original float32-scalar / int division
+        # path yields float32, while the vectorised float32/int64 division
+        # would promote to float64.
+        dcol_grid = (
+            (col_f[ty_grid, tx1_arr] - col_f[ty_grid, tx0_arr])
+            / (tx1_arr - tx0_arr)
+        ).astype(np.float32)
+        drow_grid = (
+            (row_f[ty1_arr, tx_grid] - row_f[ty0_arr, tx_grid])
+            / (ty1_arr - ty0_arr)
+        ).astype(np.float32)
+        region_grid_info.append(
+            (r, frame, flow, rowf_grid, colf_grid, ri_grid, ci_grid,
+             dcol_grid, drow_grid)
+        )
+
+    # Composite-NWP grids: lat/lon at every arrow grid point, the Jacobian
+    # neighbour lat/lon differences, the radar-coverage mask and the
+    # geometry noise-floor gate, all sampled once per grid point.
+    if has_nwp:
+        lat_g = nwp_latlons[0][ty_grid, tx_grid]
+        lon_g = nwp_latlons[1][ty_grid, tx_grid]
+        dlat_dy_g = (
+            (nwp_latlons[0][ty1_arr, tx_grid]
+             - nwp_latlons[0][ty0_arr, tx_grid])
+            / (ty1_arr - ty0_arr)
+        ).astype(np.float32)
+        dlon_dx_g = (
+            (nwp_latlons[1][ty_grid, tx1_arr]
+             - nwp_latlons[1][ty_grid, tx0_arr])
+            / (tx1_arr - tx0_arr)
+        ).astype(np.float32)
+    else:
+        lat_g = lon_g = dlat_dy_g = dlon_dx_g = None
+    coverage_g = (
+        radar_coverage[ty_grid, tx_grid]
+        if radar_coverage is not None else None
+    )
+    geom_g = geom_values[ty_grid, tx_grid] if geom_values is not None else None
+
+    # tolist() yields plain Python ints so tx/ty arithmetic matches the
+    # original range() loop bit for bit.
+    for gy, ty in enumerate(gys.tolist()):
+        for gx, tx in enumerate(gxs.tolist()):
             # The final post-blend geometry is the visual source of truth.
-            # A nowcast's raw extrapolated radar can remain above the
-            # threshold after its model-blended presentation has faded out;
-            # never leave an orphan motion arrow over an invisible area.
-            if geom_values is not None and geom_values[ty, tx] < noise_threshold:
+            # Raw extrapolated radar can remain above the threshold after its
+            # model-blended presentation has faded out; avoid orphan arrows.
+            if geom_g is not None and geom_g[gy, gx] < noise_threshold:
                 continue
             arrow_dx = arrow_dy = 0.0
             found = False
 
             # Try radar regions in priority order (finest resolution first)
-            for r, row_f, col_f, row_i, col_i in region_info:
-                ri, ci = int(row_i[ty, tx]), int(col_i[ty, tx])
+            for r, frame, flow, rowf_grid, colf_grid, ri_grid, ci_grid, \
+                    dcol_grid, drow_grid in region_grid_info:
+                ri, ci = int(ri_grid[gy, gx]), int(ci_grid[gy, gx])
                 if ri < 0 or ci < 0:
                     continue  # Outside this region, try next
 
-                frame = frame_regions[r.name]
                 if frame[ri, ci] < noise_threshold:
                     # Only claim the pixel if it's within actual radar
                     # coverage (clear sky).  Pixels inside the region's
                     # bounding box but outside station coverage should
                     # fall through to the composite NWP arrows.
-                    if radar_coverage is None or radar_coverage[ty, tx]:
+                    if coverage_g is None or coverage_g[gy, gx]:
                         found = True
                         break
                     continue
 
-                flow = flow_regions[r.name]
-                # Flow is stored at reduced resolution (≤ 1000 px target
+                # Flow is stored at reduced resolution (<= 1000 px target
                 # dim); sample it at the tile pixel's full-res region
                 # coordinates via the resize center mapping.
                 fx, fy = _sample_flow_at(
-                    flow, row_f[ty, tx], col_f[ty, tx],
+                    flow, rowf_grid[gy, gx], colf_grid[gy, gx],
                     r.height, r.width,
                 )
 
                 # Local scale: region pixels per tile pixel (finite diff)
-                tx1 = min(tx + 1, tile_size - 1)
-                ty1 = min(ty + 1, tile_size - 1)
-                tx0 = max(tx - 1, 0)
-                ty0 = max(ty - 1, 0)
-                dcol = (col_f[ty, tx1] - col_f[ty, tx0]) / (tx1 - tx0)
-                drow = (row_f[ty1, tx] - row_f[ty0, tx]) / (ty1 - ty0)
+                dcol = dcol_grid[gy, gx]
+                drow = drow_grid[gy, gx]
 
                 if abs(dcol) < 1e-8 or abs(drow) < 1e-8:
                     found = True
@@ -1004,11 +1131,11 @@ def _draw_motion_arrows(
             # this pixel (either no radar data here, or the radar frame
             # says "dry" outside coverage).
             if not found and has_nwp:
-                if geom_values is None or geom_values[ty, tx] < noise_threshold:
-                    continue  # Below noise floor — not visible on tile
+                if geom_g is None or geom_g[gy, gx] < noise_threshold:
+                    continue  # Below noise floor - not visible on tile
 
-                lat = float(nwp_latlons[0][ty, tx])
-                lon = float(nwp_latlons[1][ty, tx])
+                lat = float(lat_g[gy, gx])
+                lon = float(lon_g[gy, gx])
 
                 # Convert lat/lon to composite raster indices
                 nr = (NWP_FLOW_NORTH - lat) / nwp_res
@@ -1021,13 +1148,8 @@ def _draw_motion_arrows(
 
                 # Local scale: composite raster pixels per tile pixel.
                 # Use lat/lon difference to compute the Jacobian.
-                tx1 = min(tx + 1, tile_size - 1)
-                ty1 = min(ty + 1, tile_size - 1)
-                tx0 = max(tx - 1, 0)
-                ty0 = max(ty - 1, 0)
-
-                dlat_dy = (nwp_latlons[0][ty1, tx] - nwp_latlons[0][ty0, tx]) / (ty1 - ty0)
-                dlon_dx = (nwp_latlons[1][ty, tx1] - nwp_latlons[1][ty, tx0]) / (tx1 - tx0)
+                dlat_dy = dlat_dy_g[gy, gx]
+                dlon_dx = dlon_dx_g[gy, gx]
 
                 # Convert degrees to composite raster pixels
                 drow_dy = -dlat_dy / nwp_res  # negative: lat decreases as row increases
@@ -1135,6 +1257,12 @@ def _draw_storm_cells(
         row_min, row_max = float(valid_rows.min()), float(valid_rows.max())
         col_min, col_max = float(valid_cols.min()), float(valid_cols.max())
 
+        # First pass over the cells: apply the +-2 bounds check exactly as
+        # the old per-cell path did, collecting the surviving cell indices
+        # (ascending) with their centroid coords.
+        keep = []
+        keep_cr = []
+        keep_cc = []
         for i in range(count):
             cell = cells[i]
             cr = float(cell["centroid_row"])
@@ -1144,13 +1272,46 @@ def _draw_storm_cells(
             # The +-2 padding accounts for sub-pixel rounding at the tile edges.
             if not (row_min - 2 <= cr <= row_max + 2 and col_min - 2 <= cc <= col_max + 2):
                 continue
+            keep.append(i)
+            keep_cr.append(cr)
+            keep_cc.append(cc)
 
-            # Nearest-neighbor: find the tile pixel whose region-pixel coords
-            # are closest to the cell's centroid.  This is projection-agnostic
-            # because row_f/col_f already encode the forward projection.
-            d2 = np.where(valid_mask, (row_f - cr) ** 2 + (col_f - cc) ** 2, np.inf)
-            flat_idx = int(d2.argmin())
-            ty, tx = divmod(flat_idx, tile_size)
+        if not keep:
+            continue
+
+        # Chunked vectorized nearest-centroid assignment.  The old per-cell
+        # search built a full-tile float64 distance array per cell (up to
+        # ~1 GB transient at 512px with ~500 cells).  Computing d2 as
+        # (chunk, n_valid) float32 matrices over 16 cells at a time gives
+        # the identical pixel: every pixel of a cell lives in that cell's
+        # row (chunking is over cells, never pixels), so argmin(axis=1)
+        # picks the same first-minimum-in-row-major-order result as the
+        # old full-tile argmin.  The float32 dtype matches the old per-cell
+        # arithmetic exactly: the old path subtracted a Python-float scalar
+        # from a float32 array, which stays float32 under NumPy's weak
+        # scalar promotion, and a float32 chunk array holds the same
+        # rounded values, so the elementwise d2 results are identical.
+        # Argmin ordering is preserved because the old float64 was only an
+        # exact, order-preserving upcast of these same float32 values.
+        valid_flat = np.flatnonzero(valid_mask.ravel())
+        keep_ty = np.empty(len(keep), dtype=np.int64)
+        keep_tx = np.empty(len(keep), dtype=np.int64)
+        for start in range(0, len(keep), 16):
+            cr_chunk = np.asarray(keep_cr[start:start + 16], dtype=np.float32)
+            cc_chunk = np.asarray(keep_cc[start:start + 16], dtype=np.float32)
+            d2 = (
+                (valid_rows[None, :] - cr_chunk[:, None]) ** 2
+                + (valid_cols[None, :] - cc_chunk[:, None]) ** 2
+            )
+            flat_idx = valid_flat[d2.argmin(axis=1)]
+            keep_ty[start:start + 16], keep_tx[start:start + 16] = divmod(
+                flat_idx, tile_size
+            )
+
+        for j, i in enumerate(keep):
+            cell = cells[i]
+            ty = int(keep_ty[j])
+            tx = int(keep_tx[j])
 
             # Circle radius scaled by area (log scale -- area spans orders of
             # magnitude from ~25 km^2 single cells to ~10000 km^2 MCSs).

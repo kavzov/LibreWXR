@@ -42,13 +42,16 @@ def test_mmd_provider_is_registered():
     from librewxr.sources._base import RadarSourceContribution
 
     contribs = [p(settings) for p in RADAR_PROVIDERS]
-    mmd = [
+    sea = [
         c for c in contribs
         if isinstance(c, RadarSourceContribution) and c.group == "SOUTHEAST_ASIA"
     ]
-    assert len(mmd) == 1, "expected exactly one SOUTHEAST_ASIA contribution"
-    region_names = {r.name for r in mmd[0].regions}
-    assert region_names == {"MYPENINSULAR", "MYEAST"}
+    # Both MET Malaysia and PAGASA contribute to SOUTHEAST_ASIA.
+    assert len(sea) == 2, "expected two SOUTHEAST_ASIA contributions"
+    mmd = [c for c in sea if {r.name for r in c.regions} == {"MYPENINSULAR", "MYEAST"}]
+    assert len(mmd) == 1
+    pagasa = [c for c in sea if {r.name for r in c.regions} == {"PHCOMP"}]
+    assert len(pagasa) == 1
 
 
 def test_protocols_and_contribution_dataclasses_importable():
@@ -93,6 +96,7 @@ def test_regions_module_imports_cleanly_with_discovery_wired():
     assert "USCOMP" in regions.REGIONS
     assert "OPERA" in regions.REGIONS
     assert "MYPENINSULAR" in regions.REGIONS
+    assert "PHCOMP" in regions.REGIONS
 
 
 def test_fetcher_sees_registry_providers():
@@ -202,6 +206,7 @@ def test_radar_disabled_returns_empty_contributions(monkeypatch):
     settings.mmd_enabled = False
     settings.cwa_enabled = False
     settings.marn_enabled = False
+    settings.pagasa_enabled = False
     settings.iem_base_url = "https://example.com"
     settings.msc_canada_base_url = "https://example.com"
     contribs = collect_radar_contributions(settings)
@@ -224,18 +229,20 @@ def test_radar_disabled_skips_coverage_metadata(monkeypatch):
 
 
 def test_regional_nwp_disabled_keeps_only_ifs(tmp_path):
-    """LIBREWXR_REGIONAL_NWP_ENABLED=false collapses the chain to IFS only.
+    """LIBREWXR_REGIONAL_NWP_ENABLED=false collapses the chain to IFS.
 
     Locks in the master-toggle contract for any future regional NWP
     source: as long as it leaves ``NWPContribution.regional`` at its
     default (True), the central collector drops it when the toggle is
     off.  IFS opts out via ``regional=False`` so the global base layer
-    keeps running.
+    keeps running.  NOAA RRQPE used to ride the chain as a non-regional
+    member; it is now the global *observed* radar region and flows
+    through the radar registry instead.
     """
     from librewxr.config import settings as real_settings
     from librewxr.sources import collect_nwp_contributions
 
-    # Baseline: when enabled, more than just IFS contributes.
+    # Baseline: when enabled, more than just the global source contributes.
     real_settings.regional_nwp_enabled = True
     enabled = collect_nwp_contributions(real_settings, cache_dir=tmp_path)
     assert len(enabled) > 1, "expected regional sources alongside IFS"
@@ -248,6 +255,63 @@ def test_regional_nwp_disabled_keeps_only_ifs(tmp_path):
         assert [c.name for c in disabled] == ["ECMWF IFS"]
     finally:
         real_settings.regional_nwp_enabled = True
+
+
+def test_rrqpe_radar_contribution_present_when_enabled(monkeypatch):
+    """RRQPE registers as an always-on radar contribution when enabled."""
+    from librewxr.config import settings as real_settings
+    from librewxr.sources import collect_radar_contributions
+
+    monkeypatch.setattr(real_settings, "radar_enabled", True)
+    real_settings.rrqpe_enabled = True
+    contribs = collect_radar_contributions(real_settings)
+    rrqpe = [
+        c for c in contribs
+        if any(r.name == "RRQPE" for r in c.regions)
+    ]
+    assert len(rrqpe) == 1
+    assert [r.name for r in rrqpe[0].regions] == ["RRQPE"]
+    assert rrqpe[0].always_enabled is True
+    assert rrqpe[0].group == "GLOBAL"
+
+
+def test_rrqpe_radar_contribution_dropped_when_disabled(monkeypatch):
+    """``rrqpe_enabled=False`` drops the radar contribution entirely."""
+    from librewxr.config import settings as real_settings
+    from librewxr.sources import collect_radar_contributions
+
+    monkeypatch.setattr(real_settings, "radar_enabled", True)
+    real_settings.rrqpe_enabled = False
+    try:
+        contribs = collect_radar_contributions(real_settings)
+        assert not any(
+            r.name == "RRQPE" for c in contribs for r in c.regions
+        )
+    finally:
+        real_settings.rrqpe_enabled = True
+
+
+def test_fetcher_keeps_always_on_regions_under_narrow_spec(monkeypatch):
+    """With ``enabled_regions=['USCOMP']`` the always-on RRQPE region stays
+    in the fetcher's effective enabled set (and gets a source)."""
+    from librewxr.config import settings as S
+    from librewxr.data.fetcher import RadarFetcher
+    from librewxr.data.store import FrameStore
+    from librewxr.tiles.cache import TileCache
+
+    monkeypatch.setattr(S, "radar_enabled", True)
+    monkeypatch.setattr(S, "rrqpe_enabled", True)
+    monkeypatch.setattr(S, "enabled_regions", "USCOMP")
+    monkeypatch.setattr(S, "na_source", "iem")
+    monkeypatch.setattr(S, "ca_source", "msc")
+    store = FrameStore(max_frames=2)
+    cache = TileCache(max_mb=10)
+    f = RadarFetcher(store, cache)
+    names = {r.name for r in f._enabled_regions}
+    assert "USCOMP" in names
+    assert "RRQPE" in names
+    assert "CACOMP" not in names  # narrow spec, not always-on
+    assert "RRQPE" in f._sources
 
 
 def test_satellite_source_slug_uses_override_when_set():

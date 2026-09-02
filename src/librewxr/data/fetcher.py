@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import logging
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
@@ -53,12 +54,24 @@ class RadarFetcher:
     # masking a genuine multi-cycle outage.
     _CARRY_FORWARD_MAX_INTERVALS = 2
 
+    # A carried-forward region is a stale copy standing in for a product
+    # the source failed to serve.  Several sources can still serve the
+    # missed slot from a short archive window afterwards (Météo-France's
+    # DPPaquetRadar packet holds ~15 min), so carried slots stay eligible
+    # for re-fetch this many intervals back before being written off.
+    # Without the re-fetch, the stale copy permanently masks the slot:
+    # the store reports the region present, every later cycle skips it,
+    # and the animation keeps a frozen duplicate frame.
+    _CARRY_FORWARD_REFETCH_MAX_INTERVALS = 3
+
     # Debounce window for on_cycle_complete triggers (initial backfill,
     # end of cycle, frame merges, satellite background fetches).  Multiple
     # triggers within the window collapse into a single trailing-edge
     # invocation so the full state.json serialisation runs at most once per
-    # burst instead of up to 3-4x per fetch cycle.
-    _CYCLE_COMPLETE_DEBOUNCE_S = 30.0
+    # burst instead of up to 3-4x per fetch cycle.  5 s still coalesces the
+    # per-cycle trigger burst into one invocation while cutting render-worker
+    # visibility latency from ~30 s to ~5 s.
+    _CYCLE_COMPLETE_DEBOUNCE_S = 5.0
 
     def __init__(
         self,
@@ -102,12 +115,16 @@ class RadarFetcher:
         self._cycle_complete_debounce = self._CYCLE_COMPLETE_DEBOUNCE_S
         self._cycle_complete_task: asyncio.Task | None = None
         self._cycle_complete_dirty = False
+        # NWP-phase wall time from the last auxiliary-grid fetch, reported
+        # in the per-cycle phase breakdown logged by ``_fetch_all_frames``
+        # and ``_fetch_initial``.  Defaults to 0.0 before the first cycle.
+        self._last_nwp_phase_s = 0.0
         self._closed = False
         self._task: asyncio.Task | None = None
         self._satellite_tasks: dict[str, asyncio.Task] = {}
-        self._enabled_regions = [
-            REGIONS[name] for name in settings.get_enabled_regions()
-        ]
+        # Provenance of carry-forward fills: ts -> region names whose
+        # store entry is a stale copy, still awaiting the real product.
+        self._carried_regions: dict[int, set[str]] = {}
 
         self._na_source = settings.na_source
         self._ca_source = settings.ca_source
@@ -116,17 +133,30 @@ class RadarFetcher:
         # registry under ``librewxr.sources``.  Each source package
         # owns a ``radar_provider`` function that reads ``settings``
         # and returns a contribution (or ``None`` to opt out).  The
-        # loop below applies the contribution to every enabled region
-        # it covers; ``setdefault`` lets the first provider to claim
-        # a region keep it (currently no two providers contest the
+        # enabled set starts from the region spec and is widened with
+        # every always-on contribution region (the coarse global
+        # observed tier stays enabled even under a narrow spec); the
+        # loop below then applies the contributions to every enabled
+        # region they cover.  ``setdefault`` lets the first provider to
+        # claim a region keep it (currently no two providers contest the
         # same region, but the guard is cheap and keeps order
         # deterministic).
+        radar_contribs = collect_radar_contributions(settings)
+        base_names = settings.get_enabled_regions()
+        enabled_names = list(base_names)
+        for contribution in radar_contribs:
+            if not contribution.always_enabled:
+                continue
+            for region in contribution.regions:
+                if region.name not in enabled_names:
+                    enabled_names.append(region.name)
+        self._enabled_regions = [REGIONS[name] for name in enabled_names]
         self._sources: dict[
             str,
             IEMSource | MRMSCompositeSource | MSCCanadaSource,
         ] = {}
         enabled_names = {r.name for r in self._enabled_regions}
-        for contribution in collect_radar_contributions(settings):
+        for contribution in radar_contribs:
             for region in contribution.regions:
                 if region.name in enabled_names:
                     self._sources.setdefault(region.name, contribution.instance)
@@ -244,11 +274,20 @@ class RadarFetcher:
         always on clean multiples regardless of when the server started.
         """
         cycle_start = time.time()
-        logger.info("─── fetch cycle start (initial backfill) ───")
+        logger.debug("─── fetch cycle start (initial backfill) ───")
+        nowcast_s = 0.0
+        cells_s = 0.0
         try:
             await self._fetch_all_frames()
+            # Per-stage timing for the cycle-complete log: nowcast and
+            # storm-cell generation are the post-fetch compute stages
+            # whose cost dominates the cycle duration.
+            _nc_start = time.monotonic()
             await self._run_nowcast()
+            nowcast_s = time.monotonic() - _nc_start
+            _sc_start = time.monotonic()
             await self._run_storm_cells()
+            cells_s = time.monotonic() - _sc_start
             # Fire-and-forget: the dump runs at the trailing edge of the
             # debounce window in the background, so the fetch loop is not
             # stalled and the imminent cycle-end trigger folds into this
@@ -260,8 +299,9 @@ class RadarFetcher:
         except Exception:
             logger.exception("Error in initial backfill")
         logger.info(
-            "─── fetch cycle complete in %.1fs (initial backfill) ───",
-            time.time() - cycle_start,
+            "─── fetch cycle complete in %.1fs (initial backfill) ─── "
+            "(nowcast=%.1fs cells=%.1fs)",
+            time.time() - cycle_start, nowcast_s, cells_s,
         )
         release_memory()
 
@@ -274,11 +314,17 @@ class RadarFetcher:
             boundary_iso = datetime.fromtimestamp(
                 next_boundary, tz=timezone.utc,
             ).strftime("%Y-%m-%d %H:%M UTC")
-            logger.info("─── fetch cycle start (boundary %s) ───", boundary_iso)
+            logger.debug("─── fetch cycle start (boundary %s) ───", boundary_iso)
+            nowcast_s = 0.0
+            cells_s = 0.0
             try:
                 await self._fetch_all_frames()
+                _nc_start = time.monotonic()
                 await self._run_nowcast()
+                nowcast_s = time.monotonic() - _nc_start
+                _sc_start = time.monotonic()
                 await self._run_storm_cells()
+                cells_s = time.monotonic() - _sc_start
                 # Fire-and-forget (see initial-backfill site): the dump
                 # lands at the trailing edge of the window without stalling
                 # the loop, and any satellite completion inside the window
@@ -288,8 +334,9 @@ class RadarFetcher:
             except Exception:
                 logger.exception("Error in fetch loop")
             logger.info(
-                "─── fetch cycle complete in %.1fs (boundary %s) ───",
-                time.time() - cycle_start, boundary_iso,
+                "─── fetch cycle complete in %.1fs (boundary %s) ─── "
+                "(nowcast=%.1fs cells=%.1fs)",
+                time.time() - cycle_start, boundary_iso, nowcast_s, cells_s,
             )
             release_memory()
 
@@ -419,11 +466,43 @@ class RadarFetcher:
 
     async def _fetch_initial(self) -> None:
         """Quick startup: fetch auxiliary grids and latest radar frame only."""
-        await self._fetch_auxiliary_grids()
-
-        interval = settings.fetch_interval
-        now_rounded = int(time.time() // interval) * interval
-        await self._fetch_timestamps([(now_rounded, "live", 0)])
+        # Time the NWP-grid phase.  The NWP gather overlaps the radar fetch
+        # the same way ``_fetch_all_frames`` does: the auxiliary grids are
+        # independent of the radar path, so the task runs concurrently and
+        # the finally block below reaps it before either return path exits.
+        # The per-cycle phase breakdown is logged here (see below), so the
+        # timing lives in this caller rather than in ``_fetch_timestamps``.
+        _nwp_start = time.monotonic()
+        nwp_task = asyncio.create_task(self._fetch_auxiliary_grids())
+        try:
+            interval = settings.fetch_interval
+            now_rounded = int(time.time() // interval) * interval
+            radar_s, post_s, write_s = await self._fetch_timestamps(
+                [(now_rounded, "live", 0)]
+            )
+        finally:
+            # Capture any in-flight radar exception BEFORE the await: if
+            # the NWP task also raised, re-raising here would silently
+            # REPLACE the radar exception (finally semantics).  The radar
+            # path is the primary data source, so the NWP failure is
+            # logged and the radar exception wins; when the radar path
+            # succeeded, the NWP exception re-raises exactly as the old
+            # sequential await did.
+            radar_exc = sys.exc_info()[0]
+            try:
+                await nwp_task
+            except Exception:
+                if radar_exc is not None:
+                    logger.exception(
+                        "NWP auxiliary fetch failed (radar path also failed)"
+                    )
+                else:
+                    raise
+            self._last_nwp_phase_s = time.monotonic() - _nwp_start
+        logger.info(
+            "Fetch phases: nwp=%.1fs radar=%.1fs post=%.1fs write=%.1fs",
+            self._last_nwp_phase_s, radar_s, post_s, write_s,
+        )
         await self._run_nowcast()
         await self._run_storm_cells()
 
@@ -588,70 +667,140 @@ class RadarFetcher:
         0–50 min ago map to live indices 0, 2, 4, 6, 8, 10.  Older frames
         fall back to the archive endpoint.
         """
-        await self._fetch_auxiliary_grids()
+        # Time the NWP-grid phase.  The NWP gather now overlaps the radar
+        # fetch: the auxiliary grids are independent of the radar path, so
+        # the task runs concurrently and the finally block below reaps it
+        # before either return path exits.  The quick-start
+        # ``_fetch_initial`` path overlaps the same way (the attribute
+        # defaults to 0.0 before the first cycle).
+        _nwp_start = time.monotonic()
+        nwp_task = asyncio.create_task(self._fetch_auxiliary_grids())
+        try:
+            interval = settings.fetch_interval
+            interval_min = interval // 60
+            now_rounded = int(time.time() // interval) * interval
 
-        interval = settings.fetch_interval
-        interval_min = interval // 60
-        now_rounded = int(time.time() // interval) * interval
+            # Skip timestamps that already have all enabled regions.
+            # Incomplete frames (e.g. a region fetch failed transiently) are
+            # re-fetched so the missing regions can be merged in.
+            existing_frames = await self._store.get_region_keys()
+            enabled_names = {r.name for r in self._enabled_regions}
 
-        # Skip timestamps that already have all enabled regions.
-        # Incomplete frames (e.g. a region fetch failed transiently) are
-        # re-fetched so the missing regions can be merged in.
-        existing_frames = await self._store.get_region_keys()
-        enabled_names = {r.name for r in self._enabled_regions}
+            # Prune carry-forward provenance for slots the source archive can
+            # no longer serve (or that left the store) — past that point the
+            # stale copy is final and retrying is wasted bandwidth.
+            refetch_cutoff = (
+                now_rounded - self._CARRY_FORWARD_REFETCH_MAX_INTERVALS * interval
+            )
+            for carried_ts in list(self._carried_regions):
+                if carried_ts < refetch_cutoff or carried_ts not in existing_frames:
+                    del self._carried_regions[carried_ts]
 
-        ts_and_sources: list[tuple[int, str, int | datetime]] = []
+            ts_and_sources: list[tuple[int, str, int | datetime]] = []
 
-        for i in range(settings.max_frames):
-            minutes_ago = i * interval_min
-            ts = now_rounded - i * interval
+            for i in range(settings.max_frames):
+                minutes_ago = i * interval_min
+                ts = now_rounded - i * interval
 
-            if ts in existing_frames and enabled_names <= existing_frames[ts]:
-                continue
+                # Carried-forward regions are stale copies; while their slot
+                # is inside the recovery window they count as missing so the
+                # real product can replace the copy (store merge + tile-cache
+                # invalidation handle the swap).
+                carried = self._carried_regions.get(ts, set())
+                if (
+                    ts in existing_frames
+                    and enabled_names <= existing_frames[ts] - carried
+                ):
+                    continue
 
-            # IEM live endpoint covers 0-55 min ago
-            if minutes_ago <= 55:
-                ts_and_sources.append((ts, "live", minutes_ago))
-            else:
-                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-                ts_and_sources.append((ts, "archive", dt))
+                # IEM live endpoint covers 0-55 min ago
+                if minutes_ago <= 55:
+                    ts_and_sources.append((ts, "live", minutes_ago))
+                else:
+                    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    ts_and_sources.append((ts, "archive", dt))
 
-        if not ts_and_sources:
-            logger.debug("All radar frames up to date, nothing to fetch")
-            return
+            if not ts_and_sources:
+                logger.debug("All radar frames up to date, nothing to fetch")
+                return
 
-        await self._fetch_timestamps(ts_and_sources, skip_regions=existing_frames)
+            radar_s, post_s, write_s = await self._fetch_timestamps(
+                ts_and_sources, skip_regions=existing_frames,
+            )
+        finally:
+            # Both the normal path and the early-return path land here, so
+            # the NWP gather always completes before this method returns.
+            # Capture any in-flight radar exception BEFORE the await: if
+            # the NWP task also raised, re-raising here would silently
+            # REPLACE the radar exception (finally semantics).  The radar
+            # path is the primary data source, so the NWP failure is
+            # logged and the radar exception wins; when the radar path
+            # succeeded, the NWP exception re-raises exactly as the old
+            # sequential await did.
+            radar_exc = sys.exc_info()[0]
+            try:
+                await nwp_task
+            except Exception:
+                if radar_exc is not None:
+                    logger.exception(
+                        "NWP auxiliary fetch failed (radar path also failed)"
+                    )
+                else:
+                    raise
+            self._last_nwp_phase_s = time.monotonic() - _nwp_start
+
+        # Per-stage cycle breakdown.  Timing is guaranteed on this path
+        # (the finally block above always awaits the NWP task), so no
+        # ``getattr`` fallback is needed.
+        logger.info(
+            "Fetch phases: nwp=%.1fs radar=%.1fs post=%.1fs write=%.1fs",
+            self._last_nwp_phase_s, radar_s, post_s, write_s,
+        )
 
     async def _fetch_timestamps(
         self,
         ts_and_sources: list[tuple[int, str, int | datetime]],
         skip_regions: dict[int, set[str]] | None = None,
-    ) -> None:
+    ) -> tuple[float, float, float]:
         """Fetch enabled regions for the given timestamps.
 
         Args:
             skip_regions: Optional mapping of timestamp -> region names to
                 skip (already present in the store).  Only missing regions
-                are fetched, saving bandwidth on retries for incomplete frames.
+                are fetched, saving bandwidth on retries for incomplete
+                frames.  Regions recorded in ``_carried_regions`` are
+                fetched despite being present — their store entry is a
+                carry-forward copy awaiting the real product.
+
+        Returns:
+            ``(radar_s, post_s, write_s)``: wall-clock seconds spent in the
+            radar gather, per-result post-processing, and store write
+            phases.  The per-cycle phase log lives in the callers, which
+            own the NWP timing now that the NWP fetch overlaps the radar
+            fetch, so this method only measures and returns.
         """
         # For each timestamp, fetch regions in parallel (skipping any
         # already present from a previous partial fetch).
+        sem = asyncio.Semaphore(settings.radar_fetch_concurrency)
         tasks = []
-        task_meta: list[tuple[int, RegionDef, str]] = []
+        task_meta: list[tuple[int, RegionDef, str, int | datetime]] = []
 
         for ts, source_type, source_arg in ts_and_sources:
             have = skip_regions.get(ts, set()) if skip_regions else set()
+            carried = self._carried_regions.get(ts, set())
             for region in self._enabled_regions:
-                if region.name in have:
+                if region.name in have and region.name not in carried:
                     continue
                 source = self._sources[region.name]
                 if source_type == "live":
-                    tasks.append(source.fetch_frame(region, source_arg))
+                    tasks.append(_bounded_fetch(sem, source.fetch_frame(region, source_arg)))
                 else:
-                    tasks.append(source.fetch_archive_frame(region, source_arg))
-                task_meta.append((ts, region, source_type))
+                    tasks.append(_bounded_fetch(sem, source.fetch_archive_frame(region, source_arg)))
+                task_meta.append((ts, region, source_type, source_arg))
 
+        radar_start = time.monotonic()
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        radar_s = time.monotonic() - radar_start
 
         # Group results by timestamp and build frames.  Pre-seed every
         # ts with an empty dict so the carry-forward pass below can fire
@@ -660,49 +809,44 @@ class RadarFetcher:
         frames_by_ts: dict[int, dict[str, np.ndarray]] = {
             ts: {} for ts, _, _ in ts_and_sources
         }
-        for (ts, region, source_type), result in zip(task_meta, results):
+
+        # Per-result post-processing (fallback, CACOMP blend, despeckle)
+        # touches only its own result, so all finalization coroutines fan
+        # out under one gather instead of serialising each result's
+        # awaits.  Exception results keep their inline warning + skip;
+        # gather preserves the order of the coroutines passed, so the
+        # merge pass below zips back 1:1 in the original result order.
+        post_start = time.monotonic()
+        finalize_coros: list[Awaitable[np.ndarray | None]] = []
+        finalize_meta: list[tuple[int, RegionDef, str, int | datetime]] = []
+        for (ts, region, source_type, source_arg), result in zip(task_meta, results):
             if isinstance(result, Exception):
                 logger.warning(
                     "Failed to fetch %s for ts=%d: %s", region.name, ts, result
                 )
                 continue
-            if result is None:
-                # MRMS fallback: if MRMS returned None, try IEM for US
-                # regions (when na_source=mrms_fallback) or MSC standalone
-                # for CACOMP (when ca_source=mrms_with_msc_blend).
-                fallback_result = await self._try_fallback(region, ts, source_type, source_arg)  # noqa: E501
-                if fallback_result is not None:
-                    result = fallback_result
-                else:
-                    # Silent-None drops on the live slot are the visible-to-
-                    # user case — they create a partial or missing region in
-                    # the most-recent frame, which produces masking artifacts
-                    # and degrades the nowcast input.  Archive misses are
-                    # normal (sources have finite history) and stay silent.
-                    if source_type == "live":
-                        logger.warning(
-                            "%s: source returned no data for live ts=%d "
-                            "(silent drop — region absent from this frame)",
-                            region.name, ts,
-                        )
-                    continue
-            else:
-                # CACOMP blending: MRMS+MSC blend mode only.
-                if (
-                    self._ca_source == "mrms_with_msc_blend"
-                    and region.name == "CACOMP"
-                    and self._cacomp_msc_source is not None
-                ):
-                    result = await self._blend_cacomp(result, region, ts, source_type, source_arg)  # noqa: E501
+            finalize_coros.append(
+                self._finalize_result(region, ts, source_type, source_arg, result)
+            )
+            finalize_meta.append((ts, region, source_type, source_arg))
 
-            if settings.despeckle_min_neighbors > 0:
-                # Full-region numpy convolution (USCOMP ~63 MB) — run in
-                # a worker thread.
-                result = await asyncio.to_thread(
-                    _despeckle, result, settings.despeckle_min_neighbors,
-                )
+        finalized = await asyncio.gather(*finalize_coros)
+
+        for (ts, region, source_type, source_arg), result in zip(finalize_meta, finalized):
+            if result is None:
+                # Silent drop — nothing to merge for this slot.
+                continue
 
             frames_by_ts[ts][region.name] = result
+
+            # Real data landed — retire any carry-forward provenance so
+            # later cycles stop re-fetching this slot.
+            carried_here = self._carried_regions.get(ts)
+            if carried_here is not None:
+                carried_here.discard(region.name)
+                if not carried_here:
+                    del self._carried_regions[ts]
+        post_s = time.monotonic() - post_start
 
         # Store frames in chronological order so carry-forward lookback
         # sees the freshest data (a backfill cycle that fetches several
@@ -713,6 +857,7 @@ class RadarFetcher:
         enabled_names = {r.name for r in self._enabled_regions}
         interval = settings.fetch_interval
 
+        write_start = time.monotonic()
         for ts in sorted(frames_by_ts.keys()):
             regions_data = frames_by_ts[ts]
 
@@ -724,24 +869,36 @@ class RadarFetcher:
             # later can't invalidate the carried data.
             already_have = (skip_regions or {}).get(ts, set())
             missing = enabled_names - set(regions_data.keys()) - already_have
-            for lookback in range(1, self._CARRY_FORWARD_MAX_INTERVALS + 1):
-                if not missing:
-                    break
-                prev_ts = ts - lookback * interval
-                prev_frame = await self._store.get_frame(prev_ts)
-                if prev_frame is None:
-                    continue
-                for name in list(missing):
-                    if name in prev_frame.regions:
-                        regions_data[name] = np.asarray(
-                            prev_frame.regions[name]
-                        ).copy()
-                        stale_min = (lookback * interval) // 60
-                        logger.info(
-                            "%s: carry-forward into ts=%d from %d (%d min stale)",
-                            name, ts, prev_ts, stale_min,
-                        )
-                        missing.discard(name)
+            if missing:
+                # Batch the store lookups for every carry-forward level
+                # into one gather (each get_frame still takes the store's
+                # async lock, but the awaits collapse into a single round
+                # trip instead of one await per lookback level), then walk
+                # the in-memory results in the same level order below.
+                levels = range(1, self._CARRY_FORWARD_MAX_INTERVALS + 1)
+                prev_frames = await asyncio.gather(
+                    *(self._store.get_frame(ts - lb * interval) for lb in levels)
+                )
+                for lookback, prev_frame in zip(levels, prev_frames):
+                    if not missing:
+                        break
+                    prev_ts = ts - lookback * interval
+                    if prev_frame is None:
+                        continue
+                    for name in list(missing):
+                        if name in prev_frame.regions:
+                            regions_data[name] = np.asarray(
+                                prev_frame.regions[name]
+                            ).copy()
+                            stale_min = (lookback * interval) // 60
+                            logger.info(
+                                "%s: carry-forward into ts=%d from %d (%d min stale)",
+                                name, ts, prev_ts, stale_min,
+                            )
+                            # Record provenance so later cycles re-fetch this
+                            # slot while the source archive can still serve it.
+                            self._carried_regions.setdefault(ts, set()).add(name)
+                            missing.discard(name)
 
             if not regions_data:
                 # Nothing to add — every enabled region was either
@@ -772,6 +929,7 @@ class RadarFetcher:
                 except Exception:
                     logger.exception("Failed to persist radar frame %d", ts)
             added += 1
+        write_s = time.monotonic() - write_start
 
         # Merges only invalidate the pipeline's local cache, which the
         # render workers don't share.  Dump state.json so the workers poll
@@ -799,6 +957,64 @@ class RadarFetcher:
             "Fetch complete: %d frames added, %d total in store (%s)",
             added, count, region_summary,
         )
+        # Return the per-stage timings; the callers log the phase breakdown
+        # (they own the NWP timing, which now overlaps the radar fetch).
+        return radar_s, post_s, write_s
+
+    async def _finalize_result(
+        self,
+        region: RegionDef,
+        ts: int,
+        source_type: str,
+        source_arg: int | datetime,
+        result: np.ndarray | None,
+    ) -> np.ndarray | None:
+        """Run one fetch result's post-processing: fallback, blend, despeckle.
+
+        Extracted from the result loop in ``_fetch_timestamps`` so every
+        result's per-result awaits (cross-source fallback, CACOMP blend,
+        worker-thread despeckle) overlap under a single gather instead of
+        serialising result after result.  The logic is byte-identical to
+        the old inline pass: returns the final array, or ``None`` when the
+        result was a silent drop (the caller then skips the slot).
+        """
+        if result is None:
+            # MRMS fallback: if MRMS returned None, try IEM for US
+            # regions (when na_source=mrms_fallback) or MSC standalone
+            # for CACOMP (when ca_source=mrms_with_msc_blend).
+            fallback_result = await self._try_fallback(region, ts, source_type, source_arg)  # noqa: E501
+            if fallback_result is not None:
+                result = fallback_result
+            else:
+                # Silent-None drops on the live slot are the visible-to-
+                # user case — they create a partial or missing region in
+                # the most-recent frame, which produces masking artifacts
+                # and degrades the nowcast input.  Archive misses are
+                # normal (sources have finite history) and stay silent.
+                if source_type == "live":
+                    logger.warning(
+                        "%s: source returned no data for live ts=%d "
+                        "(silent drop — region absent from this frame)",
+                        region.name, ts,
+                    )
+                return None
+        else:
+            # CACOMP blending: MRMS+MSC blend mode only.
+            if (
+                self._ca_source == "mrms_with_msc_blend"
+                and region.name == "CACOMP"
+                and self._cacomp_msc_source is not None
+            ):
+                result = await self._blend_cacomp(result, region, ts, source_type, source_arg)  # noqa: E501
+
+        if settings.despeckle_min_neighbors > 0:
+            # Full-region numpy convolution (USCOMP ~63 MB) — run in
+            # a worker thread.
+            result = await asyncio.to_thread(
+                _despeckle, result, settings.despeckle_min_neighbors,
+            )
+
+        return result
 
     async def _try_fallback(
         self,
@@ -894,6 +1110,17 @@ class RadarFetcher:
         )
 
 
+async def _bounded_fetch(sem: asyncio.Semaphore, coro: Awaitable) -> object:
+    """Run a single fetch coroutine under the radar fetch-concurrency semaphore.
+
+    Wraps an already-created (but not yet scheduled) coroutine object so
+    the gather in ``_fetch_timestamps`` can hand each task a semaphore
+    slot without starting any fetch ahead of the gather.
+    """
+    async with sem:
+        return await coro
+
+
 def _blend_cacomp_arrays(
     mrms_data: np.ndarray,
     msc_data: np.ndarray,
@@ -940,19 +1167,23 @@ def _blend_cacomp_arrays(
 def _despeckle(data: np.ndarray, min_neighbors: int) -> np.ndarray:
     """Remove isolated pixels (ground clutter / AP artifacts).
 
-    Uses padded slicing instead of np.roll for ~2.4x speedup on large
-    arrays.  Slicing also avoids the wrap-around artifact that np.roll
+    Builds the 8-neighbor count with strided view additions into a single
+    pre-sized buffer — no (h+2) x (w+2) padded copy, so each call
+    allocates just the boolean mask, the count buffer, and the result
+    copy.  Slicing also avoids the wrap-around artifact that np.roll
     produces at array edges.
     """
     mask = data > 0
     h, w = mask.shape
-    padded = np.pad(mask, 1, constant_values=False)
     count = np.zeros((h, w), dtype=np.int8)
-    for dr in range(3):
-        for dc in range(3):
-            if dr == 1 and dc == 1:
-                continue
-            count += padded[dr:dr + h, dc:dc + w]
+    count[1:, :] += mask[:-1, :]
+    count[:-1, :] += mask[1:, :]
+    count[:, 1:] += mask[:, :-1]
+    count[:, :-1] += mask[:, 1:]
+    count[1:, 1:] += mask[:-1, :-1]
+    count[1:, :-1] += mask[:-1, 1:]
+    count[:-1, 1:] += mask[1:, :-1]
+    count[:-1, :-1] += mask[1:, 1:]
 
     result = data.copy()
     result[mask & (count < min_neighbors)] = 0

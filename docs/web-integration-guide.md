@@ -13,6 +13,7 @@ A tutorial for adding live weather radar to a website using LibreWXR. No prior e
   - [Tile URL Format](#tile-url-format)
   - [Satellite Tile URL Format](#satellite-tile-url-format)
   - [Coverage Tile Endpoint](#coverage-tile-endpoint)
+  - [Widgets and Single-Location Images](#widgets-and-single-location-images)
   - [Alerts Endpoint](#alerts-endpoint)
   - [Health Endpoint](#health-endpoint)
 - [Step-by-Step: Leaflet Integration](#step-by-step-leaflet-integration)
@@ -83,7 +84,7 @@ If you want to experiment before setting up your own server, you can use the pub
 https://api.librewxr.net
 ```
 
-Just use this URL wherever you see `http://localhost:8080` in the examples below. The `examples/` directory in the repository contains ready-to-open HTML files that auto-detect whether to use a local or public API endpoint — no setup needed.
+Just use this URL wherever you see `http://localhost:8080` in the examples below. The `examples/` directory in the repository contains ready-to-open HTML files — the map examples auto-detect whether to use a local or public API endpoint, and the widget defaults to the public instance via its API-source selector — no setup needed.
 
 When you're ready to self-host, swap the URL to your own server and everything works the same way.
 
@@ -137,6 +138,8 @@ This is the starting point for any integration. It returns metadata about all av
   }
 }
 ```
+
+(The real response lists all 14 color schemes in `colorSchemes` — the example above is abbreviated.)
 
 **Fields:**
 
@@ -267,7 +270,7 @@ This is where the actual tile images come from. Your map library will call this 
 | `z` | Zoom level | `0` to `12` (configurable max) |
 | `x` | Tile column | `0` to `2^z - 1` |
 | `y` | Tile row | `0` to `2^z - 1` |
-| `color` | Color scheme ID | `0` to `12`, or `255` (see [Color Schemes](#color-schemes)) |
+| `color` | Color scheme ID | `0` to `13`, or `255` (see [Color Schemes](#color-schemes)) |
 | `smooth_snow` | Smoothing and snow flags, joined with `_` | `{0 or 1}_{0 or 1}` |
 | `ext` | Image format | `png` or `webp` |
 
@@ -276,6 +279,7 @@ This is where the actual tile images come from. Your map library will call this 
 | Parameter | Description | Values |
 |-----------|-------------|--------|
 | `arrows` | Precipitation motion arrows | `""` (off), `light`, `dark`, `1`/`true` (alias for light) |
+| `cells` | Storm-cell markers (light/dark shape labels, rendered server-side) | `""` (off), `light`, `dark`, `1`/`true` (alias for light) |
 
 **Example tile URL:**
 
@@ -285,22 +289,7 @@ http://localhost:8080/v2/radar/1700000400/256/5/8/12/7/1_0.png
 
 This requests a 256px PNG tile at zoom 5, column 8, row 12, using color scheme 7 (Rainbow @ Selex SI), with smoothing enabled and snow coloring disabled.
 
-### Continuous WebGL Radar Motion
-
-When `radar.motion` is present, a client can request dense displacement data
-for each adjacent pair of displayed radar frames:
-
-```text
-GET /v2/radar/motion/{from}/{to}/{size}/{z}/{x}/{y}.png
-```
-
-Decode the RGB data according to the advertised `encoding`, then use the
-resulting X/Y displacement in a fragment shader: sample the earlier colour
-texture backwards by `displacement * progress`, sample the later texture
-forwards by `displacement * (1 - progress)`, and mix the two samples. Updating
-`progress` with `requestAnimationFrame` produces continuous motion without
-requesting intermediate rendered radar frames. Keep ordinary raster animation
-as a fallback when WebGL or motion tiles are unavailable.
+**Latest-frame alias:** timestamp `0` is accepted in the `{timestamp}` slot as an alias for the newest frame - radar resolves it to the latest past radar frame and the satellite endpoint to the latest GMGSI timestamp, before any caching, so alias URLs key and cache exactly like the canonical ones. Every response (200 or 304) carries the resolved timestamp in the `X-Frame-Timestamp` response header: request e.g. `http://localhost:8080/v2/radar/0/256/5/8/12/7/1_0.png` and read the canonical timestamp from the header instead of polling the metadata endpoint. The alias works on radar tile URLs, lat/lon window URLs (e.g. `http://localhost:8080/v2/radar/0/256/7/52.52/13.405/2/1_1.png`), and satellite tiles.
 
 ### Satellite Tile URL Format
 
@@ -335,7 +324,17 @@ The satellite layer renders real imagery from NOAA's GMGSI mosaic. The day side 
 GET /v2/coverage/0/{size}/{z}/{x}/{y}/0/0_0.png
 ```
 
-Returns a tile showing where radar data exists (useful for debugging or displaying coverage boundaries). The coverage tile is always PNG format.
+Returns a tile showing where radar data exists (useful for debugging or displaying coverage boundaries). The coverage tile is always PNG format. A lat/lon window variant also exists at `/v2/coverage/0/{size}/{z}/{lat}/{lon}/0/0_0.png` — see the Widgets and Single-Location Images section for the dot rule and semantics.
+
+### Widgets and Single-Location Images
+
+For widgets that poll a fixed location, request a single image centered on the coordinate instead of managing a tile grid:
+
+```
+GET /v2/radar/{timestamp}/256/7/52.52/13.405/2/1_1.png
+```
+
+This returns a 256x256 (or 512x512) PNG/WebP centered on the EPSG:4326 coordinate at the given zoom - the center snaps to the nearest pixel, longitude wraps across the antimeridian, and latitude clamps to the Web Mercator limit (+/-85.0511 deg). Path segments containing a dot are treated as lat/lon and plain integer segments as x/y tile indices - use the `{timestamp}` from the metadata response exactly as you would for tiles. The coverage variant is `/v2/coverage/0/{size}/{z}/{lat}/{lon}/0/0_0.png`, and the `?arrows=` / `?cells=` query parameters are silently ignored on lat/lon window URLs.
 
 ### Alerts Endpoint
 
@@ -358,6 +357,16 @@ Returns active weather alerts as a GeoJSON `FeatureCollection`. Each feature car
 
 Returns `503 Service Unavailable` if `LIBREWXR_ALERTS_ENABLED=false` on the server.
 
+**Using `simplify`:** the tolerance (meters) controls how aggressively the returned polygons are thinned (topology-preserving Douglas-Peucker). Larger values drop more vertices and shrink the payload; the geometry stays valid either way. Practical values:
+
+- `simplify=1000` (the default) — good for viewport-sized fetches on zoomed-out maps
+- `simplify=0` — full-resolution polygons; use when drawing a single alert boundary up close
+- `simplify=10000` or more — aggressive trimming for a whole-world overview
+
+Example: `GET /v2/alerts?bbox=-125,24,-66,50&simplify=2000`
+
+Simplification only affects the geometry in the response — point/bbox filtering always runs against full-resolution polygons. The meters-to-degrees conversion is latitude-independent, so the effective tolerance shrinks slightly at high latitudes.
+
 **Example response:**
 
 ```json
@@ -371,25 +380,20 @@ Returns `503 Service Unavailable` if `LIBREWXR_ALERTS_ENABLED=false` on the serv
         "coordinates": [[[-95.0, 30.0], [-94.0, 30.0], [-94.0, 31.0], [-95.0, 31.0], [-95.0, 30.0]]]
       },
       "properties": {
-        "identifier": "NWS-LCH-1234",
-        "sender": "w-nws.webmaster@noaa.gov",
-        "sent": "2026-05-13T14:00:00Z",
-        "expires": "2026-05-13T22:00:00Z",
-        "event": "Severe Thunderstorm Warning",
-        "headline": "Severe Thunderstorm Warning issued May 13 at 2:00PM CDT",
-        "description": "...",
+        "title": "Severe Thunderstorm Warning",
         "severity": "Severe",
-        "urgency": "Immediate",
-        "certainty": "Likely",
-        "areaDesc": "Jefferson County",
-        "country": "US"
+        "time": 1778680800,
+        "expires": 1778709600,
+        "description": "...",
+        "regions": ["Jefferson County"],
+        "uri": "https://api.weather.gov/alerts/NWS-IDP-STS-12345678"
       }
     }
   ]
 }
 ```
 
-The `severity` / `urgency` / `certainty` fields follow the CAP 1.2 vocabulary, which is convenient for styling: colour by severity, only animate the `Immediate` ones, etc.
+The `severity` field follows the CAP 1.2 vocabulary (`Extreme` / `Severe` / `Moderate` / `Minor` / `Unknown`), which is convenient for styling — colour polygons by severity and let users filter on it. `time` and `expires` are Unix epochs; `regions` lists the affected area names, and `uri` links to the full alert text.
 
 ### Health Endpoint
 
@@ -397,7 +401,7 @@ The `severity` / `urgency` / `certainty` fields follow the CAP 1.2 vocabulary, w
 GET /health
 ```
 
-Returns server status, frame count, cache usage, RAM stats, NWP chain state, alerts status, and satellite cache state. Useful for monitoring, not typically needed for web integration.
+Returns server status, frame count, cache usage, RAM stats, NWP chain state, alerts status, satellite cache state, and a cluster-wide worker aggregation (multi-worker deployments). Useful for monitoring, not typically needed for web integration.
 
 ---
 
@@ -418,7 +422,7 @@ Start with a basic HTML page with Leaflet and a full-screen map:
     <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
     <style>
         body { margin: 0; }
-        #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+        #map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: #0f1117; }
     </style>
 </head>
 <body>
@@ -434,7 +438,9 @@ Start with a basic HTML page with Leaflet and a full-screen map:
 </html>
 ```
 
-This gives you a base map centered on the US. You can change the `setView` coordinates and zoom to center on any region — for example, `[50.0, 10.0]` for Europe, `[56.0, -96.0]` for Canada, `[23.7, 121.0]` for Taiwan, `[13.7, -88.9]` for El Salvador, or `[4.0, 109.0]` for the MET Malaysia / Borneo composite.
+The dark `background` on `#map` shows through the transparent radar tiles where there is no precipitation and prevents Leaflet's default light-grey flash while tiles load; pick any color that matches your page theme.
+
+This gives you a base map centered on the US. You can change the `setView` coordinates and zoom to center on any region — for example, `[50.0, 10.0]` for Europe, `[56.0, -96.0]` for Canada, `[23.7, 121.0]` for Taiwan, `[13.7, -88.9]` for El Salvador, `[4.0, 109.0]` for the MET Malaysia / Borneo composite, or `[13.0, 122.5]` for the PAGASA Philippines composite.
 
 ### 2. Fetching Radar Metadata
 
@@ -794,10 +800,10 @@ async function loadAlerts() {
         onEachFeature: function (feature, layer) {
             var p = feature.properties;
             layer.bindPopup(
-                "<strong>" + (p.event || "Alert") + "</strong><br>" +
-                (p.headline || "") + "<br>" +
-                "<em>" + (p.areaDesc || "") + "</em><br>" +
-                "Severity: " + p.severity + " · Urgency: " + p.urgency
+                "<strong>" + (p.title || "Alert") + "</strong><br>" +
+                "<em>" + (p.regions || []).join(", ") + "</em><br>" +
+                "Severity: " + p.severity + "<br>" +
+                '<a href="' + p.uri + '" target="_blank" rel="noopener">Details</a>'
             );
         }
     }).addTo(map);
@@ -1163,6 +1169,7 @@ LibreWXR supports the 9 original Rain Viewer color schemes, a contributed scheme
 | 10 | Viper HD | High-resolution palette by Ben Mitchell (WxTools.org); cyan-blue through smooth greens into yellow / orange / red, with a magenta band at 55–60 dBZ and a grayscale tail for extreme reflectivity. Also used by RadarScope, Supercell Wx, and others |
 | 11 | MRMS CREF | Stepped 5-dBZ operational palette used by NOAA/NSSL's MRMS Product Viewer for composite reflectivity. Cyan through blue / green / yellow / orange / red into a magenta band at 70 dBZ, with light-tan and purple swatches for sub-zero / clear-air returns |
 | 12 | 33/40 Max Storm | Stepped 5-dBZ palette designed by ABC 33/40 Chief Meteorologist James Aydelott, published via Ben Mitchell's WxTools (WxTools.org). Green ramp for light precip (10–30 dBZ) stepping through yellow / orange / red for moderate-to-heavy, into a pink / magenta convective band at 55+ dBZ. Snow variant reuses the Universal Blue gradient. Also used by RadarScope, Supercell Wx, and others |
+| 13 | MetService NZ (Dark) | MetService New Zealand-inspired palette (dark-basemap variant), contributed by ashuttl via GitHub discussion #4 |
 | 255 | Raw | Grayscale proportional to dBZ — useful for custom client-side coloring |
 
 Use the scheme ID as the `{color}` path parameter. If an invalid ID is provided, the server falls back to Rainbow @ Selex SI (7).
@@ -1183,7 +1190,7 @@ The `{smooth}_{snow}` path segment controls two independent features:
 
 - **Smooth** (`1` = on, `0` = off): Applies a Gaussian blur to soften the pixelated edges of radar data. Especially useful at higher zoom levels. The blur radius is configurable server-side via `LIBREWXR_SMOOTH_RADIUS`.
 
-- **Snow** (`1` = on, `0` = off): When enabled, areas classified as snowfall use an alternate color palette (typically blues/purples instead of greens/yellows). Classification comes from the regional NWP source covering each pixel (HRRR-CONUS / HRRR-Alaska / WRF-SMN / DMI DINI / ICON-EU each classify natively from their own 2-metre temperature field), or from ECMWF IFS snowfall ratio everywhere else.
+- **Snow** (`1` = on, `0` = off): When enabled, areas classified as snowfall use an alternate color palette (typically blues/purples instead of greens/yellows). Classification comes from the regional NWP source covering each pixel (HRRR-CONUS / HRRR-Alaska / JMA MSM / WRF-SMN / DMI DINI / ICON-EU each classify natively from their own 2-metre temperature field), or from ECMWF IFS snowfall ratio everywhere else.
 
 Common combinations:
 - `0_0` — raw, no smoothing, rain colors only
@@ -1243,7 +1250,7 @@ When pre-loading layers for animation, set opacity to `0.001` rather than `0`. S
 
 ### Map pan cleanup
 
-Always clear cached/pre-loaded radar layers when the user pans the map. The tiles are only valid for the viewport that was visible when they loaded. Both examples above demonstrate this pattern.
+Always clear cached/pre-loaded radar layers when the user pans the map. The tiles are only valid for the viewport that was visible when they loaded. The examples restart background preloading after panning so newly visible tiles get cached.
 
 ### CORS
 
@@ -1275,19 +1282,23 @@ setInterval(function () {
 
 ## Complete Working Examples
 
-The `examples/` directory contains two self-contained HTML files that demonstrate every feature covered in this guide:
+The `examples/` directory contains generated HTML files, built from the modular sources in `examples/src/` by `python3 examples/src/build.py` — edit the sources there, not the built HTML. Two full map variants, plus a minimal generated `hero.html` and a dependency-free `widget.html`, demonstrate every feature covered in this guide:
 
 - **`examples/leaflet.html`** — Full Leaflet integration
 - **`examples/maplibre.html`** — Full MapLibre GL JS integration
-- **`examples/leaflet-weather-fields.html`** — Minimal metadata-driven global
-  temperature/humidity/pressure/wind client with timestamp and legend controls
+- **`examples/widget.html`** — Single-location radar widget (no map library, with a toggleable OSM basemap layer built from plain raster tiles)
 
-Both examples include:
+The two map examples include:
 - **Source selector** — switch between your local server and the public instance (`api.librewxr.net`) without editing code. Auto-detects the best default based on how the file is opened.
 - **Layer modes** — Radar, Satellite, or Radar + Satellite (satellite as a cloud background under animated radar)
 - **Light/dark theme** — toggles both the base map style and UI colors
-- **Color scheme selector**, **motion arrows**, and **nowcast** with full animation support
+- **Color scheme selector** — 14 color schemes plus a raw grayscale (255) option
+- **Motion arrows and nowcast** — with full animation support
 - **Draggable scrubber** — timeline with past/nowcast visual distinction and tick labels
+- **Weather-alerts overlay** — severity-styled WMO alert polygons (toggleable)
+- **Options panel** — collapsible controls for smoothing, snow mask, PNG/WebP output, and 256/512px tile size with HiDPI auto-detection
+- **Storm-cell markers** — light/dark cell-detection labels
+- **Locate Me** — geolocate and zoom to your position
 - **Background preloading** — pre-renders all frames with a progress indicator for smooth playback
 - **Keyboard shortcuts** — Space to play/pause, arrow keys to step through frames
 - **Auto-refresh** — metadata refreshes every 5 minutes to stay current
@@ -1298,3 +1309,5 @@ To use them:
 2. To use your local server, start LibreWXR and select "Local (localhost:8080)" from the source dropdown
 
 These examples serve as reference implementations for production web integrations.
+
+The widget page (`examples/widget.html`) demonstrates the single-location image endpoint from [Widgets and Single-Location Images](#widgets-and-single-location-images) in its purest form: one `<img>` centered on a chosen point, no tile grid and no map library. It fetches the same `weather-maps.json` catalog, cycles past and nowcast frames with play/pause and a small preload pool, and always shows the exact point-tile URL of the image on screen in a click-to-copy box — the drop-in snippet for a weather card, email, or `iframe`. Its API-source selector defaults to the public instance (switch to `Local (localhost:8080)` to target your own server). All configuration lives in one commented block at the top of its script, and it degrades gracefully (auto-retry with backoff, geolocation failures, image load errors).

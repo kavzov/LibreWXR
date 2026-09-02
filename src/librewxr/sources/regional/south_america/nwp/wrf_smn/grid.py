@@ -15,7 +15,7 @@ applying the same Marshall-Palmer Z-R conversion ECMWFGrid /
 ICONEUGrid / DMIDiniGrid / HRDPS / AROMEAntillesGrid use.
 
 Distribution: anonymous AWS Open Data S3 (``s3://smn-ar-wrf`` in
-``us-east-1``), no auth, plain HTTPS.  Each (run, leadtime) is a
+``us-west-2``), no auth, plain HTTPS.  Each (run, leadtime) is a
 single NetCDF4/HDF5 file ~32-36 MB containing about 17 surface fields;
 we download the whole file and extract only the ``PP`` variable
 (~5 MB after decode).  Range-fetching individual HDF5 chunks would
@@ -462,7 +462,7 @@ class WRFSMNGrid(WeatherFieldSourceMixin):
             )
             self._persistent = False
         self._memmap_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(
+        logger.debug(
             "WRF-SMN memmap directory: %s (persistent=%s)",
             self._memmap_dir, self._persistent,
         )
@@ -516,7 +516,7 @@ class WRFSMNGrid(WeatherFieldSourceMixin):
                 self._latest_run_ts = run_ts
             loaded += 1
         if loaded:
-            logger.info("WRF-SMN: loaded %d cached frame(s) from disk", loaded)
+            logger.debug("WRF-SMN: loaded %d cached frame(s) from disk", loaded)
 
         # Second pass: snow masks.  Orphans (no matching frame) are
         # removed so they don't accumulate.
@@ -545,7 +545,7 @@ class WRFSMNGrid(WeatherFieldSourceMixin):
             self._snow_masks[(run_ts, lead_s)] = mm
             snow_loaded += 1
         if snow_loaded:
-            logger.info(
+            logger.debug(
                 "WRF-SMN: loaded %d cached snow mask(s) from disk",
                 snow_loaded,
             )
@@ -853,7 +853,7 @@ class WRFSMNGrid(WeatherFieldSourceMixin):
             self._evict_outside_window(window_start, window_end)
 
             if total_fetched:
-                logger.info(
+                logger.debug(
                     "WRF-SMN: %d hourly frame(s) ingested + %d interpolated "
                     "across %d run(s); store now holds %d frame(s)",
                     total_fetched, total_interpolated,
@@ -1099,7 +1099,7 @@ class WRFSMNGrid(WeatherFieldSourceMixin):
         self._client = None
         if not self._persistent:
             shutil.rmtree(self._memmap_dir, ignore_errors=True)
-            logger.info("WRF-SMN memmap directory cleaned up")
+            logger.debug("WRF-SMN memmap directory cleaned up")
         else:
             logger.info(
                 "WRF-SMN cache retained at %s for warm restart",

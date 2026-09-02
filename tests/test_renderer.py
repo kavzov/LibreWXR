@@ -9,13 +9,17 @@ from PIL import Image
 
 pytestmark = pytest.mark.tiles
 
+from librewxr.colors.schemes import SCHEME_NAMES
 from librewxr.data.regions import REGIONS
 from librewxr.tiles.cache import TileCache
-from librewxr.tiles.coordinates import COMPOSITE_HEIGHT, COMPOSITE_WIDTH
+from librewxr.tiles.coordinates import (
+    COMPOSITE_HEIGHT,
+    COMPOSITE_WIDTH,
+    compute_blur_radius,
+)
 from librewxr.tiles.png_palette import _PALETTE_MIN_COLORS, encode_png
 from librewxr.tiles.renderer import (
     TileGeometry,
-    _compute_blur_radius,
     _compute_nwp_only_geometry,
     compute_tile_geometry,
     present_tile,
@@ -77,7 +81,7 @@ class TestRenderTile:
     def test_all_color_schemes(self, sample_frame_data):
         """All color schemes should produce valid tiles."""
         regions = {"USCOMP": sample_frame_data}
-        for scheme in [0, 1, 2, 3, 4, 5, 6, 7, 8, 255]:
+        for scheme in list(SCHEME_NAMES) + [255]:
             tile = render_tile(
                 regions, z=4, x=3, y=5,
                 tile_size=256, color_scheme=scheme,
@@ -201,7 +205,7 @@ class TestTileGeometryCache:
         )
         assert geom.values.max() > 0, "test fixture has no data at this tile"
         rendered = {}
-        for scheme in (0, 1, 2, 3, 4, 5, 6, 7, 8):
+        for scheme in tuple(SCHEME_NAMES):
             tile = present_tile(geom, color_scheme=scheme, fmt="png")
             assert len(tile) > 0, f"scheme {scheme} produced no bytes"
             img = Image.open(io.BytesIO(tile))
@@ -393,7 +397,7 @@ class TestBlurRadius:
         radii = []
         for z in (5, 8, 11):
             x, y = self._lonlat_to_tile(-90.0, 35.0, z)  # Memphis-ish
-            radii.append(_compute_blur_radius(uscomp, z, x, y, 256))
+            radii.append(compute_blur_radius(uscomp, z, x, y, 256))
         assert radii[0] <= radii[1] < radii[2], (
             f"blur should grow monotonically with zoom, got {radii}"
         )
@@ -405,8 +409,8 @@ class TestBlurRadius:
         z = 10
         us_x, us_y = self._lonlat_to_tile(-90.0, 35.0, z)
         eu_x, eu_y = self._lonlat_to_tile(10.0, 50.0, z)
-        us_blur = _compute_blur_radius(uscomp, z, us_x, us_y, 256)
-        eu_blur = _compute_blur_radius(opera, z, eu_x, eu_y, 256)
+        us_blur = compute_blur_radius(uscomp, z, us_x, us_y, 256)
+        eu_blur = compute_blur_radius(opera, z, eu_x, eu_y, 256)
         assert eu_blur > us_blur, (
             f"coarser region should get more blur, USCOMP={us_blur:.2f} OPERA={eu_blur:.2f}"
         )
@@ -416,7 +420,7 @@ class TestBlurRadius:
         opera = REGIONS["OPERA"]
         z = 12
         x, y = self._lonlat_to_tile(10.0, 50.0, z)
-        r = _compute_blur_radius(opera, z, x, y, 256)
+        r = compute_blur_radius(opera, z, x, y, 256)
         assert r <= 256 / 32 + 1e-6, f"blur {r} exceeded safety cap"
 
 
@@ -735,3 +739,248 @@ class TestEmptyTileFastPath:
             assert present_tile(geom_b, color_scheme=2, fmt=fmt) == present_tile(
                 ref, color_scheme=2, fmt=fmt
             )
+
+
+class TestRegionsWithDataGating:
+    """A region that overlaps the tile but delivered no frame this cycle
+    must not contribute coverage or feather (issue #24).
+
+    ``compute_tile_geometry`` builds ``regions_with_data`` (only regions
+    that actually delivered a frame this cycle) and passes it to both
+    ``_fill_ecmwf_fallback`` and ``_blend_nowcast``.  Before the fix the
+    plain all-overlapping ``regions`` list was passed, so a down or empty
+    region still contributed its coverage mask - blocking the NWP
+    fallback fill and leaving a hole in past frames - and its feather -
+    suppressing the model over its footprint in nowcast frames even
+    though no radar data existed there to protect.
+    """
+
+    # Tile (z=4, x=3, y=5) sits over empty composite space (same tile as
+    # TestEmptyTileFastPath).  The exact location doesn't drive results
+    # here - overlapping_regions / sample_coverage / sample_feather are
+    # patched - but keeping it consistent makes the fixtures
+    # deterministic.
+    _Z, _X, _Y, _TILE = 4, 3, 5, 256
+
+    @staticmethod
+    def _chain(model_arr: np.ndarray) -> MagicMock:
+        chain = MagicMock()
+        chain.has_data.return_value = True
+        chain.sample.return_value = model_arr
+        return chain
+
+    @pytest.fixture(autouse=True)
+    def _pin_noise_floor(self, monkeypatch):
+        from librewxr.config import settings
+        monkeypatch.setattr(settings, "noise_floor_dbz", 10.0)  # threshold 84
+
+    @staticmethod
+    def _patch_two_regions(monkeypatch):
+        """Force the tile to overlap USCOMP + CACOMP; only USCOMP has a frame.
+
+        ``sample_coverage`` and ``sample_feather`` are name-based: CACOMP
+        reports full coverage / full feather (it "overlaps" this tile even
+        though it delivered no frame this cycle), USCOMP reports nothing.
+        """
+        from librewxr.tiles import renderer as renderer_mod
+
+        monkeypatch.setattr(
+            renderer_mod, "overlapping_regions",
+            lambda z, x, y, enabled=None: [
+                REGIONS["USCOMP"], REGIONS["CACOMP"],
+            ],
+        )
+        monkeypatch.setattr(
+            renderer_mod, "sample_coverage",
+            lambda name, lat, lon: (
+                np.ones(lat.shape, dtype=bool)
+                if name == "CACOMP" else np.zeros(lat.shape, dtype=bool)
+            ),
+        )
+        monkeypatch.setattr(
+            renderer_mod, "sample_feather",
+            lambda name, lat, lon: (
+                np.ones(lat.shape, dtype=np.float32)
+                if name == "CACOMP" else np.zeros(lat.shape, dtype=np.float32)
+            ),
+        )
+
+    @staticmethod
+    def _empty_uscomp_frame() -> np.ndarray:
+        return np.zeros((COMPOSITE_HEIGHT, COMPOSITE_WIDTH), dtype=np.uint8)
+
+    def test_past_fill_ignores_data_less_region_coverage(self, monkeypatch):
+        """(1) A down region's coverage must not block the NWP fallback fill."""
+        from librewxr.tiles import renderer as renderer_mod
+
+        self._patch_two_regions(monkeypatch)
+        chain = self._chain(np.full((256, 256), 200, dtype=np.uint8))
+        geom = renderer_mod.compute_tile_geometry(
+            {"USCOMP": self._empty_uscomp_frame()},
+            self._Z, self._X, self._Y, tile_size=256,
+            nwp_chain=chain, frame_timestamp=1700000000,
+        )
+        assert geom.is_transparent is False  # pre-fix: tier1_post_fill
+        assert (geom.values == 200).all()
+
+    def test_nowcast_ignores_data_less_region_feather(self, monkeypatch):
+        """(2) A down region's feather must not suppress the model blend."""
+        from librewxr.tiles import renderer as renderer_mod
+
+        self._patch_two_regions(monkeypatch)
+        chain = self._chain(np.full((256, 256), 150, dtype=np.uint8))
+        geom = renderer_mod.compute_tile_geometry(
+            {"USCOMP": self._empty_uscomp_frame()},
+            self._Z, self._X, self._Y, tile_size=256,
+            nwp_chain=chain, frame_timestamp=1700000000, nowcast_blend=0.5,
+        )
+        assert geom.is_transparent is False  # pre-fix: tier1_post_blend
+        assert (geom.values == 150).all()
+
+
+class TestNowcastFloorPin:
+    """The nowcast blend must not let a dry model pixel erase real radar.
+
+    Model pixel value 0 encodes -32 dBZ, the bottom of the encoding, NOT
+    "no data" - so blending toward it drags real radar echoes below the
+    display noise floor and the post-blend thresholding zeroes them
+    (issue #24).  ``_blend_nowcast`` raises the dry (blurred) model term
+    up to the noise floor wherever the radar itself carries a live echo:
+    the blend asymptotes toward ``floor + w * (radar - floor)``, so
+    echoes fade toward the faintest visible shade as the radar weight
+    decays, are never erased, and keep their scaled intensity gradient
+    (a hard clamp at the floor flattened every echo to one flat color).
+    """
+
+    # Tile (z=4, x=3, y=5) sits over empty composite space (same tile as
+    # TestEmptyTileFastPath).  The exact location doesn't drive results
+    # here — sample_feather is patched — but keeping it consistent makes
+    # the fixtures deterministic.
+    _Z, _X, _Y, _TILE = 4, 3, 5, 256
+
+    @staticmethod
+    def _chain(model_arr: np.ndarray) -> MagicMock:
+        chain = MagicMock()
+        chain.has_data.return_value = True
+        chain.sample.return_value = model_arr
+        return chain
+
+    @pytest.fixture(autouse=True)
+    def _pin_noise_floor(self, monkeypatch):
+        from librewxr.config import settings
+        monkeypatch.setattr(settings, "noise_floor_dbz", 10.0)  # threshold 84
+
+    @staticmethod
+    def _feather_all_ones() -> callable:
+        return lambda name, lat, lon: np.ones(lat.shape, dtype=np.float32)
+
+    def _blend(self, radar, model, blend_weight, monkeypatch):
+        """Call _blend_nowcast with feather=1 everywhere, floor=10.0."""
+        from librewxr.tiles import renderer as renderer_mod
+
+        monkeypatch.setattr(renderer_mod, "sample_feather", self._feather_all_ones())
+        return renderer_mod._blend_nowcast(
+            radar, [REGIONS["USCOMP"]], self._Z, self._X, self._Y,
+            self._TILE, 0, self._chain(model), blend_weight=blend_weight,
+        )
+
+    def test_dry_model_fades_radar_toward_floor(self, monkeypatch):
+        """(1) Dry model (all 0): radar asymptotes toward the floor."""
+        radar = np.full((256, 256), 104, dtype=np.uint8)
+        model = np.zeros((256, 256), dtype=np.uint8)
+        result = self._blend(radar, model, 0.5, monkeypatch)
+        assert (result == 94).all()  # 0.5*104 + 0.5*84; pre-fix: 52
+
+    def test_model_above_floor_blends_normally(self, monkeypatch):
+        """(2) Model with real precip still blends exactly as before."""
+        radar = np.full((256, 256), 104, dtype=np.uint8)
+        model = np.full((256, 256), 200, dtype=np.uint8)
+        result = self._blend(radar, model, 0.5, monkeypatch)
+        assert (result == 152).all()  # clip(0.5*104 + 0.5*200 + 0.5)
+
+    def test_blur_fringe_fades_toward_floor(self, monkeypatch):
+        """(3) Gaussian fringe around a model echo must not eat radar.
+
+        The 3x3 Gaussian leaves a ~32 fringe on the orthogonal neighbours
+        of a single 255 model pixel — below the 84 floor, so the fringe
+        is raised to the floor and the blend asymptotes to 94 instead of
+        diluting radar to 68 (or hard-pinning to 84).
+        """
+        radar = np.full((256, 256), 104, dtype=np.uint8)
+        model = np.zeros((256, 256), dtype=np.uint8)
+        model[128, 128] = 255
+        result = self._blend(radar, model, 0.5, monkeypatch)
+        for r, c in ((128, 127), (128, 129), (127, 128), (129, 128)):
+            assert result[r, c] == 94  # 0.5*104 + 0.5*84; pre-fix: 68
+
+    def test_floor_disabled_keeps_old_behavior(self, monkeypatch):
+        """(4) Noise floor disabled (-33) -> the guard is a no-op."""
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "noise_floor_dbz", -33.0)
+        radar = np.full((256, 256), 104, dtype=np.uint8)
+        model = np.zeros((256, 256), dtype=np.uint8)
+        result = self._blend(radar, model, 0.5, monkeypatch)
+        assert (result == 52).all()  # clip(0.5*104 + 0.5)
+
+    def test_zero_blend_weight_is_pure_model(self, monkeypatch):
+        """(5) blend_weight=0 -> pure model output, guard skipped."""
+        radar = np.full((256, 256), 104, dtype=np.uint8)
+        model = np.zeros((256, 256), dtype=np.uint8)
+        result = self._blend(radar, model, 0.0, monkeypatch)
+        assert (result == 0).all()
+
+    def test_both_empty_no_hallucination(self, monkeypatch):
+        """(6) Neither source has anything -> still nothing."""
+        radar = np.zeros((256, 256), dtype=np.uint8)
+        model = np.zeros((256, 256), dtype=np.uint8)
+        result = self._blend(radar, model, 0.5, monkeypatch)
+        assert (result == 0).all()
+
+    def test_dry_model_fades_but_never_erases(self, monkeypatch):
+        """(7) Over dry model, radar fades with lead time but stays alive.
+
+        Floor at 10.0 -> threshold 84; radar echo 104.  Gated pixels
+        asymptote to ``w*104 + (1-w)*84``: 0.82 -> 100, 0.5 -> 94,
+        0.32 -> 90, 0.2 -> 88.  Every result is >= 84 (survives the
+        post-blend noise-floor cut, so the painted area is never erased)
+        and < 104 (always dimmer than pure radar).
+        """
+        radar = np.full((256, 256), 104, dtype=np.uint8)
+        model = np.zeros((256, 256), dtype=np.uint8)
+        for weight, expected in ((0.82, 100), (0.5, 94), (0.32, 90), (0.2, 88)):
+            result = self._blend(radar, model, weight, monkeypatch)
+            assert (result == expected).all()
+            assert (result >= 84).all()
+            assert (result < 104).all()
+
+    def test_subfloor_radar_is_not_promoted(self, monkeypatch):
+        """(8) Sub-floor radar must NOT be promoted into a painted echo."""
+        radar = np.full((256, 256), 60, dtype=np.uint8)
+        model = np.zeros((256, 256), dtype=np.uint8)
+        result = self._blend(radar, model, 0.5, monkeypatch)
+        assert (result == 30).all()  # live_radar gate fails -> model not raised
+
+    def test_strong_echo_keeps_intensity(self, monkeypatch):
+        """(9) Strong echoes keep their scaled fade: 0.5*200 + 0.5*84 = 142."""
+        radar = np.full((256, 256), 200, dtype=np.uint8)
+        model = np.zeros((256, 256), dtype=np.uint8)
+        result = self._blend(radar, model, 0.5, monkeypatch)
+        assert (result == 142).all()  # was 100 under the clamp
+
+    def test_gradient_survives_over_dry_model(self, monkeypatch):
+        """(10) Distinct echo levels stay distinct over a dry model.
+
+        Regression test for the flat-silhouette complaint: a hard clamp
+        at the floor flattened every echo to one flat color.  Two echo
+        levels (140 / 200) over an all-zero model at w=0.32 must remain
+        different: 0.32*140 + 0.68*84 = 101.92 -> 102 and
+        0.32*200 + 0.68*84 = 121.12 -> 121, both >= 84.
+        """
+        radar = np.full((256, 256), 140, dtype=np.uint8)
+        radar[128:, :] = 200
+        model = np.zeros((256, 256), dtype=np.uint8)
+        result = self._blend(radar, model, 0.32, monkeypatch)
+        assert (result[:128, :] == 102).all()
+        assert (result[128:, :] == 121).all()
+        assert (result >= 84).all()

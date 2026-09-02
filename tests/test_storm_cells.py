@@ -5,6 +5,7 @@ StormCellGenerator orchestration."""
 
 import asyncio
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,11 +35,13 @@ _DEFAULT_PX_TO_KM2 = _DEFAULT_PS_LON_KM * _DEFAULT_PS_LAT_KM  # ~1.2321
 def _make_region(
     name: str = "SYNTH_REGION",
     pixel_size: float = _DEFAULT_PS,
+    storm_cells: bool = True,
 ) -> RegionDef:
     return RegionDef(
         name=name,
         west=0.0, east=10.0, south=0.0, north=10.0,
         pixel_size=pixel_size, group="TEST",
+        storm_cells=storm_cells,
     )
 
 
@@ -252,6 +255,32 @@ class TestDetectStormCells:
         assert "SYNTH_REGION" in result
         assert "SYNTH_REGION_2" not in result
 
+    @pytest.mark.storm_cells
+    def test_skips_regions_flagged_storm_cells_false(self, syn_regions, monkeypatch):
+        """Regions with ``RegionDef.storm_cells=False`` (the coarse global
+        fill layer) are skipped even when enabled."""
+        from librewxr.data import regions as _regions_mod
+
+        no_cells = _make_region("SYNTH_NO_CELLS", storm_cells=False)
+        monkeypatch.setitem(_regions_mod.REGIONS, "SYNTH_NO_CELLS", no_cells)
+
+        frame = np.zeros((100, 100), dtype=np.uint8)
+        frame[20:30, 30:40] = 160
+        result = detect_storm_cells(
+            latest_frame_regions={
+                "SYNTH_REGION": frame,
+                "SYNTH_NO_CELLS": frame,
+            },
+            enabled_regions=["SYNTH_REGION", "SYNTH_NO_CELLS"],
+            flows_by_region=None,
+            min_dbz=40,
+            min_area_km2=2.0,
+            fetch_interval_s=600,
+        )
+        assert "SYNTH_REGION" in result
+        assert len(result["SYNTH_REGION"]) == 1
+        assert "SYNTH_NO_CELLS" not in result
+
 
 # ---------------------------------------------------------------------------
 # StormCellStore tests
@@ -322,6 +351,66 @@ class TestStormCellStore:
             store.cleanup()
 
     @pytest.mark.storm_cells
+    async def test_replace_cells_bumps_version(self):
+        """Each replace_cells swap bumps cells_version by exactly 1."""
+        store = StormCellStore()
+        try:
+            assert store.cells_version == 0
+            arr = np.array([
+                (10.0, 20.0, 50.0, 61.6, 45.0,
+                 0.0, 0.0, float("nan"), float("nan")),
+            ], dtype=_CELL_DTYPE)
+            await store.replace_cells({"TEST": arr})
+            assert store.cells_version == 1
+            await store.replace_cells({"TEST": arr})
+            assert store.cells_version == 2
+        finally:
+            store.cleanup()
+
+    @pytest.mark.storm_cells
+    async def test_state_round_trip_preserves_version(self, tmp_path):
+        """__getstate__/__setstate__ round-trips cells_version."""
+        store = StormCellStore(cache_dir=tmp_path)
+        try:
+            arr = np.array([
+                (10.0, 20.0, 50.0, 61.6, 45.0,
+                 0.0, 0.0, float("nan"), float("nan")),
+            ], dtype=_CELL_DTYPE)
+            await store.replace_cells({"TEST": arr})
+            await store.replace_cells({"TEST": arr})
+            assert store.cells_version == 2
+
+            state = store.__getstate__()
+            new_store = StormCellStore()
+            new_store.__setstate__(state)
+            assert new_store.cells_version == 2
+            new_store.cleanup()
+        finally:
+            store.cleanup()
+
+    @pytest.mark.storm_cells
+    async def test_setstate_missing_version_bumps_local(self, tmp_path):
+        """A legacy snapshot without ``cells_version`` bumps the local
+        version by 1 (conservative fallback) instead of resetting it."""
+        store = StormCellStore(cache_dir=tmp_path)
+        try:
+            arr = np.array([
+                (10.0, 20.0, 50.0, 61.6, 45.0,
+                 0.0, 0.0, float("nan"), float("nan")),
+            ], dtype=_CELL_DTYPE)
+            await store.replace_cells({"TEST": arr})
+            state = store.__getstate__()
+            del state["cells_version"]  # simulate an older pipeline snapshot
+
+            new_store = StormCellStore()
+            assert new_store.cells_version == 0
+            new_store.__setstate__(state)
+            assert new_store.cells_version == 1
+            new_store.cleanup()
+        finally:
+            store.cleanup()
+
+    @pytest.mark.storm_cells
     async def test_max_cap_truncation(self):
         """More than MAX_CELLS_PER_REGION cells are truncated to MAX."""
         store = StormCellStore()
@@ -343,6 +432,125 @@ class TestStormCellStore:
             assert counts["TRUNC"] == MAX_CELLS_PER_REGION
         finally:
             store.cleanup()
+
+
+class TestStormCellStoreTmpIsolation:
+    """Cross-process tmp-file isolation on the shared (multi-mode) storm-cells dir.
+
+    In multi mode the pipeline writes ``storm_cells/cells_*.dat`` files
+    that render workers memmap read-only via state.json.  Two writers
+    (overlapping pipeline processes during a deploy) can race on the same
+    final name, and a render-worker boot must never sweep the pipeline's
+    in-flight tmp files.  These tests pin both halves of the fix: unique
+    (pid+uuid) tmp names in ``_to_memmap``, and ``cleanup_tmp=False`` for
+    readers.
+    """
+
+    def test_to_memmap_tmp_names_are_unique(self, tmp_path, monkeypatch):
+        """Two writes to the same final name must never share a tmp file.
+
+        The tmp name embeds pid + uuid (mirroring ``coord_store.publish``),
+        so concurrent writers can't collide on the same ``.tmp`` path and
+        steal each other's in-flight file.  The pre-fix deterministic
+        ``cells_<region>.dat.tmp`` produced identical paths; this test
+        must fail against that code.
+        """
+        store = StormCellStore(cache_dir=tmp_path)
+        replaced_srcs: list[str] = []
+
+        real_replace = os.replace
+
+        def _capture_replace(src, dst):
+            replaced_srcs.append(str(src))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(
+            "librewxr.data.storm_cells.os.replace", _capture_replace,
+        )
+        arr = np.array([
+            (10.0, 20.0, 50.0, 61.6, 45.0,
+             0.0, 0.0, 30.0, 45.0),
+        ], dtype=_CELL_DTYPE)
+        store._to_memmap("cells_USCOMP", arr)
+        store._to_memmap("cells_USCOMP", arr)
+
+        assert len(replaced_srcs) == 2
+        # pid + uuid naming (mirrors coord_store.publish), distinct per
+        # write.  The old ``cells_USCOMP.dat.tmp`` fails the regex AND
+        # produces two identical paths.
+        pattern = re.compile(r"^cells_USCOMP\.dat\.\d+\.[0-9a-f]{32}\.tmp$")
+        assert all(pattern.match(Path(name).name) for name in replaced_srcs)
+        assert replaced_srcs[0] != replaced_srcs[1]
+
+    def test_concurrent_writer_does_not_steal_tmp(self, tmp_path, monkeypatch):
+        """Deterministic cross-process race: store B completes its full
+        write for the same name while store A's ``_to_memmap`` is in flight.
+
+        With unique tmp names A's ``os.replace`` still succeeds (B never
+        touched A's tmp path) and the final ``.dat`` holds valid content.
+        Under the pre-fix deterministic ``cells_<region>.dat.tmp``, B's
+        rename removes the file A is about to rename and A raises
+        ``FileNotFoundError``.
+        """
+        name = "cells_USCOMP"
+        data_a = np.array([
+            (7.0, 20.0, 50.0, 61.6, 45.0,
+             0.0, 0.0, 30.0, 45.0),
+        ], dtype=_CELL_DTYPE)
+        data_b = np.array([
+            (9.0, 20.0, 50.0, 61.6, 45.0,
+             0.0, 0.0, 30.0, 45.0),
+        ], dtype=_CELL_DTYPE)
+
+        store_a = StormCellStore(cache_dir=tmp_path)
+        store_b = StormCellStore(cache_dir=tmp_path)
+
+        real_replace = os.replace
+        b_completed = False
+
+        def _coordinated_replace(src, dst):
+            nonlocal b_completed
+            if not b_completed:
+                # B runs its whole write (tmp -> final) before A's rename.
+                b_completed = True
+                store_b._to_memmap(name, data_b)
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(
+            "librewxr.data.storm_cells.os.replace", _coordinated_replace,
+        )
+
+        result = store_a._to_memmap(name, data_a)  # must not raise
+
+        final = tmp_path / "storm_cells" / f"{name}.dat"
+        assert final.exists()
+        np.testing.assert_array_equal(result, data_a)
+        np.testing.assert_array_equal(
+            np.memmap(final, dtype=data_a.dtype, mode="r", shape=data_a.shape),
+            data_a,
+        )
+
+    def test_reader_store_boot_preserves_inflight_tmp(self, tmp_path):
+        """A reader (render-worker) boot must not delete the pipeline's
+        in-flight ``*.tmp`` file in the shared storm-cells dir.
+
+        ``cleanup_tmp=False`` (the render-only lifespan) leaves it alone;
+        the default ``True`` (the pipeline's own boot) still sweeps stale
+        leftovers.  Pins both sides of the contract.
+        """
+        cells_dir = tmp_path / "storm_cells"
+        cells_dir.mkdir(parents=True, exist_ok=True)
+        inflight = cells_dir / "something.dat.tmp"
+        inflight.write_bytes(b"\x00" * 16)
+
+        # Reader boot: sweep must NOT run.
+        StormCellStore(cache_dir=tmp_path, cleanup_tmp=False)
+        assert inflight.exists()
+
+        # Writer (pipeline) boot: default sweep removes stale tmp files.
+        inflight.write_bytes(b"\x00" * 16)
+        StormCellStore(cache_dir=tmp_path)
+        assert not inflight.exists()
 
 
 # ---------------------------------------------------------------------------

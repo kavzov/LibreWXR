@@ -2,6 +2,8 @@
 # Copyright (C) 2026 Joshua Kimsey
 """Tests for precipitation nowcasting: store, generator, and optical flow."""
 import asyncio
+import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +19,8 @@ from librewxr.data.nowcast import (
     NowcastGenerator,
     NowcastStore,
     _clamp_flow,
+    _coarsen_frame,
+    _coarsen_sigma_km,
     _compute_flow,
     _coverage_degraded,
     _extrapolate_forward,
@@ -36,6 +40,13 @@ def _make_blob(cy: int, cx: int, radius: int = 20, value: int = 150) -> np.ndarr
     mask = (ys - cy) ** 2 + (xs - cx) ** 2 <= radius ** 2
     grid[mask] = value
     return grid
+
+
+def _disk(h: int, w: int, cy: int, cx: int, radius: int, value: int = 150) -> np.ndarray:
+    """Circular blob on an arbitrary-size grid (no seam wrap)."""
+    ys, xs = np.mgrid[0:h, 0:w]
+    mask = (ys - cy) ** 2 + (xs - cx) ** 2 <= radius ** 2
+    return np.where(mask, value, 0).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +208,117 @@ def test_animation_generator_backfills_history_incrementally():
     assert retained_valid == {150, 450}
 
 
+class TestNowcastStoreTmpIsolation:
+    """Cross-process tmp-file isolation on the shared (multi-mode) nowcast dir.
+
+    In multi mode the pipeline writes ``nowcast/*.dat`` files that render
+    workers memmap read-only via state.json.  Two writers (overlapping
+    pipeline processes during a deploy) can race on the same final name,
+    and a render-worker boot must never sweep the pipeline's in-flight
+    tmp files.  These tests pin both halves of the fix: unique (pid+uuid)
+    tmp names in ``_to_memmap``, and ``cleanup_tmp=False`` for readers.
+    """
+
+    def test_to_memmap_tmp_names_are_unique(self, tmp_path, monkeypatch):
+        """Two writes to the same final name must never share a tmp file.
+
+        The tmp name embeds pid + uuid (mirroring ``coord_store.publish``),
+        so concurrent writers can't collide on the same ``.tmp`` path and
+        steal each other's in-flight file.  The pre-fix deterministic
+        ``<name>.dat.tmp`` produced identical paths; this test must fail
+        against that code.
+        """
+        store = NowcastStore(cache_dir=tmp_path)
+        replaced_srcs: list[str] = []
+
+        real_replace = os.replace
+
+        def _capture_replace(src, dst):
+            replaced_srcs.append(str(src))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(
+            "librewxr.data.nowcast.os.replace", _capture_replace,
+        )
+        data = np.zeros((4, 4), dtype=np.uint8)
+        store._to_memmap("frame_1000_USCOMP", data)
+        store._to_memmap("frame_1000_USCOMP", data)
+
+        assert len(replaced_srcs) == 2
+        # pid + uuid naming (mirrors coord_store.publish), distinct per
+        # write.  The old ``frame_1000_USCOMP.dat.tmp`` fails the regex
+        # AND produces two identical paths.
+        pattern = re.compile(r"^frame_1000_USCOMP\.dat\.\d+\.[0-9a-f]{32}\.tmp$")
+        assert all(
+            pattern.match(Path(name).name) for name in replaced_srcs
+        )
+        assert replaced_srcs[0] != replaced_srcs[1]
+
+    def test_concurrent_writer_does_not_steal_tmp(self, tmp_path, monkeypatch):
+        """Deterministic cross-process race: store B completes its full
+        write for the same name while store A's ``_to_memmap`` is in flight.
+
+        With unique tmp names A's ``os.replace`` still succeeds (B never
+        touched A's tmp path) and the final ``.dat`` holds valid content.
+        Under the pre-fix deterministic ``<name>.dat.tmp``, B's rename
+        removes the file A is about to rename and A raises
+        ``FileNotFoundError``.
+        """
+        name = "frame_1234567890_USCOMP"
+        data_a = np.full((4, 4), 7, dtype=np.uint8)
+        data_b = np.full((4, 4), 9, dtype=np.uint8)
+
+        store_a = NowcastStore(cache_dir=tmp_path)
+        store_b = NowcastStore(cache_dir=tmp_path)
+
+        real_replace = os.replace
+        b_completed = False
+
+        def _coordinated_replace(src, dst):
+            nonlocal b_completed
+            if not b_completed:
+                # B runs its whole write (tmp -> final) before A's rename.
+                b_completed = True
+                store_b._to_memmap(name, data_b)
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(
+            "librewxr.data.nowcast.os.replace", _coordinated_replace,
+        )
+
+        result = store_a._to_memmap(name, data_a)  # must not raise
+
+        final = tmp_path / "nowcast" / f"{name}.dat"
+        assert final.exists()
+        np.testing.assert_array_equal(result, data_a)
+        np.testing.assert_array_equal(
+            np.memmap(final, dtype=np.uint8, mode="r", shape=data_a.shape),
+            data_a,
+        )
+
+    def test_reader_store_boot_preserves_inflight_tmp(self, tmp_path):
+        """A reader (render-worker) boot must not delete the pipeline's
+        in-flight ``*.tmp`` file in the shared nowcast dir.
+
+        ``cleanup_tmp=False`` (the render-only lifespan) leaves it alone;
+        the default ``True`` (the pipeline's own boot) still sweeps stale
+        leftovers.  Pins both sides of the contract.
+        """
+        nowcast_dir = tmp_path / "nowcast"
+        nowcast_dir.mkdir(parents=True, exist_ok=True)
+        inflight = nowcast_dir / "something.dat.tmp"
+        inflight.write_bytes(b"\x00" * 16)
+
+        # Reader boot: sweep must NOT run.
+        NowcastStore(cache_dir=tmp_path, cleanup_tmp=False)
+        assert inflight.exists()
+
+        # Writer (pipeline) boot: default sweep removes stale tmp files.
+        inflight.write_bytes(b"\x00" * 16)
+        NowcastStore(cache_dir=tmp_path)
+        assert not inflight.exists()
+
+
 # ---------------------------------------------------------------------------
 # Optical flow tests
 # ---------------------------------------------------------------------------
@@ -266,6 +388,127 @@ class TestExtrapolateForward:
         com1 = np.average(np.arange(W), weights=result1.sum(axis=0).astype(float) + 1e-9)
         com2 = np.average(np.arange(W), weights=result2.sum(axis=0).astype(float) + 1e-9)
         assert com2 > com1
+
+
+# ---------------------------------------------------------------------------
+# Lead-time coarsening (progressive Gaussian smoothing of extrapolation)
+# ---------------------------------------------------------------------------
+# As forecast lead time grows, the internally extrapolated field is
+# smoothed with a Gaussian whose sigma ramps quadratically in km, so by
+# T+60 the effective resolution has coarsened from native (~1 km) to
+# ~3 km (at the default max_km; these unit tests pass explicit values).
+# This low-passes the high-frequency melt/filament artifacts of
+# long optical-flow extrapolation and honestly encodes the growing
+# positional uncertainty.  External contribution frames are never
+# smoothed.
+
+
+class TestCoarsen:
+    """Lead-time coarsening: sigma ramp, frame smoothing, seam wrap."""
+
+    def test_sigma_quadratic_ramp(self):
+        """Quadratic ramp: negligible at T+10, full max_km at the last
+        blend step, clamped beyond it (t is clamped to 1)."""
+        assert _coarsen_sigma_km(1, 6, 4.0) == pytest.approx(4.0 / 36.0)  # ≈ 0.111
+        assert _coarsen_sigma_km(3, 6, 4.0) == pytest.approx(1.0)
+        assert _coarsen_sigma_km(6, 6, 4.0) == pytest.approx(4.0)
+        # Step beyond the last blend step clamps t to 1 → stays at max_km.
+        assert _coarsen_sigma_km(9, 6, 4.0) == pytest.approx(4.0)
+
+    def test_coarsen_frame_noop_below_threshold(self):
+        """Sigma < 0.4 px is invisible — return the input unchanged."""
+        blob = _make_blob(60, 120, radius=5, value=150)
+        out = _coarsen_frame(blob, 0.0, wrap=False)
+        assert out is blob
+        assert np.array_equal(out, blob)
+        out_wrap = _coarsen_frame(blob, 0.3, wrap=True)
+        assert out_wrap is blob
+        assert np.array_equal(out_wrap, blob)
+
+    def test_coarsen_frame_smooths_blob(self):
+        """Blur preserves shape/dtype, reduces the peak, approximately
+        conserves mass, and spreads the nonzero footprint outward."""
+        blob = _make_blob(60, 120, radius=5, value=150)
+        out = _coarsen_frame(blob, 3.0, wrap=False)
+        assert out.shape == blob.shape
+        assert out.dtype == np.uint8
+        assert out.max() < blob.max()  # peak reduced
+        total_in = int(np.sum(blob, dtype=np.int64))
+        total_out = int(np.sum(out, dtype=np.int64))
+        # rint/clip losses are within a few percent.
+        assert 0.95 * total_in <= total_out <= 1.05 * total_in
+        assert np.count_nonzero(out) > np.count_nonzero(blob)
+
+    def test_coarsen_frame_wrap_seam_continuity(self):
+        """wrap=True blurs mass across the ±180° seam (both sides gain
+        nonzero values); wrap=False leaves the far side at zero."""
+        h, w = 60, 100
+        blob = _disk(h, w, 30, 0, 8, value=150)  # straddles column 0
+        sigma_px = 3.0
+        out_wrap = _coarsen_frame(blob, sigma_px, wrap=True)
+        out_nowrap = _coarsen_frame(blob, sigma_px, wrap=False)
+        assert out_wrap.shape == blob.shape
+        assert out_wrap.dtype == np.uint8
+        # Seam continuity: blurred mass on BOTH sides of the seam.
+        assert out_wrap[:, :8].any(), "east side of the seam must carry mass"
+        assert out_wrap[:, w - 8 :].any(), "west side of the seam must carry mass"
+        # Without wrap, the far side stays zero — no mass teleports.
+        assert not out_nowrap[:, w - 8 :].any()
+
+    def test_generate_sync_coarsens_late_frames(self):
+        """Zero-flow stationary blob: the T+60 frame is Gaussian-smoothed
+        (peak strictly lower than T+10), shapes/dtypes unchanged."""
+        blob = _make_blob(60, 120, radius=5, value=150)
+        frames, flows = NowcastGenerator._generate_sync(
+            {"USCOMP": blob}, {"USCOMP": blob},
+            latest_ts=1000, n_steps=6, interval=600,
+        )
+        assert "USCOMP" in flows
+        step1 = frames[0].regions["USCOMP"]
+        step6 = frames[-1].regions["USCOMP"]
+        assert step1.shape == step6.shape == (H, W)
+        assert step1.dtype == np.uint8 and step6.dtype == np.uint8
+        assert step6.max() < step1.max()
+
+    def test_generate_sync_coarsen_disabled_matches_raw_warp(self, monkeypatch):
+        """With coarsening disabled, the step-6 frame is bit-identical to
+        the raw (un-coarsened) zero-flow warp."""
+        from librewxr.config import settings
+
+        blob = _make_blob(60, 120, radius=5, value=150)
+        monkeypatch.setattr(settings, "nowcast_coarsen_enabled", False)
+        frames, flows = NowcastGenerator._generate_sync(
+            {"USCOMP": blob}, {"USCOMP": blob},
+            latest_ts=1000, n_steps=6, interval=600,
+        )
+        # Stationary blob → no clamp fires, so the stored flow is the
+        # exact field the warp path used; recomputing the warp directly
+        # reproduces the un-coarsened step-6 frame bit-for-bit.
+        raw = _extrapolate_forward(blob, flows["USCOMP"], steps=6)
+        assert np.array_equal(frames[-1].regions["USCOMP"], raw)
+
+    def test_external_frames_not_coarsened(self, monkeypatch):
+        """External contribution frames pass through _generate_sync
+        unchanged even with coarsening enabled at a late step."""
+        from librewxr.config import settings
+
+        blob = _make_blob(60, 100, radius=20, value=150)
+        external_frame = np.full((H, W), 200, dtype=np.uint8)  # sentinel
+        # Step 3 (ts 1000 + 3*600 = 2800) is served by the external frame.
+        external_by_region = {"USCOMP": {2800: external_frame}}
+
+        monkeypatch.setattr(settings, "nowcast_coarsen_enabled", True)
+        monkeypatch.setattr(settings, "nowcast_coarsen_max_km", 4.0)
+        frames, flows = NowcastGenerator._generate_sync(
+            {"USCOMP": blob}, {"USCOMP": blob},
+            latest_ts=1000, n_steps=3, interval=600,
+            external_by_region=external_by_region,
+        )
+        assert len(frames) == 3
+        frame = frames[2].regions["USCOMP"]
+        assert frame.dtype == np.uint8
+        assert frame.shape == (H, W)
+        np.testing.assert_array_equal(frame, external_frame)
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +865,94 @@ class TestExtrapolationClampingPreventsStreaks:
         # 0.01° → max ≈ 30 px/step.
         mag = np.sqrt(flows["USCOMP"][..., 0] ** 2 + flows["USCOMP"][..., 1] ** 2)
         assert mag.max() <= 30.5  # within rounding of the cap
+
+
+# ---------------------------------------------------------------------------
+# Dateline wrap (full-longitude regions)
+# ---------------------------------------------------------------------------
+#
+# RRQPE is a full-longitude (global) radar region: content that advects
+# across the ±180° seam must re-enter on the other side instead of being
+# zeroed at a hard edge.  Both the Farneback flow computation and the
+# inverse-warp remap wrap-pad the column axis for regions where
+# ``RegionDef.is_global``; every other region keeps the legacy path.
+
+
+class TestDatelineWrap:
+    _H, _W = 60, 100
+
+    @pytest.fixture
+    def global_region(self, monkeypatch):
+        """Register a synthetic full-longitude region in REGIONS."""
+        from librewxr.data import regions as _regions_mod
+        from librewxr.data.regions import RegionDef
+
+        r = RegionDef(
+            name="GLOBAL_REGION",
+            west=-180.0, east=180.0, south=-60.0, north=70.0,
+            pixel_size=0.1, pixel_size_y=0.1, group="TEST",
+            grid_width=self._W, grid_height=self._H,
+        )
+        monkeypatch.setitem(_regions_mod.REGIONS, "GLOBAL_REGION", r)
+        return r
+
+    def test_extrapolate_forward_wrap_reenters_seam_content(self):
+        """A blob just west of the seam advecting east must re-enter on
+        the east side of the seam (content on BOTH sides afterwards)."""
+        h, w = self._H, self._W
+        latest = _disk(h, w, 30, w - 6, 8)  # cols 86..99, fully west
+        flow = np.zeros((h, w, 2), dtype=np.float32)
+        flow[..., 0] = 3.0
+
+        out_nowrap = _extrapolate_forward(latest, flow, steps=3, wrap=False)
+        assert not out_nowrap[:, :8].any()  # lost at the seam
+        assert int((out_nowrap > 0).sum()) < int((latest > 0).sum())
+
+        out_wrap = _extrapolate_forward(latest, flow, steps=3, wrap=True)
+        assert out_wrap[:, :8].any(), "content must re-enter east of the seam"
+        assert out_wrap[:, w - 8 :].any(), "trailing content stays west of the seam"
+        # Mass is preserved through the wrap (vs. the ~3/4 lost without it).
+        assert int((out_wrap > 0).sum()) >= 0.9 * int((latest > 0).sum())
+
+    def test_extrapolate_forward_wrap_zero_flow_identity(self):
+        """wrap=True with zero flow must reproduce the frame exactly."""
+        h, w = self._H, self._W
+        latest = _disk(h, w, 30, w - 6, 8)
+        flow = np.zeros((h, w, 2), dtype=np.float32)
+        out = _extrapolate_forward(latest, flow, steps=3, wrap=True)
+        assert np.array_equal(out, latest)
+
+    def test_generate_sync_global_region_seam_survives(self, global_region):
+        """End-to-end: Farneback between two seam-adjacent frames and a
+        3-step warp keeps the blob on BOTH sides of the seam."""
+        h, w = self._H, self._W
+        prev = _disk(h, w, 30, w - 9, 8)
+        latest = _disk(h, w, 30, w - 6, 8)
+        frames, flows = NowcastGenerator._generate_sync(
+            {"GLOBAL_REGION": prev}, {"GLOBAL_REGION": latest},
+            latest_ts=1000, n_steps=3, interval=600,
+        )
+        assert len(frames) == 3
+        assert "GLOBAL_REGION" in flows
+        # Flow is stored at the unpadded grid shape.
+        assert flows["GLOBAL_REGION"].shape == (h, w, 2)
+        out = frames[-1].regions["GLOBAL_REGION"]
+        assert out.shape == (h, w)
+        assert out[:, :8].any(), "blob must re-enter east of the seam"
+        assert out[:, w - 8 :].any(), "blob tail must remain west of the seam"
+
+    def test_non_global_region_path_unchanged(self):
+        """A non-global region keeps the legacy shapes (no padding) and
+        the pre-refactor behaviour."""
+        blob0 = _make_blob(60, 100)
+        blob1 = _make_blob(60, 110)
+        frames, flows = NowcastGenerator._generate_sync(
+            {"USCOMP": blob0}, {"USCOMP": blob1},
+            latest_ts=1000, n_steps=2, interval=600,
+        )
+        assert flows["USCOMP"].shape == (H, W, 2)
+        assert frames[0].regions["USCOMP"].shape == (H, W)
+        assert frames[0].regions["USCOMP"].dtype == np.uint8
 
 
 # ---------------------------------------------------------------------------
@@ -1076,8 +1407,17 @@ class TestNowcastStoreNWPFlow:
     @pytest.mark.asyncio
     async def test_nwp_flow_absent_in_old_snapshot(self, tmp_path):
         """Old snapshots written before the hybrid arrow path omit
-        ``nwp_flow``; ``__setstate__`` must treat absence as ``None``."""
+        ``nwp_flow``; ``__setstate__`` must treat absence as ``None``.
+        The producer holds a frame so ``__getstate__`` returns a dict
+        (an all-empty store now serializes to ``None``)."""
         producer = NowcastStore(cache_dir=tmp_path)
+        await producer.replace_all([
+            NowcastFrame(
+                timestamp=1000,
+                blend_weight=0.8,
+                regions={"A": np.ones((4, 4), dtype=np.uint8)},
+            ),
+        ])
         state = producer.__getstate__()
         # Simulate an old snapshot by removing the key entirely.
         del state["nwp_flow"]
@@ -1085,6 +1425,190 @@ class TestNowcastStoreNWPFlow:
         consumer = NowcastStore()
         consumer.__setstate__(state)
         assert await consumer.get_nwp_flow() is None
+
+
+class TestNowcastStoreFlowVersion:
+    """Monotonic content version for the flow fields (radar + NWP).
+
+    ``flow_version`` bumps on every ``replace_flows`` /
+    ``replace_nwp_flow`` swap and ships through state.json so render
+    workers can key shared-store overlay tiles by flow identity.
+    """
+
+    @pytest.mark.asyncio
+    async def test_replace_flows_bumps_version_by_one(self, tmp_path):
+        store = NowcastStore(cache_dir=tmp_path)
+        assert store.flow_version == 0
+        await store.replace_flows({"R1": np.zeros((4, 6, 2), dtype=np.float32)})
+        assert store.flow_version == 1
+        await store.replace_flows({"R1": np.zeros((4, 6, 2), dtype=np.float32)})
+        assert store.flow_version == 2
+
+    @pytest.mark.asyncio
+    async def test_replace_nwp_flow_bumps_version_by_one(self, tmp_path):
+        store = NowcastStore(cache_dir=tmp_path)
+        assert store.flow_version == 0
+        await store.replace_nwp_flow(np.zeros((4, 6, 2), dtype=np.float32))
+        assert store.flow_version == 1
+        await store.replace_nwp_flow(np.zeros((4, 6, 2), dtype=np.float32))
+        assert store.flow_version == 2
+
+    @pytest.mark.asyncio
+    async def test_roundtrip_preserves_flow_version(self, tmp_path):
+        """``__getstate__`` -> JSON -> ``__setstate__`` preserves the version."""
+        producer = NowcastStore(cache_dir=tmp_path)
+        await producer.replace_flows({"R1": np.zeros((4, 6, 2), dtype=np.float32)})
+        await producer.replace_nwp_flow(np.zeros((4, 6, 2), dtype=np.float32))
+        # Two swaps (one per bump path) -> version 2 in the snapshot.
+        assert producer.flow_version == 2
+
+        import json
+        snapshot = json.loads(json.dumps(producer.__getstate__()))
+
+        consumer = NowcastStore()
+        consumer.__setstate__(snapshot)
+        assert consumer.flow_version == 2
+
+    @pytest.mark.asyncio
+    async def test_setstate_missing_flow_version_bumps_local(self, tmp_path):
+        """A legacy snapshot without ``flow_version`` bumps the local
+        version by 1 (conservative fallback) instead of resetting it."""
+        producer = NowcastStore(cache_dir=tmp_path)
+        await producer.replace_flows({"R1": np.zeros((4, 6, 2), dtype=np.float32)})
+        state = producer.__getstate__()
+        del state["flow_version"]  # simulate an older pipeline snapshot
+
+        consumer = NowcastStore()
+        assert consumer.flow_version == 0
+        consumer.__setstate__(state)
+        assert consumer.flow_version == 1
+
+
+class TestNowcastStoreEmptyState:
+    """Empty-store dump/apply semantics.
+
+    The pipeline boots with an empty NowcastStore, and the first
+    ``state.json`` dump can fire before the first generation completes.
+    An all-empty dump must never wholesale-replace a populated store on
+    a serving render worker — ``__getstate__`` returns ``None`` for an
+    all-empty store (``dump_state`` then skips the entry) and
+    ``__setstate__`` refuses an all-empty payload while holding content.
+    """
+
+    @pytest.mark.asyncio
+    async def test_getstate_none_while_empty(self, tmp_path):
+        """A fresh, all-empty store serializes to ``None`` so the first
+        boot dump can't null render workers; once one frame lands the
+        store serializes normally."""
+        store = NowcastStore(cache_dir=tmp_path)
+        assert store.__getstate__() is None
+
+        await store.replace_all([
+            NowcastFrame(
+                timestamp=1000,
+                blend_weight=0.8,
+                regions={"A": np.ones((4, 4), dtype=np.uint8)},
+            ),
+        ])
+        state = store.__getstate__()
+        assert state is not None
+        assert [int(f["timestamp"]) for f in state["frames"]] == [1000]
+
+    @pytest.mark.asyncio
+    async def test_getstate_present_with_flows_only(self, tmp_path):
+        """A store with flows but no frames is a valid, dumpable state
+        (arrow-flow-only configuration) — ``__getstate__`` must not
+        collapse it to ``None``."""
+        store = NowcastStore(cache_dir=tmp_path)
+        await store.replace_flows({"R1": np.zeros((4, 6, 2), dtype=np.float32)})
+        state = store.__getstate__()
+        assert state is not None
+        assert state["frames"] == []
+        assert "R1" in state["flows"]
+
+    @pytest.mark.asyncio
+    async def test_setstate_empty_payload_keeps_existing_frames(self, tmp_path):
+        """An all-empty payload carries no information (historically
+        "first generation in flight") — it must not null a store that is
+        currently serving frames and flows."""
+        store = NowcastStore(cache_dir=tmp_path)
+        frame = NowcastFrame(
+            timestamp=1000,
+            blend_weight=0.7,
+            regions={"A": np.zeros((4, 4), dtype=np.uint8)},
+        )
+        await store.replace_all([frame])
+        flow = np.zeros((4, 4, 2), dtype=np.float32)
+        await store.replace_flows({"A": flow})
+
+        store.__setstate__({
+            "memmap_dir": str(store._memmap_dir),
+            "frames": [],
+            "flows": {},
+            "nwp_flow": None,
+        })
+
+        assert await store.get_timestamps() == [1000]
+        nc_frame, weight = await store.get_frame(1000)
+        assert nc_frame is not None
+        assert weight == pytest.approx(0.7)
+        np.testing.assert_array_equal(
+            nc_frame.regions["A"], np.zeros((4, 4), dtype=np.uint8),
+        )
+        flows = await store.get_flows()
+        assert "A" in flows
+        np.testing.assert_array_equal(flows["A"], flow)
+
+    @pytest.mark.asyncio
+    async def test_setstate_empty_payload_on_empty_store_is_noop(self, tmp_path):
+        """An all-empty payload applied to an already-empty store is a
+        no-op — it applies without error and the store stays empty."""
+        store = NowcastStore(cache_dir=tmp_path)
+        store.__setstate__({
+            "memmap_dir": str(store._memmap_dir),
+            "frames": [],
+            "flows": {},
+            "nwp_flow": None,
+        })
+        assert await store.get_timestamps() == []
+        assert await store.get_flows() == {}
+        assert await store.get_nwp_flow() is None
+
+    @pytest.mark.asyncio
+    async def test_setstate_frames_empty_but_flows_present_applies(self, tmp_path):
+        """A payload with frames=[] but a non-empty flows dict is the
+        arrow-only path — it must apply normally (replace flows, leave
+        frames empty), not be treated as an all-empty dump."""
+        store = NowcastStore(cache_dir=tmp_path)
+        # Give the store existing content so the apply-side guard is live.
+        await store.replace_all([
+            NowcastFrame(
+                timestamp=1000,
+                blend_weight=0.7,
+                regions={"A": np.zeros((4, 4), dtype=np.uint8)},
+            ),
+        ])
+        flow = np.full((4, 4, 2), 2.5, dtype=np.float32)
+        await store.replace_flows({"A": flow})
+        arr = store._flows["A"]
+
+        store.__setstate__({
+            "memmap_dir": str(store._memmap_dir),
+            "frames": [],
+            "flows": {
+                "A": [
+                    os.path.basename(str(arr.filename)),
+                    arr.dtype.str,
+                    list(arr.shape),
+                ],
+            },
+            "nwp_flow": None,
+        })
+
+        assert await store.get_timestamps() == []
+        flows = await store.get_flows()
+        assert list(flows) == ["A"]
+        np.testing.assert_array_equal(flows["A"], flow)
 
 
 class TestNowcastStoreSetstateStaleFiles:

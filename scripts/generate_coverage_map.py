@@ -42,6 +42,7 @@ from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, PathPatch
 from matplotlib.path import Path as MplPath
 from pyproj import CRS, Transformer
@@ -94,6 +95,7 @@ DPC_COVERAGE_POLYGONS = _dpc.COVERAGE_POLYGONS
 _msc   = _load_data_module(_SRC / "north_america/canada/radar/msc_canada/stations.py")
 _usa   = _load_data_module(_SRC / "north_america/usa/radar/stations.py")
 _mmd   = _load_data_module(_SRC / "southeast_asia/malaysia/radar/mmd/stations.py")
+_pagasa = _load_data_module(_SRC / "southeast_asia/philippines/radar/pagasa/stations.py")
 
 MARN_RANGES = _marn.RANGE_OVERRIDES
 SNET_STATIONS = _marn.STATIONS
@@ -112,6 +114,8 @@ NEXRAD_PUERTO_RICO = _usa.NEXRAD_PUERTO_RICO
 MMD_EAST_STATIONS = _mmd.EAST_STATIONS
 MMD_PENINSULAR_STATIONS = _mmd.PENINSULAR_STATIONS
 MMD_RANGES = _mmd.RANGE_OVERRIDES
+PHCOMP_STATIONS = _pagasa.PHCOMP_STATIONS
+PAGASA_RANGES = _pagasa.RANGE_OVERRIDES
 JMA_STATIONS = _jma.STATIONS
 JMA_RANGES = _jma.RANGE_OVERRIDES
 JMA_COVERAGE_POLYGONS = _jma.COVERAGE_POLYGONS
@@ -125,6 +129,7 @@ REGION_RADAR_RANGE: dict[str, float] = {
     **OPERA_RANGES,
     **DPC_RANGES,
     **MMD_RANGES,
+    **PAGASA_RANGES,
     **JMA_RANGES,
 }
 
@@ -138,6 +143,9 @@ class Source:
     label: str
     color: str
     polygon: np.ndarray  # shape (N, 2), [lon, lat]
+    alpha: float | None = None  # per-source fill alpha override (None = render()'s alpha_fill)
+    legend_alpha: float | None = None  # per-source legend swatch override (None = derived from alpha)
+    outline_only: bool = False  # draw only the band's N/S boundary lines, no fill
 
 
 def project_grid_perimeter(
@@ -312,6 +320,29 @@ def build_radar_sources() -> list[Source]:
     def range_for(region: str) -> float:
         return REGION_RADAR_RANGE.get(region, RADAR_RANGE_KM)
 
+    # NOAA RRQPE — satellite-derived observed precipitation (Enterprise
+    # Rain Rate GLB-5 blend) ingested as a single coarse global radar
+    # region on a 60S-70N band at all longitudes; the always-on bottom
+    # compositing tier beneath every finer radar composite.  The band is
+    # split into two half-world boxes at the -180/+180 seam — a single
+    # -180..180 ring collapses to a degenerate line under the renderer's
+    # antimeridian unwrap.  The two pieces share one label so the legend
+    # shows a single entry.  Both pieces are appended first, and list
+    # order is draw order here (uniform zorder=2, no sorting), so the
+    # band always renders beneath every radar polygon.  Rendered as
+    # outline only — dashed boundary lines at the band's N/S edges — so
+    # the always-on global band is demarcated without shading over the
+    # regional sources drawn on top.
+    rrqpe_color = "#7f7f7f"
+    radar.append(Source(
+        "NOAA RRQPE", rrqpe_color, latlon_box(-180, 0, -60, 70),
+        alpha=0.20, legend_alpha=0.50, outline_only=True,
+    ))
+    radar.append(Source(
+        "NOAA RRQPE", rrqpe_color, latlon_box(0, 180, -60, 70),
+        alpha=0.20, legend_alpha=0.50, outline_only=True,
+    ))
+
     # MRMS — five composites sharing one upstream operator (NOAA) and
     # one legend swatch.  Each composite gets its own union polygon
     # built from that region's NEXRAD stations.
@@ -338,7 +369,7 @@ def build_radar_sources() -> list[Source]:
     for poly in union_of_radar_circles(SNET_STATIONS, range_for("SVCOMP")):
         radar.append(Source("MARN/SNET (El Salvador)", "#bcbd22", poly))
 
-    # OPERA — ~155 European stations at 300 km each (C-band).  The
+    # OPERA — 184 European stations at 300 km each (C-band).  The
     # union naturally splits into a continental piece, Iceland,
     # Ireland-and-Britain, etc. where station gaps exceed range.
     for poly in union_of_radar_circles(OPERA_STATIONS, range_for("OPERA")):
@@ -398,6 +429,16 @@ def build_radar_sources() -> list[Source]:
         MMD_EAST_STATIONS, range_for("MYEAST"),
     ):
         radar.append(Source("MET Malaysia (East / Borneo)", mmd_color, poly))
+
+    # PAGASA Philippines — nine-station PAGASA PANAHON national mosaic
+    # covering Luzon, Visayas, Mindanao, and the surrounding seas.  All
+    # stations carry a uniform ~240 km range (see stations.py — no
+    # per-station overrides), matching the runtime coverage mask default.
+    pagasa_color = "#8c564b"
+    for poly in union_of_radar_circles(
+        PHCOMP_STATIONS, range_for("PHCOMP"),
+    ):
+        radar.append(Source("PAGASA (Philippines)", pagasa_color, poly))
 
     return radar
 
@@ -653,6 +694,14 @@ def _draw_polygon(ax, src: Source, alpha_fill: float, hatch: str | None) -> None
     and the others are clipped away by matplotlib.  This avoids the
     half-closed sliver artefact you get from splitting the polygon at
     the wrap and rendering each segment separately.
+
+    A source with its own ``alpha`` override (e.g. the muted RRQPE
+    backdrop band) is drawn at that alpha instead of ``alpha_fill``.
+
+    An ``outline_only`` source (the RRQPE half-world boxes) contributes
+    no fill at all — only dashed horizontal boundary lines at the
+    band's north/south latitudes, so the band is demarcated without
+    shading over the regional polygons.
     """
     poly = src.polygon
     if poly.shape[0] < 3:
@@ -664,12 +713,52 @@ def _draw_polygon(ax, src: Source, alpha_fill: float, hatch: str | None) -> None
         # Skip copies that can't possibly overlap the visible window.
         if shifted_lon.max() < -180 or shifted_lon.min() > 180:
             continue
-        ax.fill(
-            shifted_lon, lat,
-            facecolor=src.color, edgecolor=src.color,
-            alpha=alpha_fill, linewidth=1.2,
-            hatch=hatch, zorder=2,
-        )
+        if src.outline_only:
+            # Outline-only sources render a rectangular band's N/S
+            # boundaries only — no fill.  Side edges are deliberately
+            # omitted: the two RRQPE half-world boxes meet at lon 0 /
+            # the antimeridian, and full outlines would draw spurious
+            # meridian lines straight through continents.
+            eps = 1e-9
+            n = len(lat)
+            for target_lat in (float(lat.max()), float(lat.min())):
+                run: list[float] = []
+                for i in range(n):
+                    j = (i + 1) % n
+                    # Ring-closing duplicate vertex, not an edge.
+                    if (
+                        abs(lat[i] - lat[j]) < eps
+                        and abs(shifted_lon[i] - shifted_lon[j]) < eps
+                    ):
+                        continue
+                    if (
+                        abs(lat[i] - target_lat) < eps
+                        and abs(lat[j] - target_lat) < eps
+                    ):
+                        if not run:
+                            run.append(float(shifted_lon[i]))
+                        run.append(float(shifted_lon[j]))
+                    elif run:
+                        ax.plot(
+                            run, [target_lat] * len(run),
+                            color=src.color, linestyle="--", linewidth=1.4,
+                            zorder=2, solid_capstyle="butt",
+                        )
+                        run = []
+                if run:
+                    ax.plot(
+                        run, [target_lat] * len(run),
+                        color=src.color, linestyle="--", linewidth=1.4,
+                        zorder=2, solid_capstyle="butt",
+                    )
+        else:
+            ax.fill(
+                shifted_lon, lat,
+                facecolor=src.color, edgecolor=src.color,
+                alpha=src.alpha if src.alpha is not None else alpha_fill,
+                linewidth=1.2,
+                hatch=hatch, zorder=2,
+            )
 
 
 def render(
@@ -725,7 +814,7 @@ def render(
 
     # Legend
     seen: set[str] = set()
-    handles: list[Patch] = []
+    handles: list[Patch | Line2D] = []
     for s in sources:
         key = s.label
         if dedupe_label_prefix and s.label.startswith(dedupe_label_prefix):
@@ -743,11 +832,25 @@ def render(
                 if x.label.startswith(dedupe_label_prefix)
             }
             label = f"{key} ({len(distinct)} composites)"
-        handles.append(Patch(
-            facecolor=s.color, edgecolor=s.color,
-            alpha=min(0.95, alpha_fill + 0.10), hatch=hatch,
-            label=label,
-        ))
+        if s.outline_only:
+            # Outline-only sources get a dashed-line legend handle
+            # instead of a filled swatch (no fill to swatch).
+            handles.append(Line2D(
+                [0.1, 0.9], [0, 0],
+                color=s.color, linestyle="--", linewidth=1.4,
+                label=label,
+            ))
+        else:
+            handles.append(Patch(
+                facecolor=s.color, edgecolor=s.color,
+                alpha=(
+                    s.legend_alpha
+                    if s.legend_alpha is not None
+                    else min(0.95, (s.alpha if s.alpha is not None else alpha_fill) + 0.10)
+                ),
+                hatch=hatch,
+                label=label,
+            ))
     ax.legend(
         handles=handles, loc=legend_loc,
         title=legend_title, fontsize=9, title_fontsize=10,
@@ -774,7 +877,7 @@ if __name__ == "__main__":
         sources=build_radar_sources(),
         output_path=RADAR_OUTPUT,
         title="LibreWXR — Radar Composite Coverage",
-        subtitle="NOAA MRMS · MSC Canada · MARN/SNET · OPERA Europe · DPC Italy · CWA / QPESUMS Taiwan · JMA HRPN Japan · MET Malaysia",
+        subtitle="NOAA RRQPE · NOAA MRMS · MSC Canada · MARN/SNET · OPERA Europe · DPC Italy · CWA / QPESUMS Taiwan · JMA HRPN Japan · MET Malaysia · PAGASA Philippines",
         legend_title="Radar composites",
         alpha_fill=0.40,
         hatch="//",
@@ -866,7 +969,7 @@ if __name__ == "__main__":
         sources=_filter_sources_to_bounds(build_radar_sources(), ea_bounds),
         output_path=EAST_ASIA_RADAR_OUTPUT,
         title="LibreWXR — Radar Composite Coverage (East Asia)",
-        subtitle="MET Malaysia + CWA / QPESUMS Taiwan + JMA HRPN Japan + MRMS Guam (Western Pacific)",
+        subtitle="MET Malaysia + PAGASA Philippines + CWA / QPESUMS Taiwan + JMA HRPN Japan + MRMS Guam (Western Pacific)",
         legend_title="Radar composites",
         alpha_fill=0.40,
         hatch="//",

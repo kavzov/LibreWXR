@@ -10,6 +10,7 @@ import math
 import os
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -65,11 +66,17 @@ class StormCellStore:
     files via state.json.
     """
 
-    def __init__(self, cache_dir: Path | None = None):
+    def __init__(
+        self, cache_dir: Path | None = None, *, cleanup_tmp: bool = True,
+    ):
         self._cells: dict[str, np.ndarray] = {}
         self._counts: dict[str, int] = {}  # actual cell count per region (vs MAX cap)
         self._last_updated: float = 0.0
         self._detected_at_timestamp: int = 0
+        # Monotonic content version for the detected cells.  Bumped on
+        # every replace_cells swap and shipped via state.json so render
+        # workers can key shared-store overlay tiles by cell identity.
+        self._cells_version: int = 0
         self._lock = asyncio.Lock()
         if cache_dir is not None:
             self._memmap_dir = Path(cache_dir) / "storm_cells"
@@ -78,9 +85,15 @@ class StormCellStore:
             self._memmap_dir = Path(tempfile.mkdtemp(prefix="librewxr_stormcells_"))
             self._persistent = False
         self._memmap_dir.mkdir(parents=True, exist_ok=True)
-        for path in self._memmap_dir.glob("*.tmp"):
-            path.unlink(missing_ok=True)
-        logger.info(
+        # The ``*.tmp`` unlink is a stale-leftover sweep for the store's
+        # OWN dir.  A render worker booting against the shared (multi-mode)
+        # storm-cells dir must skip it - the pipeline process may be
+        # concurrently writing ``.tmp`` files it is about to rename (the
+        # stale-tmp sweep stays the pipeline's job at its own boot).
+        if cleanup_tmp:
+            for path in self._memmap_dir.glob("*.tmp"):
+                path.unlink(missing_ok=True)
+        logger.debug(
             "Storm-cell memmap directory: %s (persistent=%s)",
             self._memmap_dir, self._persistent,
         )
@@ -88,7 +101,18 @@ class StormCellStore:
     def _to_memmap(self, name: str, data: np.ndarray) -> np.ndarray:
         """Write array to disk atomically and return a read-only memmap view."""
         final = self._memmap_dir / f"{name}.dat"
-        tmp = final.with_suffix(".dat.tmp")
+        # The storm-cells dir is shared across processes in multi mode
+        # (the pipeline writes it, render workers read it via state.json).
+        # A deterministic tmp name lets a concurrent writer's rename steal
+        # the file out from under this writer's os.replace - the same
+        # hazard NowcastStore hit in production when two pipeline
+        # processes overlapped during a deploy.  pid+uuid makes writers
+        # independent: both succeed, and the last replace wins the final
+        # name atomically.  The constructor's stale-``*.tmp`` sweep still
+        # matches these names.
+        tmp = final.with_name(
+            f"{final.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
         mm = np.memmap(tmp, dtype=data.dtype, mode="w+", shape=data.shape)
         mm[:] = data
         mm.flush()
@@ -139,6 +163,7 @@ class StormCellStore:
             self._counts = new_counts
             self._last_updated = time.time()
             self._detected_at_timestamp = detected_at_timestamp
+            self._cells_version += 1
 
     async def get_cells(self) -> dict[str, np.ndarray]:
         """Return the latest per-region cell arrays (fixed-size, NaN-padded).
@@ -167,6 +192,18 @@ class StormCellStore:
         return self._detected_at_timestamp
 
     @property
+    def cells_version(self) -> int:
+        """Content version for the detected cells.
+
+        Bumped on every ``replace_cells`` swap.  Synchronous and
+        lock-free on purpose: the version is a plain attribute read that
+        only the pipeline mutates (under the async lock), so a read under
+        the GIL always sees a consistent value; render workers receive it
+        via the state.json snapshot.
+        """
+        return self._cells_version
+
+    @property
     def total_count(self) -> int:
         """Total detected cells across all regions (sum of per-region counts)."""
         return sum(self._counts.values())
@@ -188,6 +225,7 @@ class StormCellStore:
             "counts": dict(self._counts),
             "last_updated": self._last_updated,
             "detected_at_timestamp": self._detected_at_timestamp,
+            "cells_version": self._cells_version,
         }
 
     def __setstate__(self, state: dict) -> None:
@@ -212,6 +250,14 @@ class StormCellStore:
         self._counts = dict(state.get("counts", {}))
         self._last_updated = float(state.get("last_updated", 0.0))
         self._detected_at_timestamp = int(state.get("detected_at_timestamp", 0))
+        if "cells_version" in state:
+            self._cells_version = int(state["cells_version"])
+        else:
+            # Legacy snapshot from an older pipeline (pre ``cells_version``).
+            # Conservative fallback: this store's payload embeds
+            # ``last_updated``, so it reloads every cycle, and bumping on
+            # every apply matches the cell regeneration cadence.
+            self._cells_version = self._cells_version + 1
         self._persistent = True
         if not hasattr(self, "_lock"):
             self._lock = asyncio.Lock()
@@ -271,6 +317,10 @@ def detect_storm_cells(
             continue
         region = REGIONS.get(region_name)
         if region is None:
+            continue
+        # Coarse global fill layers (RRQPE) opt out of cell detection —
+        # no meaningful convective-cell structure at the min-area cutoff.
+        if not region.storm_cells:
             continue
 
         # Threshold: pixels >= threshold are part of candidate cells.
@@ -448,7 +498,7 @@ class StormCellGenerator:
                 detected_at_timestamp=latest.timestamp,
             )
             total = sum(len(arr) for arr in cells_by_region.values())
-            logger.info(
+            logger.debug(
                 "Storm-cell detection: %d cells across %d region(s)",
                 total, len(cells_by_region),
             )

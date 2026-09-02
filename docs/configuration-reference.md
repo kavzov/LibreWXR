@@ -15,6 +15,7 @@ This document is the **full** reference for every setting LibreWXR understands. 
 - [Workers and Memory](#workers-and-memory)
 - [Multi-mode Tile-Server Split](#multi-mode-tile-server-split)
 - [ECMWF IFS Global Coverage](#ecmwf-ifs-global-coverage)
+  - [Global: NOAA RRQPE](#global-noaa-rrqpe)
 - [Regional NWP Sources](#regional-nwp-sources)
   - [North American: HRRR / HRRR-Alaska](#north-american-hrrr--hrrr-alaska)
   - [North American: HRDPS](#north-american-hrdps)
@@ -64,6 +65,15 @@ The port the server listens on.
 | **Default** | `8080` |
 | **Type** | integer |
 
+### `LIBREWXR_SSL_CERTFILE` / `LIBREWXR_SSL_KEYFILE`
+
+Paths to a TLS certificate and key for direct uvicorn termination. Both must be set for TLS to activate; setting only one has no effect. Leave unset to serve plain HTTP behind a reverse proxy.
+
+| | |
+|---|---|
+| **Default** | unset (both) |
+| **Type** | string (both) |
+
 ### `LIBREWXR_PUBLIC_URL`
 
 The public-facing URL of your LibreWXR instance. This value is returned in the `host` field of `/public/weather-maps.json` responses. Clients use it to construct full tile URLs.
@@ -91,9 +101,50 @@ Allowed CORS origins for cross-origin requests from web browsers.
 
 If you restrict this, make sure your web app's origin is included or tile requests from browsers will fail silently.
 
+### `LIBREWXR_LOG_LEVEL`
+
+Root log level for the Rich-tagged console output (the `[tag] message` format shared with uvicorn's own loggers).  One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` — case-insensitive, normalized to uppercase.  At the default `INFO`, boot status, fetch-cycle timing, and per-source fetch durations are visible while per-cycle noise (memmap-directory lines, per-source ingest summaries, fetch-cycle-start banners, retry attempts) stays at `DEBUG`.
+
+| | |
+|---|---|
+| **Default** | `INFO` |
+| **Type** | string |
+
+**Example:**
+```bash
+LIBREWXR_LOG_LEVEL=DEBUG
+```
+
+---
+
+### `LIBREWXR_LOG_FILE`
+
+Path to a rotating log file capturing WARNING and above (warnings, errors, and exception tracebacks) in addition to the Rich-tagged console output. Enabled by default at `logs/librewxr.log`; each file is capped at 5 MB with 3 rotated backups (`librewxr.log`, `.1`, `.2`, `.3`). Set it to an empty value to disable the file entirely - console behaviour is unchanged.
+
+| | |
+|---|---|
+| **Default** | `logs/librewxr.log` (enabled; empty disables) |
+| **Type** | string (file path) |
+
+Relative paths resolve against the process working directory - the project root for local runs, `/app` in the container. The stock docker-compose.yml sets `LIBREWXR_LOG_FILE=/logs/librewxr.log` and bind-mounts `./logs:/logs`, so every Docker deployment maps the container log to `./logs/` in the clone directory on the host with zero setup. In multi mode every process (pipeline and all render workers) appends to the same file.
+
+**Example:**
+```bash
+LIBREWXR_LOG_FILE=logs/librewxr.log
+```
+
 ---
 
 ## Radar Data
+
+### `LIBREWXR_RADAR_ENABLED`
+
+Master toggle for all radar sources. When false, every radar provider is skipped (MRMS/IEM/MSC/OPERA/DPC/MARN/CWA/JMA/MMD/PAGASA/RRQPE), coverage masks come up empty, and radar tiles return no data. NWP and satellite are unaffected.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
 
 ### `LIBREWXR_FETCH_INTERVAL`
 
@@ -128,7 +179,7 @@ More frames = longer animation history = more RAM usage.
 US-side radar data source — applies to USCOMP, AKCOMP, HICOMP, PRCOMP, and GUCOMP only. **Canada (CACOMP) is controlled independently** by `LIBREWXR_CA_SOURCE`. Three modes:
 
 - **`mrms_fallback`** (default) — NCEP MRMS quality-controlled mosaics as the primary source, with IEM NEXRAD fallback when MRMS fails for a specific frame. Best coverage.
-- **`mrms`** — NCEP MRMS only, no fallback. Pure MRMS where available; gaps show as empty (the global ECMWF IFS layer still fills in outside radar coverage). Least bandwidth.
+- **`mrms`** — NCEP MRMS only, no fallback. Pure MRMS where available; gaps inside the RRQPE band fall through to the global observed RRQPE layer first, then ECMWF IFS (poleward / fringe / RRQPE-decline). Least bandwidth.
 - **`iem`** — Legacy mode. IEM NEXRAD N0Q only. NEXRAD-only without quality control. Simplest and most battle-tested, but fewer radars and no QC.
 
 | | |
@@ -144,7 +195,7 @@ US-side radar data source — applies to USCOMP, AKCOMP, HICOMP, PRCOMP, and GUC
 Canada-side radar data source — applies to CACOMP only. Fully independent of `LIBREWXR_NA_SOURCE`: any US choice can be combined with any Canada choice. Three modes:
 
 - **`mrms_with_msc_blend`** (default) — NCEP MRMS as the primary source covering southern Canada via its CONUS product, with MSC Canada blended in to fill gaps north of MRMS's bbox (latitudes north of ~55°N) and as a fallback if MRMS fails. Best coverage.
-- **`mrms`** — NCEP MRMS only via the CONUS product. Southern Canada is covered; northern Canada (outside the MRMS bbox) falls through to the global ECMWF IFS layer. No MSC fetched.
+- **`mrms`** — NCEP MRMS only via the CONUS product. Southern Canada is covered; northern Canada (outside the MRMS bbox) falls through to the global observed RRQPE layer first, then ECMWF IFS. No MSC fetched.
 - **`msc`** — MSC Canada standalone — Environment and Climate Change Canada's native composite covering all of Canada (RADAR_1KM_RRAI via WMS, MRMS makes no contribution to CACOMP).
 
 | | |
@@ -211,6 +262,35 @@ Base URL for the Taiwan CWA QPESUMS composite bucket on AWS S3 (`cwaopendata` in
 | **Default** | `https://cwaopendata.s3.ap-northeast-1.amazonaws.com` |
 | **Type** | string |
 
+### Japan: JMA HRPN
+
+#### `LIBREWXR_JMA_ENABLED`
+
+JMA HRPN radar toggle; false drops JPCOMP from the ALL and JAPAN groups.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
+
+#### `LIBREWXR_JMA_BASE_URL`
+
+Base URL for the JMA HRPN public tile pyramid. The source fetches and stitches the 10-stop-palette PNG tiles under the `nowc` data tree anonymously (JMA Public Data License v1.0; attribution required).
+
+| | |
+|---|---|
+| **Default** | `https://www.jma.go.jp/bosai/jmatile/data/nowc` |
+| **Type** | string |
+
+#### `LIBREWXR_JMA_ZOOM`
+
+HRPN tile zoom; even values only (z=8 matches JPCOMP's ~1.4 km grid; z=7 or z=9 produce all-empty frames).
+
+| | |
+|---|---|
+| **Default** | `8` |
+| **Type** | integer |
+
 ### `LIBREWXR_MMD_BASE_URL`
 
 Base URL for the MET Malaysia radar composite endpoint. The animated GIF at `{base}/static/images/radar-latest.gif` carries 6 frames at 10-min cadence (~60 min of backfill per fetch). CC-BY-4.0 — attribution required. Only used when `MYPENINSULAR`, `MYEAST`, or the `SOUTHEAST_ASIA` group is in `LIBREWXR_ENABLED_REGIONS`.
@@ -231,12 +311,30 @@ Master toggle for the MET Malaysia source. When `false`, drops `MYPENINSULAR` an
 
 ### `LIBREWXR_MMD_PUBLISH_LAG_SEC`
 
-Estimated publication lag (seconds) between a MET Malaysia frame's data time and when the carrying GIF lands at `api.met.gov.my`. The GIF carries no structured per-frame timestamps, so the newest frame's UTC time is derived from `floor(Last-Modified - mmd_publish_lag_sec, 10min)`. The empirically observed lag is ~11 min; 600 s gives a safe rounding margin. Bump if you observe the latest store slot stuck behind by one frame.
+MET publishes each 10-min slot ~11 minutes after its real data time, so the newest frame on the server is up to ~10 min stale. The decoder therefore labels the newest GIF frame at the current wall-clock 10-min slot so the renderer's "current" slot is always populated; `mmd_publish_lag_sec` acts as a stale-content ceiling — a response whose `Last-Modified` is further behind wall clock than this is treated as legitimately old data, not relabelled forward.
 
 | | |
 |---|---|
 | **Default** | `600` |
 | **Type** | integer (seconds) |
+
+### `LIBREWXR_PAGASA_BASE_URL`
+
+Base URL for the PAGASA PANAHON radar API. The JSON timeline endpoint at `{base}/api/v1/radar/timeline` returns 6 frames at 15-min cadence with explicit UTC timestamps; the image endpoint at `{base}/api/v1/radar-image?sublayer=hybrid-reflectivity&index=N` serves the corresponding 2048×2048 RGBA PNGs. Public domain per Philippine IP code RA 8293 §176. Only used when `PHCOMP` or the `SOUTHEAST_ASIA` group is in `LIBREWXR_ENABLED_REGIONS`.
+
+| | |
+|---|---|
+| **Default** | `https://cdn.panahon.gov.ph` |
+| **Type** | string |
+
+### `LIBREWXR_PAGASA_ENABLED`
+
+Master toggle for the PAGASA Philippines source. When `false`, drops `PHCOMP` from the active region set even if a group alias (`SOUTHEAST_ASIA`, `ALL`) would otherwise pull it in.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
 
 ### `LIBREWXR_DPC_BASE_URL`
 
@@ -278,8 +376,9 @@ Which radar regions to fetch and serve. Accepts group aliases, individual region
 | `CANADA` | `CACOMP` | Canada |
 | `CENTRAL_AMERICA` | `SVCOMP` | El Salvador + W. Honduras + S. Guatemala + offshore Pacific |
 | `EUROPE` | `ITCOMP`, `OPERA` | DPC Italian national composite (24 radars) + OPERA pan-European composite (~155 radars, 24 countries). ITCOMP wins precedence over OPERA where it covers — Italy is not in the EUMETNET OPERA station list. |
-| `SOUTHEAST_ASIA` | `MYPENINSULAR`, `MYEAST` | Peninsular Malaysia + N. Sumatra + all of Borneo + Brunei + Singapore (MET Malaysia 12-radar composite) |
+| `SOUTHEAST_ASIA` | `MYPENINSULAR`, `MYEAST`, `PHCOMP` | Peninsular Malaysia + N. Sumatra + all of Borneo + Brunei + Singapore (MET Malaysia 12-radar composite) + the Philippines (PAGASA PANAHON 9-radar mosaic) |
 | `TAIWAN` | `TWCOMP` | Taiwan + W. Pacific buffer (CWA QPESUMS 7-radar composite) |
+| `JAPAN` | `JPCOMP` | Japan (JMA HRPN analysis-leg composite) |
 | `ALL` | All of the above | Every available region |
 
 **Individual regions:**
@@ -296,8 +395,10 @@ Which radar regions to fetch and serve. Accepts group aliases, individual region
 | `OPERA` | Europe | EUMETNET OPERA (MeteoGate S3) | 3800 x 4400 | 1km (LAEA) | ~16 MB |
 | `ITCOMP` | Italy | DPC (Radar-DPC v2 REST API) | 1200 x 1400 | 1km (tmerc) | ~7 MB |
 | `TWCOMP` | Taiwan + W. Pacific | CWA QPESUMS (cwaopendata S3) | 921 x 881 | 0.0125° (~1.4km) | ~3 MB |
+| `JPCOMP` | Japan (JMA HRPN analysis-leg composite) | JMA HRPN (jmatile nowc tile pyramid) | 2160 x 1920 | 0.0125° (~1.4 km) | ~4 MB |
 | `MYPENINSULAR` | Peninsular Malaysia + N. Sumatra | MET Malaysia (12-radar composite) | 424 x 551 | 0.022° lon / 0.019° lat (~2.5km) | <1 MB |
 | `MYEAST` | East Malaysia (Borneo) + Brunei | MET Malaysia (12-radar composite) | 640 x 570 | 0.022° lon / 0.019° lat (~2.5km) | <1 MB |
+| `PHCOMP` | Philippines (Luzon, Visayas, Mindanao) | PAGASA PANAHON (9-radar mosaic) | 2048 x 2048 | 0.0069° lon / 0.0091° lat (~770m) | ~4 MB |
 
 **Examples:**
 ```bash
@@ -322,7 +423,7 @@ Maximum tile zoom level. Higher values allow more detail when zoomed in but use 
 |---|---|
 | **Default** | `12` |
 | **Type** | integer |
-| **Range** | 0 - 12 |
+| **Range** | 0 - 12 (advisory — 12 is the source-data maximum; the API accepts higher values if you raise it, but tiles show no finer detail) |
 
 ### `LIBREWXR_SMOOTH_RADIUS`
 
@@ -389,7 +490,7 @@ Maximum tile cache size in megabytes, **per worker**. The cache stores pre-prese
 
 Higher values mean faster tile serving for repeat requests; lower values save RAM. The default tracks `LIBREWXR_MODE`: 200 MB total in single mode, 128 MB per worker in multi mode (where many workers share the rack). At a 512² tile size each geometry entry is ~256 KB, so 200 MB holds ~800 viewport geometries.
 
-The tile cache holds two kinds of entries: computed `TileGeometry` records (the expensive per-tile compositing result) and cached encoded tile bytes (rendered tiles kept for HTTP ETag reuse so repeat requests skip re-encoding). Both share this single byte budget, and the half that overflows the byte cap is evicted via LRU when the cache is full. There is no separate config knob for the encoded-byte cache.
+The tile cache holds two kinds of entries: computed `TileGeometry` records (the expensive per-tile compositing result) and cached encoded tile bytes (rendered tiles kept for HTTP ETag reuse so repeat requests skip re-encoding — covering present, overlay, and lat/lon-window renders, with `/health` reporting each kind's count and bytes separately via `geometry_entries`, `present_entries`, `overlay_entries`, `window_entries`, and `satellite_entries`). Both share this single byte budget, and the half that overflows the byte cap is evicted via LRU when the cache is full. There is no separate config knob for the encoded-byte cache.
 
 | | |
 |---|---|
@@ -408,6 +509,29 @@ These caches are the largest RAM consumer after frame data. Reducing this saves 
 | **Default** | `2048` (single) / `512` (multi) — set 0 or unset to use the mode default |
 | **Type** | integer |
 
+### `LIBREWXR_COORD_STORE_ENABLED`
+
+Master switch for the shared on-disk coordinate store (`data/coord_store.py`). When enabled, the six cached tile-coordinate functions in `tiles/coordinates.py` publish their computed arrays to a shared store under `LIBREWXR_CACHE_DIR` and read them back as read-only memmaps, so multi-worker deployments compute each array once globally instead of once per render worker. When `false`, the per-worker in-process coordinate LRU caches are used exactly as before the store existed.
+
+Best-effort: any store failure (unwritable cache dir, corrupt files, version mismatch) is logged once and falls back to the in-process compute path — the store is never a single point of failure. Requires `LIBREWXR_CACHE_DIR`; the store disables itself when the cache dir is unset.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
+
+### `LIBREWXR_COORD_STORE_MB`
+
+Size cap of the shared on-disk coordinate store, in megabytes. The cap is **soft**: the store is pruned once per fetch cycle by whichever process owns store maintenance (the pipeline in multi mode, the main process in single mode — via the ~30 s-debounced cycle hook), so it can briefly overshoot between prunes.
+
+The default tracks `LIBREWXR_MODE`: 1024 in single mode, 8192 in multi mode. In multi mode the budget is **shared by ALL render workers** — every worker reads the same on-disk store, so the 8192 MB default covers the combined warm set rather than 8192 MB per worker. Settable via `.env` like any knob; a restart applies the change. Requires `LIBREWXR_CACHE_DIR`; the store disables itself when the cache dir is unset.
+
+| | |
+|---|---|
+| **Default** | `1024` (single) / `8192` (multi) — set 0 or unset to use the mode default |
+| **Type** | integer |
+| **Unit** | megabytes |
+
 ### `LIBREWXR_WARMER_THREADS`
 
 Thread pool size for background tile cache warming, **single mode only** — in multi mode no `TileWarmer` is instantiated in render workers, and the 4-thread multi default sizes the request-executor pool used to compute tile geometry, not a warming pool. When a tile is requested, the warmer pre-computes the geometry for that same tile position at all other timestamps in the background, so animation playback is smooth without waiting for each frame to render on demand. Warming covers all color schemes and output formats automatically because the cache stores pre-presentation geometry, not encoded bytes.
@@ -421,14 +545,22 @@ The empty-tile fast path (see `tile_requests.fast_path` in `/health`) and per-wo
 
 ### `LIBREWXR_WARM_COORD_ZOOM`
 
-Pre-warm coordinate caches up to this zoom level at startup. Coordinate caches store tile-to-region pixel index mappings; warming them eliminates cold-start latency from trigonometric projections. In multi mode, this runs only in the pipeline parent process; serving workers build their coordinate caches lazily on first request.
+Pre-warm coordinate caches up to this zoom level at startup, as a **background task**: the server starts accepting requests immediately and the warm proceeds alongside serving, so a slow warm on cold storage (ZFS/HDD) never blocks boot. Coordinate caches store tile-to-region pixel index mappings; warming them eliminates cold-start latency from trigonometric projections. Coordinate wrappers handle unwarmed entries gracefully — they compute on demand and publish to the shared on-disk coord store — so lazy loading is always safe.
 
 | | |
 |---|---|
-| **Default** | `6` |
+| **Default** | `0` (mode default: `6` in single / no eager warm in multi) |
 | **Type** | integer |
 
-Each zoom level adds ~4x the tiles of the previous (zoom 6 = ~5,500 tiles). Set to `0` to disable.
+Resolution:
+
+- `0` (or unset) — use the per-mode default: **single** warms up to zoom 6 in the background; **multi** render workers do no eager warm at all, building their coordinate caches lazily on first request.
+- Negative (e.g. `-1`) — disable the warm entirely in either mode.
+- Positive — force that zoom in either mode (e.g. `4` in multi re-enables a background warm; `-1` in single turns the warm off).
+
+Each zoom level adds ~4x the tiles of the previous (zoom 6 = ~5,500 tiles).
+
+> **Note:** this changes the meaning of `0` relative to earlier releases — `0` previously meant "disabled"; it now means "use the mode default". Use a negative value to disable.
 
 ### `LIBREWXR_WARM_OVERVIEW_ZOOM`
 
@@ -506,6 +638,18 @@ Seconds between memory pressure checks.
 | **Type** | integer |
 | **Unit** | seconds |
 
+### `LIBREWXR_SHARED_TILE_STORE_MB`
+
+Budget, in megabytes, of the shared on-disk store of **encoded** tile bytes under `LIBREWXR_CACHE_DIR` (`tiles_shared/`). Multi-mode render workers publish their freshly-encoded plain past-frame tiles here and read back bytes published by any other worker — one encode serves the whole fleet — instead of each worker redundantly colorizing and encoding the same viewport. The store is disabled in single mode (one process — the in-memory cache is enough).
+
+Semantics: unset (`None`) = auto, which resolves to **2048 MB for render-only workers** and **disabled in single mode**; `0` or any negative value disables the store entirely; a positive value sets the MB budget explicitly. Content-versioned keys (the frame's content version is folded into each key) make stale entries unreachable between fetch cycles, and the render workers' state poller invalidates + prunes the store with the same cadence as the in-memory tile cache. Requires `LIBREWXR_CACHE_DIR` (a shared volume) — render-only mode already requires it.
+
+| | |
+|---|---|
+| **Default** | unset (auto: `2048` in multi / disabled in single) |
+| **Type** | integer (or unset) |
+| **Unit** | megabytes |
+
 ### Docker memory limits
 
 The compose file caps each container using these env vars (not LIBREWXR_* settings — they're consumed by `deploy.resources.limits` in the YAML directly). Which one applies depends on which profile is active.
@@ -566,50 +710,52 @@ Seconds for render workers to wait for the first `state.json` on cold start befo
 
 ### `LIBREWXR_STATE_RETENTION_GENERATIONS`
 
-Total number of complete immutable state generations retained on disk, including the current generation. The default `3` keeps current + two previous snapshots. The minimum is `2`: a renderer that read the old `state.json` immediately before an atomic pointer switch must still be able to open that generation's memmaps.
+Number of complete immutable state generations retained in multi mode,
+including the current generation. Each generation has its own manifest and
+hardlinks to the memmap files it references. Keeping at least two generations
+lets a render worker that observed the old manifest finish opening its files
+while the pipeline atomically publishes the next manifest. Unchanged files do
+not consume duplicate data blocks; replaced files remain until their oldest
+retained generation is pruned.
 
 | | |
 |---|---|
 | **Default** | `3` |
-| **Type** | integer (minimum 2) |
+| **Type** | integer |
+| **Minimum** | `2` |
+
+### `LIBREWXR_WORKER_HEALTHCHECK_TIMEOUT`
+
+Seconds uvicorn's master process waits for a worker healthcheck ping before killing and respawning the worker (applies whenever `LIBREWXR_WORKERS` > 1, i.e. multi mode). Render workers can stall well past the default when they page-fault freshly written memmap frame files off a slow backing disk while holding the GIL; raising this to 30 s lets a stalled worker recover instead of being SIGKILLed. `0` = uvicorn's built-in default (5 s).
+
+| | |
+|---|---|
+| **Default** | `30` |
+| **Type** | integer |
+| **Unit** | seconds |
+
+### `LIBREWXR_PAGECACHE_PRIME_ENABLED`
+
+When `true` (default), the data pipeline primes freshly written memmap frame files (radar, NWP, satellite, nowcast, precip-mask) into the host page cache after each fetch cycle via `posix_fadvise(WILLNEED)`. The host page cache is shared between the pipeline and renderer containers, so render workers serve those frames without cold page faults on slow backing disks. Consumed only by the multi-mode pipeline process; single mode never runs it.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
 
 ---
 
 ## ECMWF IFS Global Coverage
 
-LibreWXR uses ECMWF IFS 9 km global data from [Open-Meteo](https://open-meteo.com/) S3 as the global base layer of its NWP chain. IFS provides:
+LibreWXR uses ECMWF IFS 9 km global data from [Open-Meteo](https://open-meteo.com/) S3 as the terminal model of its NWP chain. IFS provides:
 
-- Precipitation animation everywhere the regional NWP chain doesn't reach
+- Model precipitation everywhere the regional NWP chain doesn't reach — for past frames that means poleward of the RRQPE band, the 2-degree fringe excluded by RRQPE's coverage polygon (68-70N, -60 to -58S), and wherever RRQPE declines (missed scans / stale store); within the band, past/current frames come from the always-on observed radar region NOAA RRQPE (below)
 - Per-pixel snow/rain classification
-- Nowcast extrapolation outside regional model coverage
-- Global 2 m temperature and dew point, mean sea-level pressure, and 10 m U/V wind components
-
-The global scalar API is separate from Rain Viewer metadata and radar tiles:
-
-```text
-GET /v2/weather/metadata.json
-GET /v2/weather/{field}/{timestamp}/{size}/{z}/{x}/{y}/{palette}.{ext}
-```
-
-LibreWXR reads the same bulk per-valid-time `.om` objects as precipitation;
-it never builds global rasters from the Open-Meteo point forecast API. Exact
-source names and public units are:
-
-| Public field | Open-Meteo variable(s) | Unit |
-|---|---|---|
-| `temperature_2m` | `temperature_2m` | °C |
-| `dewpoint_2m` | `dew_point_2m` | °C |
-| `relative_humidity_2m` | derived from temperature/dew point | % |
-| `pressure_msl` | `pressure_msl` (Pa converted to hPa) | hPa |
-| `wind_speed_10m` | `wind_u_component_10m`, `wind_v_component_10m` | m/s |
-
-See [Global weather map layers](global-weather-fields.md) for metadata and tile
-examples, palettes/legends, attribution, deployment, storage, caching, stale
-behaviour, and accuracy limitations.
+- The model side of the nowcast blend tail (RRQPE joins nowcast extrapolation like any radar region)
 
 ### `LIBREWXR_ECMWF_ENABLED`
 
-Disable ECMWF IFS entirely. Useful only for isolating regional NWP layers during debugging — anywhere outside the regional models will then simply show zero precipitation.
+Disable ECMWF IFS entirely. Useful only for isolating regional NWP layers during debugging — the always-on observed radar region RRQPE (see below) still renders the 60S-70N band, so only pixels poleward of the band or in the fringe excluded by RRQPE's coverage polygon will then simply show zero precipitation.
 
 | | |
 |---|---|
@@ -675,137 +821,71 @@ Enable optical flow interpolation of ECMWF IFS hourly data to 10-minute frames. 
 
 Adds ~130 MB RAM for synthetic frames and ~5-10 seconds of compute per IFS fetch cycle.
 
-### `LIBREWXR_WEATHER_FIELDS_ENABLED`
+### Global: NOAA RRQPE
 
-Enable the global scalar weather-field store and `/v2/weather/...` API. The
-setting is independent of IFS precipitation: disabling it keeps the existing
-radar fallback, snow mask, and nowcast behaviour while avoiding the additional
-weather-field disk footprint. Persistent deployments keep the active and
-immediately previous complete model runs and restore the active run after a
-restart or upstream outage.
+NOAA's Enterprise Rain Rate (RRQPE) GLB-5 blend is ingested as a single coarse global **radar** region (lat 60°S-70°N, all longitudes): satellite-derived **observed** precipitation on a global 0.02° grid, block-averaged to 0.04° at the default downsample, consumed from the anonymous NOAA Open Data bucket `noaa-enterprise-rainrate-pds`. It sorts **last** in the multi-region compositor — the bottom tier that fills only pixels no finer radar region claims, so it never overwrites a Doppler composite's authoritative "no echo" zeros. Because it is observations rather than model output it only ever answers for past / observed frame times; it joins radar nowcast extrapolation and blend-weight fade like any other region, the fetcher's carry-forward covers late scans, and the region is **always-on** — it keeps fetching and rendering even when `LIBREWXR_ENABLED_REGIONS` is a narrow group.
+
+It is an IR-based satellite **estimate**, not a measurement: it underestimates warm / stratiform rain, is unreliable over snow and ice surfaces, and only covers the 60°S-70°N geostationary ring. Scans publish on a 10-min cadence with ~17-min median latency.
+
+Data is distributed under the NOAA Open Data Dissemination (NODD) program. Attribution is requested: "Precipitation data from NOAA Enterprise Rain Rate (RRQPE)". No endorsement by NOAA is implied, and don't present modified data as unaltered NOAA data. Blend inputs include JMA Himawari-9 and EUMETSAT Meteosat-9/10; courtesy attribution to the contributing agencies is appreciated but not required.
+
+#### `LIBREWXR_RRQPE_ENABLED`
+
+Master switch for the RRQPE layer.
 
 | | |
 |---|---|
 | **Default** | `true` |
 | **Type** | boolean |
 
-Disk-constrained installations that only use the Rain Viewer-compatible API
-can set this to `false`.
+#### `LIBREWXR_RRQPE_BASE_URL`
 
-### `LIBREWXR_WEATHER_PNG_MODE`
-
-Encoding mode for scalar weather PNG tiles. Tiles containing at most 256 exact
-RGBA colours always retain the lossless PNG8 path. For more complex tiles,
-`quantized` creates a deterministic palette PNG while `lossless` preserves the
-full RGBA raster. Quantization uses libimagequant when Pillow provides it and
-falls back to FASTOCTREE otherwise. No external optimizer runs on requests.
+S3 bucket for the NOAA Enterprise Rain Rate GLB-5 files.
 
 | | |
 |---|---|
-| **Default** | `quantized` |
-| **Values** | `lossless`, `quantized` |
+| **Default** | `https://noaa-enterprise-rainrate-pds.s3.amazonaws.com` |
+| **Type** | string |
 
-### `LIBREWXR_WEATHER_PNG_COLORS`
+#### `LIBREWXR_RRQPE_PUBLISH_DELAY_MINUTES`
 
-Maximum palette size for quantized weather PNGs.
-
-| | |
-|---|---|
-| **Default** | `256` |
-| **Range** | `2`–`256` |
-
-### `LIBREWXR_WEATHER_PNG_DITHER`
-
-Enable Floyd–Steinberg dithering for quantized weather PNGs. Disabled by
-default for deterministic smooth fields, better compression, and lower request
-cost.
+How long after a 10-min scan start the file is considered safely published. The fetch window ends at `now - publish_delay`, so not-yet-published slots are never requested; a missed scan simply has no key in its hour directory and is skipped.
 
 | | |
 |---|---|
-| **Default** | `false` |
-| **Type** | boolean |
-
-### `LIBREWXR_NATIVE_RENDER`
-
-Select the implementation for continuous weather sampling and derived fields.
-The optional `librewxr-native` ABI3 wheel contains only PyO3 sampling kernels;
-FastAPI, downloading, source discovery, state management, and APIs remain
-Python. The standard LibreWXR installation does not depend on Rust or maturin.
-
-| | |
-|---|---|
-| **Default** | `auto` |
-| **Values** | `auto`, `on`, `off` |
-
-- `auto` uses `_librewxr_native` when installed and otherwise uses NumPy.
-- `on` fails source initialization with a clear error when the extension is
-  unavailable.
-- `off` always uses NumPy, including when the extension is installed.
-
-The native kernels are single-threaded and release the GIL. They do not create
-a Rayon pool, preventing hidden oversubscription across Uvicorn workers. Build
-and wheel-install instructions are in `native/README.md`.
-
-### `LIBREWXR_WEATHER_FIELDS_FIELDS`
-
-Comma-separated scalar fields to retain. Public derived fields automatically
-select their native dependencies: `relative_humidity_2m` adds temperature and
-dew point; `wind_speed_10m` adds both 10 m wind components.
-
-| | |
-|---|---|
-| **Default** | `temperature_2m,dewpoint_2m,relative_humidity_2m,pressure_msl,wind_speed_10m` |
-| **Type** | comma-separated string |
-
-Restricting this list reduces each retained timestep's disk and page-cache
-footprint. The metadata endpoint advertises only fields derivable from the
-selected native inputs.
-
-### `LIBREWXR_WEATHER_FIELDS_FORECAST_HOURS`
-
-Forecast horizon for the native valid-time window of global continuous weather fields. This window is independent of radar history and precipitation animation.
-
-| | |
-|---|---|
-| **Default** | `48` |
+| **Default** | `15` |
 | **Type** | integer |
-| **Unit** | hours |
+| **Unit** | minutes |
 
-### `LIBREWXR_WEATHER_FIELDS_MAX_TIMESTEPS`
+#### `LIBREWXR_RRQPE_DBZ_OFFSET`
 
-Optional cap on native ECMWF valid times retained for global continuous fields, starting with the nearest analysis/past valid time. `0` keeps every actually published valid time through `LIBREWXR_WEATHER_FIELDS_FORECAST_HOURS` and is recommended because IFS cadence becomes coarser later in the forecast.
+dBZ calibration shift applied after Z-R conversion of RRQPE rain rates (Marshall-Palmer 200·R^1.6). Satellite QPE is a surface rain rate; radar reflectivity samples the storm column and reads higher, so nudge the derived dBZ up to match.
 
 | | |
 |---|---|
-| **Default** | `0` (unlimited within the horizon) |
+| **Default** | `6.0` |
+| **Type** | float |
+| **Unit** | dBZ |
+
+#### `LIBREWXR_RRQPE_DOWNSAMPLE`
+
+Integer block-averaging factor for the 0.02° native grid (1/2/4 → 0.02°/0.04°/0.08°). 2 is the default: each decoded ~117 MB float32 frame becomes a ~29 MB uint8 store.
+
+| | |
+|---|---|
+| **Default** | `2` |
 | **Type** | integer |
+| **Values** | `1` (0.02° native) · `2` (0.04°) · `4` (0.08°) |
 
-### Operational sizing and publication
+#### `LIBREWXR_RRQPE_MATCH_TOLERANCE_SECONDS`
 
-Scalar fields use the existing `LIBREWXR_FETCH_INTERVAL` check loop. The run
-reference is compared before downloading, so an already-complete model run is
-not fetched again; model publication cadence remains the upstream IFS cadence,
-independent of the ten-minute check cadence.
+Match slack around the ideal constant-shift target slot. Every frame is served the scan exactly `RRQPE_LAG_SECONDS` (30 min) its senior — a **constant shift** that keeps the frame → scan mapping deterministic 1:1, so consecutive frames step one scan per frame (no freezing, no skipping). The target 30-min-old scan is essentially always published given the product's ~13-25 min publish latency, so the target slot exists every cycle; the fib is a constant ~30 min — honest staleness over fabricated motion (previously the shift wobbled between 2-3 slots as latency varied, freezing or skipping frames). This value bounds how far the nearest stored scan may sit from that ideal target: at the default it tolerates up to ~2 consecutive missed scan slots before the region declines for the affected frames (carry-forward / NWP fill take over until the next fetch cycle heals). It is not a publish-lag cap — the shift is constant by design.
 
-The 1801 × 3600 regular global grid stores five two-byte native components by
-default, or 61.8 MiB per valid time. An hourly 48-hour window is approximately
-3.0 GiB for one run. LibreWXR retains the active and previous complete runs
-(approximately 6.0 GiB) and may need up to approximately 9 GiB while staging a
-new run. Precipitation, radar, satellite, nowcast, and tile caches are extra.
-Actual use follows the upstream valid-time list and configured field/timestep
-caps; `/health` exposes `field_bytes` for the active run.
-
-Every field array is written to a `.tmp`, flushed, size-checked, and atomically
-renamed. The active manifest and frame mapping are replaced only after the
-entire configured generation succeeds. A missing/corrupt new run leaves the
-last-known-good generation active and sets `stale` / `last_update_error` in
-health. In multi mode only the pipeline downloads; render-only workers reopen
-the snapshot's memmaps read-only and never contact the model upstream.
-
-Weather metadata uses a 60-second public cache lifetime. Timestamped tiles use
-ETags and a six-hour public lifetime. A later model run can revise a forecast
-for the same valid timestamp, so CDNs should honour origin TTL and conditional
-revalidation rather than pinning a URL forever.
+| | |
+|---|---|
+| **Default** | `1800` |
+| **Type** | integer |
+| **Unit** | seconds |
 
 ---
 
@@ -820,6 +900,15 @@ Each regional source supports the same set of advanced tuning knobs:
 - `<SOURCE>_PUBLISH_DELAY_MINUTES` — how long after a model run's init time its files become available upstream. The fetcher won't try to read a run published more recently than this.
 - `<SOURCE>_DBZ_OFFSET` — a dBZ calibration shift applied after Marshall-Palmer Z-R conversion (only for sources that derive reflectivity from precipitation rate, not those with native composite reflectivity). Marshall-Palmer is for stratiform rain at the surface; radar reads 5-10 dBZ higher at the brightest part of the storm column, so a positive offset brings model output closer to OPERA / NEXRAD radar in colour.
 - `<SOURCE>_BASE_URL` (HTTPS sources) or `<SOURCE>_S3_BUCKET` + `<SOURCE>_S3_REGION` (AWS Open Data sources) — should rarely need changing; the defaults point at the upstream-provider buckets.
+
+### `LIBREWXR_REGIONAL_NWP_ENABLED`
+
+Master switch for all regional NWP. When false the NWP chain collapses to ECMWF IFS alone. RRQPE is unaffected (it is an observed radar region, not NWP).
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
 
 ### North American: HRRR / HRRR-Alaska
 
@@ -947,7 +1036,7 @@ DWD main runs typically publish ~3-4 h after init.
 
 | | |
 |---|---|
-| **Default** | `6.0` |
+| **Default** | `12.0` |
 | **Type** | float |
 | **Unit** | dBZ |
 
@@ -979,7 +1068,7 @@ DMI files publish ~3 h after run init.
 
 | | |
 |---|---|
-| **Default** | `6.0` |
+| **Default** | `12.0` |
 | **Type** | float |
 | **Unit** | dBZ |
 
@@ -1173,6 +1262,17 @@ Maximum number of NWP grid fetches running in parallel inside one fetch cycle. E
 
 4 fits comfortably in 8 GB; bump to 6-8 on bigger rigs (multi mode has a separate pipeline container with its own memory budget, so it can usually go higher) to bring cycle wall time closer to the slowest single source.
 
+### `LIBREWXR_RADAR_FETCH_CONCURRENCY`
+
+Maximum number of radar region-frame fetches (live or archive) running in parallel inside one fetch cycle. Each in-flight fetch can hold 100-200 MB during decode (MRMS), so this caps peak transient RAM at ~N x per-frame working set.
+
+| | |
+|---|---|
+| **Default** | `8` |
+| **Type** | integer |
+
+8 caps transient decode RAM around 1.6 GB; raise on fatter rigs to shorten backfill wall time.
+
 ---
 
 ## Nowcasting
@@ -1241,6 +1341,28 @@ The model side is taken from the active NWP chain — **HRRR over CONUS, HRDPS o
 
 (Value renamed from `ifs` to `model` after the regional NWP chain shipped — the model side is no longer IFS-only.)
 
+### `LIBREWXR_NOWCAST_COARSEN_ENABLED`
+
+Progressive spatial coarsening of the optical-flow-extrapolated radar fields in the nowcast pipeline.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
+
+When enabled, each extrapolated forecast frame is Gaussian-smoothed with a sigma that ramps quadratically with lead time — negligible at T+10, the full `LIBREWXR_NOWCAST_COARSEN_MAX_KM` effective-resolution floor at the last blend step. Farneback optical flow produces melted/filamented high-spatial-frequency warping artifacts at long lead times; the lead-time-ramped low-pass attenuates exactly those artifacts and honestly encodes the growing positional uncertainty of the extrapolation. Early frames stay crisp; only the internal optical-flow path is smoothed — external nowcast contribution frames (e.g. JMA HRPN for JPCOMP) pass through untouched.
+
+### `LIBREWXR_NOWCAST_COARSEN_MAX_KM`
+
+Effective resolution floor reached at the last blend step, in kilometres.
+
+| | |
+|---|---|
+| **Default** | `3.0` |
+| **Type** | float |
+
+The Gaussian sigma at forecast step `t` (normalized to the blend window) is `max_km * t²` in kilometres — so at the default 3.0 km and 10-minute cadence the T+60 field is smoothed to roughly the resolution of a 3 km NWP grid while the T+10 field is left effectively untouched. Setting this to `0` (or disabling `LIBREWXR_NOWCAST_COARSEN_ENABLED`) disables the smoothing entirely.
+
 ### `LIBREWXR_ARROW_FLOW_ENABLED`
 
 The `/v2/radar/...` tile endpoint accepts an `?arrows=` query param that overlays semi-transparent precipitation-direction arrows on areas with active precipitation. Arrows key off per-region optical flow computed between the two most recent radar frames; outside radar coverage, a single **composite NWP flow raster** (built from `NWPChain.sample()` at T and T−1) drives the arrows — reflecting whichever regional NWP source is active at each point (HRRR over CONUS, ICON-EU over Europe, JMA MSM over Japan, IFS elsewhere) rather than IFS alone.
@@ -1286,7 +1408,7 @@ Resolution of the global composite NWP flow raster used by the arrow overlay out
 | **Default** | `0.25` |
 | **Type** | float |
 
-At 0.25° the raster is 721×1440 float32 (~8 MB). The 32/48px arrow draw grid can't resolve finer detail at most zooms, so coarser is cheaper for no visible loss. Finer values help only at high zoom inside small convective cells — and inside radar coverage those cells already get the fine per-region radar flow (which wins by construction), so the composite only fills NWP-only regions where sub-0.25° detail doesn't matter. This is an advanced tuning knob not surfaced in `.env.example`.
+At 0.25° the raster is 721×1440 float32 (~4 MB per snapshot; ~8 MB for the two-channel flow output). The 32/48px arrow draw grid can't resolve finer detail at most zooms, so coarser is cheaper for no visible loss. Finer values help only at high zoom inside small convective cells — and inside radar coverage those cells already get the fine per-region radar flow (which wins by construction), so the composite only fills NWP-only regions where sub-0.25° detail doesn't matter. This is an advanced tuning knob not surfaced in `.env.example`.
 
 ---
 
@@ -1372,6 +1494,16 @@ Number of hourly satellite frames retained per channel. GMGSI publishes one fram
 |---|---|
 | **Default** | `12` |
 | **Type** | integer |
+
+### `LIBREWXR_SATELLITE_FETCH_TIMEOUT`
+
+Deadline for one satellite fetch pass (list + download + decode). A hung S3 connection skips the channel for that pass rather than retrying.
+
+| | |
+|---|---|
+| **Default** | `600.0` |
+| **Type** | float |
+| **Unit** | seconds |
 
 ---
 
@@ -1490,7 +1622,7 @@ Both transports require the optional `[mcp]` extra:
 pip install -e ".[mcp]"
 ```
 
-Without the extra, the HTTP transport is silently disabled at startup with a logged warning, and the stdio entry point (`python -m librewxr.mcp` / `librewxr-mcp`) won't import.
+Without the extra, the HTTP transport is silently disabled at startup with a logged error (traceback), and the stdio entry point (`python -m librewxr.mcp` / `librewxr-mcp`) won't import.
 
 ### `LIBREWXR_MCP_ENABLED`
 
@@ -1525,6 +1657,8 @@ Each worker process holds its own copy of radar frames, NWP grids, coordinate ca
 | ALL regions + IFS only, 1 worker, 12 frames | ~7-8 GB |
 | ALL regions + full NWP chain, 1 worker, 12 frames | ~9-10 GB |
 | ALL regions + full NWP chain, 2 workers, 12 frames | ~16-18 GB |
+
+> **Note:** The "ALL regions" rows include the always-on RRQPE global observed region — ~350 MB of frame store (12 × ~29 MB past frames) plus ~175 MB of nowcast-extrapolated frames, per [`self-host-sizing.md`](self-host-sizing.md).
 
 ### Multi-worker mode
 

@@ -1,8 +1,10 @@
 # Source Survey
 
-A snapshot of the data sources LibreWXR has evaluated for inclusion in the core project: what shipped, what's queued, what was investigated and ruled out, and the reasoning behind each call. Covers both radar composites and regional NWP grids.
+A snapshot of the data sources LibreWXR has evaluated for inclusion in the core project: what shipped, what's queued, what was investigated and ruled out, and the reasoning behind each call. Covers both radar composites and regional NWP grids. The satellite layer (NOAA GMGSI, LW+VIS hourly composite) is covered separately in docs/satellite-implementation-plan.md. WMO CAP weather alerts (severeweather.wmo.int + NWS API) are fetched by src/librewxr/data/alerts_fetcher.py and served at /v2/alerts.
 
 The open-data criteria these decisions apply are documented in [`adding-a-source.md`](adding-a-source.md#upstream-contribution-criteria). Self-hosters running their own LibreWXR instance are not bound by them — this document is the upstream selection record, not a prescription for every deployment.
+
+Tier statuses and endpoint details were re-validated in an August 2026 sweep; dated per-entry notes record what changed.
 
 ## Conventions
 
@@ -22,6 +24,7 @@ Sources that shipped and were later removed are recorded in [Reverted and remove
 - [Radar — Tier 1](#radar--tier-1)
 - [Radar — Tier 2](#radar--tier-2)
 - [Radar — Tier 3](#radar--tier-3)
+- [Satellite — Implemented](#satellite--implemented)
 - [NWP — Implemented](#nwp--implemented)
 - [NWP — Tier 2](#nwp--tier-2)
 - [NWP — Tier 3](#nwp--tier-3)
@@ -44,7 +47,7 @@ Region: CACOMP. Source: MSC GeoMet WMS, `RADAR_1KM_RRAI` layer with `Radar-Rain_
 
 ### Europe — OPERA Pan-European CIRRUS Composite
 
-Region: OPERA (\~155 radars across 24 countries). Source: EUMETNET OPERA CIRRUS MAX reflectivity via MeteoGate/Cloudferro S3 — anonymous, no key required. ODIM HDF5, float64 dBZ. Resolution 3800×4400 at 1 km, LAEA projection. 5-minute cadence, rolling 24-hour archive. Sentinels: nodata `-9999000.0`, undetect `-8888000.0` (both map to 0 in uint8, so clear sky falls through to the NWP chain). URL pattern: `https://s3.waw3-1.cloudferro.com/openradar-24h/YYYY/MM/DD/OPERA/COMP/OPERA@YYYYMMDDTHHMM@0@DBZH.h5`.
+Region: OPERA (\~155 radars across 24 countries). Source: EUMETNET OPERA CIRRUS MAX reflectivity via MeteoGate/Cloudferro S3 — anonymous, no key required. ODIM HDF5, float64 dBZ. Resolution 3800×4400 at 1 km, LAEA projection. 5-minute cadence, rolling 24-hour archive. Sentinels: nodata `-9999000.0`, undetect `-8888000.0` (both map to 0 in uint8, so clear sky falls through to the RRQPE bottom radar tier for in-band past frames, then to the NWP chain). URL pattern: `https://s3.waw3-1.cloudferro.com/openradar-24h/YYYY/MM/DD/OPERA/COMP/OPERA@YYYYMMDDTHHMM@0@DBZH.h5`.
 
 The legal lever that opened European radar data is the **EU High Value Datasets regulation (EU 2023/138)**, not WMO policy — it legally requires European meteorological data to be free, open-licensed, and API-accessible.
 
@@ -83,9 +86,35 @@ Format: animated GIF89a, 1352×570, 6 frames at 10-min cadence (\~60 min of back
 
 Vendor credit visible in the burned-in chrome ("Rainbow 5 / LEONARDO Germany GmbH") is a tool credit, not a license obligation.
 
+### Global — NOAA Enterprise Rain Rate (RRQPE)
+
+Region: `RRQPE` — a single coarse global radar region covering the 60°S–70°N geostationary ring at all longitudes. Source: NOAA Enterprise Rain Rate GLB-5 blend — satellite-derived **observed** precipitation (IR-based estimate; inputs include GOES-East/West, EUMETSAT Meteosat-9/10, JMA Himawari-9) from the anonymous NOAA NODD bucket `noaa-enterprise-rainrate-pds`. 10-minute cadence, ~17-min publish latency. Native 0.02° grid block-averaged to 0.04° stored at the default downsample. Always-on bottom tier of the multi-region compositor — it fills only pixels no finer radar region claims (past frames within the band), joins radar nowcast extrapolation like any region, and keeps fetching/rendering even under narrow `LIBREWXR_ENABLED_REGIONS` specs.
+
+License: NOAA Open Data Dissemination (NODD) program. Attribution requested — "Precipitation data from NOAA Enterprise Rain Rate (RRQPE)". No endorsement by NOAA implied; don't present modified data as unaltered NOAA data.
+
+### Japan — JMA HRPN Composite (JPCOMP)
+
+**Shipped 2026-05-30** (commit `dfb97c4`, refined in follow-ups).  Analysis-leg only: the N1 manifest (basetime == validtime) feeds a standard `RadarSourceContribution` for the new `JPCOMP` region under the `JAPAN` group.  Forward prediction comes from LibreWXR's internal optical-flow extrapolation like every other region.
+
+Source: `https://www.jma.go.jp/bosai/jmatile/data/nowc/` — anonymous, no auth, no WAF, S3-backed CDN.
+
+- **Manifest:** `targetTimes_N1.json` — JSON array, 36 frames at 5-minute cadence.  Format: `{"basetime": "YYYYMMDDHHMMSS", "validtime": "YYYYMMDDHHMMSS", "elements": ["hrpns", "hrpns_nd"]}`.  We consume `hrpns` only; `hrpns_nd` returns an HTML 404 page when probed (not a real product variant despite appearing in the elements array).
+- **Tile pattern:** `…/{basetime}/none/{validtime}/surf/hrpns/{z}/{x}/{y}.png` — 256×256 4-bit palette PNG for populated tiles, 8-bit RGBA all-transparent placeholder for empty tiles.
+- **Tile pyramid quirk:** JMA serves real data only at **even zoom levels** (z=4, 6, 8, 10).  Odd zooms (5, 7, 9) return 334-byte transparent placeholders at every coord.  We fetch at z=8 (~420 tiles per frame, ~1.25 km/px), which matches the JPCOMP grid resolution.  z=6 (~30 tiles, ~5 km/px) is the bandwidth-saver fallback.
+- **Cadence:** native 5 min; we sample at LibreWXR's 10 min rhythm.
+- **Coverage:** all of Japan via 20 C-band Doppler radars fused with the AMeDAS rain-gauge network.  High-quality QPE composite, not a single-radar PPI.
+
+License: **JMA Public Data License v1.0** — CC-BY equivalent, explicit commercial-reuse permission, attribution required ("Source: Japan Meteorological Agency website").  Article 17 of Japan's Meteorological Service Act restricts "provision of meteorological services in Japan" — does not apply to LibreWXR redistributing radar imagery globally, but worth noting for any operator running a Japan-domestic service.
+
+**Removed forecast leg.**  An initial implementation also ingested JMA's N2 manifest (their own 60-min nowcast extrapolation) as a `NowcastContribution` that swapped in for internal optical-flow over JPCOMP.  That path was removed: JMA's 5-min validtime cadence didn't line up cleanly with our 10-min sampling rhythm, and the dispatch complexity wasn't worth the win for one region.  The cleaner long-term play — a regional Japanese NWP overlay so optical-flow blends with high-resolution Japan-specific model precip instead of with global IFS — landed 2026-05-30 as **JMA MSM** in the NWP — Implemented section.
+
+### Philippines — PAGASA PANAHON (PHCOMP)
+
+Reinstated 2026-08-19 (see "Reverted and removed" for history). CDN PNG mosaic, 6-frame 15-min timeline, 9 stations, 2048x2048 grid, SOUTHEAST_ASIA group.
+
 ## Radar — Reverted and removed
 
-Two sources shipped and were removed within the same day. Both reverts taught something concrete that informed the upstream-contribution criteria.
+Two sources shipped and were removed within the same day; PAGASA was later reinstated — see its note below. Both reverts taught something concrete that informed the upstream-contribution criteria.
 
 ### Singapore — MSS Changi (shipped and removed 2026-05-15 / 2026-05-16)
 
@@ -111,20 +140,11 @@ What it would take to revisit: per-station ranges (the current radar infrastruct
 
 Worth noting the license itself was fine — PAGASA's site-wide public-domain statement covered the radar imagery. The revert was a data-quality call, not a licensing one. An open license is a prerequisite for upstream inclusion, but the data also has to be usable in practice.
 
+**Reinstated 2026-08-19.** A re-examination (live probe of six typhoon-season frames plus pixel-level analysis) found the revert's empirical basis mostly didn't reproduce: the ~2065-pixel frame was a dry-season artifact — August frames carry 22–24k precip pixels with 100% exact palette matches, so the decoder was never dropping data — and the 80 km range claim is refuted for every station testable today (uniform ~240 km cap; no range constants exist in the app JS). Kabacan and Panabo remain untested (no rain over Mindanao during the probe window); if they ever prove short-range, `range_overrides` in the source package is the fix. What held: the mosaic is a union of ~240 km station circles, inherent to the source. The network gained a ninth station (Davao) since May. One license nuance now recorded: RA 8293 §176 puts government works in the public domain but requires PAGASA approval for for-profit exploitation — fine for self-hosted AGPL, a caveat for paid hosting. Re-added as a self-discovered package at `sources/regional/southeast_asia/philippines/radar/pagasa/`; the low-zoom max-pool question above remains open but is cosmetic, not structural.
+
 ## Radar — Tier 1
 
 Validated against the upstream endpoints. License and access path are clear. Implementation is queued behind whatever else is in flight.
-
-### Cayman Islands — CINWS
-
-Source: weather.gov.ky CDN, anonymous, no WAF. URL pattern `https://www.weather.gov.ky/cdn/assets/images/radar/{product}/{TIMESTAMP}{type}.jpg`. Timestamp format `YYYYMMDDHHMMSSSS` (UTC, clock-aligned, \~5-minute cadence). JPEG 1276×1000 RGB, \~65 KB per frame.
-
-Products available include PPI 400 km (largest coverage — recommended primary), CAPPI 250 km, 40 nautical-mile zoom, DPSRI rainfall rate, and a Sister Islands product. The DPSRI naming and file-name suffixes (`dBZ.cappi.jpg`, `dBZ.ppi.jpg`, `dBR.dpsri.jpg`) suggest the same vendor product line as the old Singapore MSS feed — Selex/Leonardo. Bermuda likely runs the same family.
-
-**Open questions before implementation:**
-- **Bounds**: not found in the radar HTML or in the JS bundles checked so far. The fallback is centre-on-radar + per-product range arithmetic, verified empirically by aligning the Cuba/Jamaica coastline against a basemap. Final bounds should come from a deeper JS dig or from CINWS directly.
-- **JPEG decode**: lossy compression means RGB triplets drift around discrete intensity bands. The mitigation is fuzzy palette matching (snap each pixel to the nearest of N known colours within a tolerance), but the band-width needs measurement against a known precipitation frame.
-- **License**: not explicitly published on the radar page. CINWS recently upgraded their site (May 2026) with explicit language about users being able to "download weather data directly for research, planning and operational use" — implying open-access intent. Direct confirmation from CINWS via their website contact form is still warranted before shipping.
 
 ### Bermuda — BWS
 
@@ -138,37 +158,25 @@ License: permissive with attribution. BWS disclaimer explicitly permits redistri
 
 Open questions before implementation: exact palette / dBZ scale (legend needed — sample a precip frame or correspond with BWS); backfill depth (page exposes only 5 frames; older timestamps return 404); projection confirmation. Adding a new `proj="aeqd"` branch to the `RegionDef` machinery is the largest scoped change relative to the existing source pattern.
 
-### Japan — JMA HRPN Composite (JPCOMP)
-
-**Shipped 2026-05-30** (commit `dfb97c4`, refined in follow-ups).  Analysis-leg only: the N1 manifest (basetime == validtime) feeds a standard `RadarSourceContribution` for the new `JPCOMP` region under the `JAPAN` group.  Forward prediction comes from LibreWXR's internal optical-flow extrapolation like every other region.
-
-Source: `https://www.jma.go.jp/bosai/jmatile/data/nowc/` — anonymous, no auth, no WAF, S3-backed CDN.
-
-- **Manifest:** `targetTimes_N1.json` — JSON array, 36 frames at 5-minute cadence.  Format: `{"basetime": "YYYYMMDDHHMMSS", "validtime": "YYYYMMDDHHMMSS", "elements": ["hrpns", "hrpns_nd"]}`.  We consume `hrpns` only; `hrpns_nd` returns an HTML 404 page when probed (not a real product variant despite appearing in the elements array).
-- **Tile pattern:** `…/{basetime}/none/{validtime}/surf/hrpns/{z}/{x}/{y}.png` — 256×256 4-bit palette PNG for populated tiles, 8-bit RGBA all-transparent placeholder for empty tiles.
-- **Tile pyramid quirk:** JMA serves real data only at **even zoom levels** (z=4, 6, 8, 10).  Odd zooms (5, 7, 9) return 334-byte transparent placeholders at every coord.  We fetch at z=8 (~420 tiles per frame, ~1.25 km/px), which matches the JPCOMP grid resolution.  z=6 (~30 tiles, ~5 km/px) is the bandwidth-saver fallback.
-- **Cadence:** native 5 min; we sample at LibreWXR's 10 min rhythm.
-- **Coverage:** all of Japan via 20 C-band Doppler radars fused with the AMeDAS rain-gauge network.  High-quality QPE composite, not a single-radar PPI.
-
-License: **JMA Public Data License v1.0** — CC-BY equivalent, explicit commercial-reuse permission, attribution required ("Source: Japan Meteorological Agency website").  Article 17 of Japan's Meteorological Service Act restricts "provision of meteorological services in Japan" — does not apply to LibreWXR redistributing radar imagery globally, but worth noting for any operator running a Japan-domestic service.
-
-**Removed forecast leg.**  An initial implementation also ingested JMA's N2 manifest (their own 60-min nowcast extrapolation) as a `NowcastContribution` that swapped in for internal optical-flow over JPCOMP.  That path was removed: JMA's 5-min validtime cadence didn't line up cleanly with our 10-min sampling rhythm, and the dispatch complexity wasn't worth the win for one region.  The cleaner long-term play — a regional Japanese NWP overlay so optical-flow blends with high-resolution Japan-specific model precip instead of with global IFS — landed 2026-05-30 as **JMA MSM** in the NWP — Implemented section.
+**Re-validated 2026-08-19:** URL pattern (including the mixed `dBZ`/`dBz` casing), 5-frame manifest, 6-minute cadence, and the disclaimer license text are all unchanged. Backfill is still ~30 minutes — probes at 1 h / 6 h / 24 h before the newest frame all return 404. New additive products since May: 250 km and 100 km SRI variants (5 frames each, same cadence) plus PARISH MAP / HYDROESTIMATOR / UK KINDEX entries in the graphics sidebar. With Cayman moved to Tier 2, Bermuda is now the only unshipped Tier 1 radar source.
 
 ## Radar — Tier 2
 
 Sources with viable open access but at least one outstanding blocker — either a license question pending an operator response, a technical friction that adds material engineering cost, or a deferral while higher-value Tier 1s ship first.
 
-### Météo-France Antilles-Guyane (MQCOMP + GFCOMP)
+### India — IMD
 
-Source: `rwg.meteofrance.com` WMS GetMap for `BASE_REFLECTIVITY_ANTILLES` (Guadeloupe + Martinique mosaic) and `BASE_REFLECTIVITY_GUYANE_400` (French Guiana). Anonymous after a one-step JWT bootstrap: `GET https://meteofrance.gp/fr/images-radar/mosaique-antilles`, extract the `mfsession` cookie, `urldecode` + `rot13` to a JWT, then include the JWT in the WMS query. No account, no registration. 5-minute cadence, TIME at 5-min boundaries.
+Found 2026-08-19 during a re-survey of the Tier 3 "not investigated in depth" stub — that miss is corrected here. IMD serves a national Doppler mosaic plus per-station products as plain GIFs, anonymously, no auth, no WAF (verified by direct fetch):
 
-Format: PNG RGBA via the `synopsis_reflectivity_oppidum_transparence` style — colour-keyed reflectivity, palette decode required. Native dimensions: ANTILLES mosaic 700×600, GUYANE_400 700×700. EPSG:3857 projection.
+- National mosaic: `https://mausam.imd.gov.in/Radar/MOSAIC/Converted/mosaic.gif`
+- Per-station example: `https://mausam.imd.gov.in/Radar/caz_delhi.gif` — `radar.php` on the same host lists the full network with MAX / PPI / SRI / accumulation products per station.
 
-License: **Etalab Licence Ouverte v2.0** with attribution "Météo-France" — the same licence as the already-shipped AROME Antilles NWP source. The official Données Radar API on `portail-api.meteofrance.fr` requires account registration (auto-Tier-3 under the no-API-keys rule in `adding-a-source.md`), but the public viewer's WMS at `rwg.meteofrance.com` exposes the same data with the session-cookie bootstrap and is covered by the same Etalab licence.
+Coverage value: the highest of the entire remaining radar backlog — India is one of the largest radar voids on the coverage map.
 
-**Why this is uniquely valuable**: pairs radar + high-res NWP across the same domain. First source to do so outside CONUS and Europe, since AROME Antilles is already running for the model side. Three regions (Guadeloupe, Martinique, French Guiana) are otherwise covered only by the IFS global base.
-
-Open questions: JWT lifetime under sustained use (needs probing across hours — short-lived sessions need a refresh cycle, long-lived sessions can bootstrap once at startup); time-archive depth (capabilities suppresses the list; the viewer animation length suggests \~1–2 h); courtesy email to `contact.api@meteo.fr` for a paper trail on the `rwg.meteofrance.com` endpoint's specific terms.
+**Three open items before implementation:**
+1. **License**: weak — "© Copyright 2026 … India Meteorological Department" with no open-license statement. `data.gov.in` (the national open-data portal) was unreachable from the research host; check whether IMD publishes radar there under an open license before falling back to an email to IMD.
+2. **Palette and bounds**: GIF palette reverse-engineering against the published legend, plus geographic bounds/projection determination — the same shape of work as Malaysia MMD.
+3. **Cadence**: unmeasured (~10 min typical of IMD); confirm from frame timestamps.
 
 ### Argentina — SMN / SINARAME
 
@@ -181,6 +189,8 @@ Open questions: JWT lifetime under sustained use (needs probing across hours —
 If SMN says yes, the format is likely Sigmet IRIS RAW (same as Colombia), which would need `pyart`/`xradar` for decode. Tier 1 candidate at that point. If they say no, defer indefinitely — don't try to scrape past Cloudflare.
 
 Coverage value: significant. WRF-SMN already covers Argentina + Chile + Uruguay + Paraguay + parts of Bolivia and Brazil at 4 km / hourly. Observed radar over the same domain would be a meaningful upgrade from "model only."
+
+**Re-validated 2026-08-19:** unchanged. `smn.gob.ar/radar` still returns Cloudflare 403. The full AWS Open Data Registry tree was checked — the only SMN dataset remains `smn-ar-wrf-dataset` (the WRF model); bucket-name probes (`s3-radar-smn`, `smn-ar-radar`, `sinarame`) all return NoSuchBucket. The `odp-aws@smn.gov.ar` email remains the unlock.
 
 ### Mexico — CONAGUA SMN
 
@@ -197,6 +207,17 @@ Filename pattern: `{STATION}_{PRODUCT}_{MOMENT}_XXX_PXXX_YYYYMMDD_HHMMSS.gif`. P
 
 Format gotcha: palette table is not documented. Capture it from a representative reflectivity GIF; the React viewer renders the legend client-side, so the palette table may be embedded in `radarsDB.json` or the JS bundle — worth a deeper search before manual colour-picking.
 
+**Re-validated 2026-08-19:** the data endpoint is still anonymous, live, and current — `RDA_repository.php?dir=ecos&type=json` returns same-day timestamps at ~5–6 min cadence. No national composite exists (`dir=mosaico` returns "Api deny"). The license blocker persists: both the radar info page and the avisos-legales page return HTTP 500, so no terms statement is reachable. Two details worth recording: the `ecos` listing also carries US border NEXRAD stations CONAGUA ingests (YUMA, TUCS, PHNX, BROW, ELPA…) — irrelevant for coverage since MRMS already covers them, but don't mistake them for Mexican network stations when counting; and one station (RIAM) now serves PNG instead of GIF.
+
+### Cayman Islands — CINWS
+
+Moved from Tier 1 on 2026-08-19. The site relaunched (Laravel app) and two things changed:
+
+1. **URL layout rewritten.** Frame manifest is now inline JS (`window.radarFrames[id]` arrays, 10 frames per product, ~70-min PPI trail). Current patterns (all verified live, anonymous, no WAF): PPI 400 km → `https://www.weather.gov.ky/cdn/assets/images/radar/ppi_400km_1k/{TS}dBZ.ppi.jpg`; CAPPI 250 km → `cappi_250km_1k/{TS}dBZ.cappi.jpg`; CAPPI 40 nm → `cappi_40nm/…`; Sister Islands → `Sister_Islands/…`; Rain Rate → `RainRate/{TS}dBR.dpsri.jpg`; plus new Turbulence (`Turbulence/{TS}W.ltb.jpg`) and Wind Shear (`W_Shear/{TS}Shear.hshear.jpg`) products. Timestamp still 16-digit `YYYYMMDDHHMMSSSS` UTC. Cadence is irregular (~6.5–8.4 min between frames), not the clean 5-min the May survey recorded.
+2. **License turned restrictive.** The May 2026 "download weather data directly for research, planning and operational use" language is gone. The new `/terms-conditions` page states verbatim: *"The material may be downloaded to file or printer without requiring specific prior permission. Any other proposed use of the material is subject to the approval of the Director General, Cayman Islands National Weather Service."* Re-serving tiles through LibreWRX is unambiguously "any other proposed use" → written approval required.
+
+Bounds remain unpublished. **Action:** email the Director General, CINWS (Box 10022, Grand Cayman KY1-1001; Tel (345) 949-4528) requesting redistribution approval, and ask for product bounds in the same email. If granted, implementation is a JPEG fuzzy-palette decode plus empirical bbox fit — same shape as Bermuda but without the projection question.
+
 ### Thailand — TMD
 
 National composite at `weather.tmd.go.th/composite/index_composite.html`, driven by the HAniS animation framework. The radar layer is a transparent overlay (Singapore-style), not baked into a basemap — the architectural prerequisite for being usable. Frames composed from four layered PNGs at 1173×1668 RGBA, of which only `images/zr{NNNN}.png` (\~108 KB, \~525 distinct RGBA colours) is the radar data.
@@ -210,6 +231,8 @@ Frame manifest at `images_composite.list` — 24 frames at **15-minute cadence**
 3. **License unclear**. Radar composite page says only "Copyright © 2022 Thai Meteorological Department" with no open-data license referenced. Email confirmation from TMD is needed before shipping.
 
 If revisited: the official TMD data API at `data.tmd.go.th/api/index1.php` may have radar imagery on a documented endpoint that bypasses the composite-page WAF — worth checking. WMO WIS2 publication is the other long-horizon trigger.
+
+**Re-validated 2026-08-19:** all three frictions unchanged. The Incapsula WAF is still on the host (`/_Incapsula_Resource?…` script tag present in the page footer). The composite page footer is still verbatim "Copyright© 2022 by Thai Meteorological Department (TMD)"; `disclaimer.html` turned out to be a technical usage-caveat list (ground clutter, anomalous propagation) with no license grant. The official open-data portal `data.tmd.go.th` serves observation APIs anonymously (demo credentials baked into the docs) but carries **no radar product**; its NWP API requires registration. The TMD email remains the only unlock.
 
 ### Bahrain / Gulf Cooperation Council (gccmet.net)
 
@@ -229,25 +252,15 @@ URL extraction resolved 2026-05-15: `https://www.bahrainweather.gov.bh/o/ibl-ima
 
 If the email goes nowhere, this sits at the back of Tier 2 behind cleaner-format options. The image-based path is tractable but the cost / value is worse than every Tier 1.
 
-### Brazil — CPTEC/INPE sigma
+**Re-validated 2026-08-19:** still anonymous and live. URL pattern unchanged; the page manifest currently lists 285 frames at 5-min cadence (~24 h rolling, clock-aligned UTC). A direct frame fetch returned a valid JPEG measured at 1953×1297 px (first actual dimension measurement — the May survey didn't record one). Footer copyright still "© 2025 Ministry of Transportation and Telecommunications Kingdom of Bahrain"; gccmet.net itself was unreachable from the research host. Related development: the UAE's NCM now exposes a `gcc_radars_network` WMS layer (see the UAE entry in Tier 3) — the same GCC-wide product exists behind a 401 gate there while Bahrain serves it openly. The recommended pre-implementation email to Bahrain MoT / gccmet.net stands.
 
-**Path A (DECEA REDEMET) is ruled out** — `api-redemet.decea.mil.br` requires API-key registration. Auto-Tier-3 under the no-API-keys rule.
+### Bangladesh — BMD
 
-**Path B (CPTEC/INPE sigma reverse-engineering)** is the only acceptable path. The viewer at `sigma.cptec.inpe.br/radar/` aggregates data from all five Brazilian radar networks (INPE + DECEA + IPMet + CEMADEN + CENSIPAM) without an auth gate. Internal plumbing:
+Found 2026-08-19. Per-station radar GIFs listed at `https://www.bmd.gov.bd/radar` (five stations: Dhaka, Cox's Bazar, Khepupara, Molvibazar, Rangpur), with a dedicated fullscreen viewer host at `radar.bmd.gov.bd`. Anonymous access. License weak: verbatim footer "© Copy Rights 2014 - 2026 Bangladesh Meteorological Department. All rights reserved.", and the site runs an "Online Data Purchase" portal for bulk data — a commercial posture signal. Good monsoon-region value adjacent to India's domain; queue behind India, and the same email-first license posture applies.
 
-- Product catalog: `https://s0.cptec.inpe.br/webdsa/json_dsa/dados_radar.json` (\~756 KB). Keyed by 4-digit `idSubprod` codes; each entry has `filePath`, `fileDate`, `fileTime`, and a fully-qualified `url` to the PNG.
-- Image CDN: `https://satelite.cptec.inpe.br/repositorio7/{radar}/cappi/maxcappi/YYYY/MM/R{station_id}_{YYYYMMDDHHMM}.png` — anonymous, no auth.
+### Fiji — FMS
 
-**Why this is back of Tier 2 and not Tier 1:**
-
-- Per-radar PNGs, not a national mosaic — despite the viewer's appearance, the underlying data is per-station. A national composite would have to be built from \~24 stations, comparable to Mexico's complexity.
-- No documented URL contract — `dados_radar.json` and `repositorio7/...` paths are the viewer's internal plumbing, not a published API. More fragile than Mexico (which at least has documented per-station bounds in `radarsDB.json`).
-- Sample inspection has shown 2018-era timestamps in the top entries of the catalog. Either deep-archive priority or stale catalog — must verify current data freshness as the very first implementation step.
-- Whether each per-radar PNG carries a transparent radar overlay or a basemap-baked layer hasn't been confirmed.
-- Aggregator dependency: if CPTEC drops one of the five contributing networks, Brazil coverage degrades silently.
-- License not explicitly published on the radar viewer page. Email confirmation needed.
-
-Defensible to leave Brazil at the back of Tier 2 indefinitely — Argentina (single-email blocker) and Mexico (cleaner architecture) are higher-value Tier 2 targets and IFS already provides global fallback over Brazil.
+Found 2026-08-19. `https://www.met.gov.fj/maps-observation/radar-image/` serves a Fiji Composite plus Nadi / Nausori / Labasa single-station GIF loops (Labasa flagged as down on the page itself). Images are JS-loaded, so exact GIF URLs need extraction during pre-flight. License: "© 2026 Fiji Meteorological Services. All Rights Reserved." Small-island coverage, but Fiji is an RSMC tropical-cyclone region with no current LibreWXR presence. Back of Tier 2.
 
 ### Colombia — IDEAM (archive-only)
 
@@ -256,6 +269,8 @@ Anonymous AWS S3 bucket `s3-radaresideam` in `us-east-1`. AWS Open Data Sponsors
 **Blocker for the real-time pipeline**: \~24-hour publication delay. Querying today's directory returns zero keys; querying two days back returns data with all `LastModified` timestamps at \~04:04 UTC the following day. Useless for live precipitation overlay where users see "current" weather, but **Tier 1 for an archive/research mode** if LibreWXR ever adds one.
 
 If revisited: trigger is IDEAM shortening the publication delay (would be a meaningful operational change — worth checking annually). Decoding would need `pyart` or `xradar`, which is a meaningful new dependency LibreWXR currently avoids.
+
+**Re-validated 2026-08-19:** delay unchanged at ~24 h (2026-08-18 data landed 2026-08-19 ~04:03 UTC; same-day prefix empty). License confirmed verbatim from the AWS Open Data Registry entry: "Creative Commons Attribution 4.0 International (CC BY 4.0)". Station roster changed: a new **Munchique** radar is publishing; Bogota, Guaviare, and santa_elena did not appear in sampled recent prefixes (Barrancabermeja + Munchique only). File keys carry a new suffix scheme (e.g. `.RAWTYFP`), suggesting a product/format revision.
 
 ## Radar — Tier 3
 
@@ -276,10 +291,6 @@ If revisited: contact BOM about data access terms; check whether `api.bom.gov.au
 API-key gated. KMA's Open MET Data Portal at `data.kma.go.kr` does offer radar data, but access requires registration and a per-developer API key. Automatic Tier 3 under the no-API-keys rule (`adding-a-source.md`). Licence itself is dual-marked KOGL (Korea Open Government License) + Creative Commons and would otherwise be fine; the credential gate is the disqualifier.
 
 Trigger to revisit: KMA publishes anonymous radar endpoints, e.g. via the AWS Open Data Sponsorship Program. They already did this for GK-2A satellite data (`noaa-gk2a-pds` bucket is anonymous), so the precedent exists within the same agency. Same trigger pattern as Indonesia BMKG.
-
-### India — IMD
-
-Not investigated in depth. Large coverage area would be high-impact if open access exists.
 
 ### Netherlands — KNMI
 
@@ -305,6 +316,12 @@ Trigger to revisit: NZ government policy change repurposing MetService away from
 
 Paid / service-request model. IMN's data offerings explicitly note "information has associated costs depending on what is requested" — a pay-per-request model administered through service-request forms. AGPL self-hosted redistribution is incompatible with per-request paid licensing.
 
+### Brazil — CPTEC/INPE sigma
+
+Demoted from Tier 2 on 2026-08-19: the feed is confirmed dead/stale. The `dados_radar.json` catalog still serves, but its first entries are dated **2018-04-26** — confirming the staleness the May survey flagged as a risk. Current-dated image URLs under the documented `repositorio7/...` scheme return 404, and the sigma viewer page itself displays "Radares indisponíveis no momento" ("radars unavailable at the moment"). Path A (DECEA REDEMET) remains API-key-gated. With the aggregation feed stale, Brazil has no viable anonymous radar source.
+
+Trigger to revisit: CPTEC/INPE revives the sigma aggregation with fresh timestamps (check the catalog's first-entry dates), or one of the five constituent networks (INPE, DECEA, IPMet, CEMADEN, CENSIPAM) publishes its own open feed.
+
 ### Hong Kong — HKO
 
 Technically reachable anonymously (manifest at `nradar_img.json`, 6-min cadence, JPEG 577×400 at 64/128/256 km ranges), but the licence explicitly prohibits commercial redistribution: *"the use of the Materials for commercial purposes is strictly prohibited unless... prior written authorisation is obtained."* Radar imagery is **not** on the `data.gov.hk` Open Data API — the permissive open-data terms don't cover it.
@@ -313,6 +330,22 @@ If the licence ever opens, implementation effort would be \~1.5–2 days. The pr
 
 Trigger to revisit: HKO adds radar to `data.gov.hk` (where they already publish warnings, climate, station data under permissive terms).
 
+### France — Météo-France (Données Publiques Radar API)
+
+API-key gated — automatic Tier 3 under the no-API-keys rule. One API covers metropolitan France plus the overseas domains (Nouvelle-Calédonie, Antilles, Réunion) at 5-minute cadence, which is why this entry absorbs the former Antilles-Guyane Tier 2 entry. Prompted by GitHub issue #21 (2026-08-06, an operator reporting a working self-hosted integration); verified against Météo-France's current documentation on 2026-08-19.
+
+**Access.** Requires account registration + a free per-application subscription + a time-limited Bearer token (\~1 h validity) — verbatim from the quick-start guide: *"Sans token valable, l'API refuse toute requête, même si vous êtes bien inscrit et abonné."* Gateway base: `https://public-api.meteofrance.fr/public/<API>/v1/...`. The licence itself is fine (*"Sans redevance sous Licence Ouverte d'Etalab. La source à indiquer est "Météo-France"."*) — the credential gate is the sole disqualifier: every self-host operator would need their own Météo-France account, which is exactly what the rule guards against.
+
+**Products** (from the "Données radars" documentation page):
+
+- Reflectivity is **BUFR-only at every resolution** (individual 1 km, PAM 240 m, PAG 1 km, and the 1 km mosaic). The BUFR uses a custom non-dBZ encoding (a 0–79/255 code lookup) with Météo-France local descriptor tables — the docs ship those tables as a downloadable CSV zip and the FAQ acknowledges the values "ne sont pas directement exprimées en décibels Z". This is exactly why eccodes loads the message but fails on unpack, as the issue author found. A bespoke BUFR decoder is theoretically possible, but it is not ODIM.
+- The **500 m HDF5 mosaic is rain accumulation** ("lame d'eau", 1/100 mm), not reflectivity — so a working integration derives dBZ via Marshall-Palmer (same shape as the IFS path) rather than decoding measured reflectivity. The issue author's "500 m ODIM HDF5 composite" conflates the two products; "ODIM" is not claimed in the docs.
+- **Near-real-time only.** Historical radar is distributed on-request via FTP; the real-time endpoints serve only the newest slots. Operator-reported runtime detail (issue #21 — consistent with the docs, not independently verified): the product endpoint silently ignores `date` / `time` / `referencetime` / `validity_time`, and the packet endpoint holds only the last 3 slots (\~15 min), so a deployment fills its frame store forward with no backfill on cold start.
+
+**The anonymous path is dead.** The `rwg.meteofrance.com` WMS (the basis of the former Antilles-Guyane Tier 2 entry) was retired between 2026-08-06 and 2026-08-19: every WMS/WFS/GetMap path returns 404 (never 401/403) and the host serves only a "Welcome on rpcache service!" placeholder. The viewer JS now points at a non-public `rpcache-aa-integration.meteofrance.com` host, and the old geoservices catalogue states the unique-key method was deactivated in favour of the API portal. Per issue #21 the rwg route also covered metropolitan France with a \~48 h archive — moot now that the host is gone. The old mfsession/rot13-JWT recipe is preserved in git history if the service ever returns.
+
+Trigger to revisit: Météo-France publishes a real-time radar raster to an anonymous channel — `meteo.data.gouv.fr` is the plausible host, since it already carries the COMEPHORES hourly accumulation reanalysis (1997–present, GeoTIFF, metropolitan France) — or the project ever relaxes the no-API-keys rule.
+
 ### Saudi Arabia — NCM
 
 No anonymous public radar URL exists. NCM's ArcGIS Hub publishes climate, surface station, and alert data but conspicuously no radar. `meteo.ncm.gov.sa` is a registered-user portal (MeteoKSA). `beta.ncm.gov.sa` doesn't resolve from non-Saudi hosts.
@@ -320,6 +353,32 @@ No anonymous public radar URL exists. NCM's ArcGIS Hub publishes climate, surfac
 Evidence the data is gated: the third-party viewer at `radar-flask.xyz` displays NCM radar with KML overlays, but its JS calls `/radar_image_proxy/${colormap}/${ts}` — a backend proxy on its own server, not direct NCM URLs. The proxy exists precisely because direct anonymous access doesn't work; the operator likely registered for MeteoKSA and runs the proxy from their own infrastructure. LibreWXR can't follow that path — would require either every self-hoster getting MeteoKSA credentials (API-key rule violation) or routing through a central proxy (not self-hostable).
 
 Trigger to revisit: NCM publishes radar to their ArcGIS Hub, to anonymous AWS/CDN, or via a documented free-tier API on `data.ncm.gov.sa` or similar.
+
+**Re-checked 2026-08-19:** ncm.gov.sa relaunched ("enhanced digital platform") with a new "Direct API Integration" service — but it covers forecasts and early warnings only, no radar. MeteoKSA is still login-gated (`demometeoksa.ncm.gov.sa/auth/login`); `beta.ncm.gov.sa` still does not resolve. No change to the revisit trigger.
+
+### Mongolia — NAMEM
+
+Probed 2026-08-19. Radar hardware exists (JICA-granted C-band network; NAMEM's own open-data page names a senior specialist responsible for the "radar network"), and `weather.gov.mn` has a public "Радар" tab — but the site is a Next.js SPA pulling from an undocumented internal API (`/api/get/radar` → 404; only `/api/get/forecasts` is exposed). No static raster endpoint found. NAMEM additionally runs a paid tariff page for data/archive services (`namem.gov.mn/p/service-prices`), and no open license appears anywhere (footer "© 2026 NAMEM").
+
+Trigger to revisit: NAMEM publishes radar rasters to a documented anonymous endpoint, or opendata.gov.mn (currently a JS SPA, not enumerable server-side) lists a radar dataset under an open license.
+
+### United Arab Emirates — NCM
+
+Found 2026-08-19. `ncm.gov.ae` (new canonical host, formerly ncm.ae) exposes radar layers in its SPA config — notably `gcc_radars_network` and `uae_radars_network` WMS layers on `tiles2.ncm.gov.ae`. Every probe (WMS GetCapabilities, GeoServer paths) returns HTTP 401 — a credential-gated GeoServer, failing the anonymous rule. Footer "© National Center of Meteorology 2026". Notable because it proves a GCC-wide radar composite product exists on the UAE side too — Bahrain serves the same composite openly (see the GCC entry in Tier 2).
+
+Trigger to revisit: `tiles2.ncm.gov.ae` drops the auth requirement on the WMS.
+
+### Kuwait — DGCA Meteorological Department
+
+Found 2026-08-19. Radar pages exist at `met.gov.kw/Radar/maxz.php` (MAXCAPPI 125 km) and `maxz_250.php` (250 km) but currently serve a maintenance placeholder. Disqualifying regardless — verbatim footer: *"It is not allowed to broadcast, publish, or amend any part of the site and the information it contains without prior written approval by the Directorate General of Civil Aviation."* Explicit redistribution prohibition backed by law No. 64/1999 — same class as Hong Kong.
+
+Trigger to revisit: an open-data license or written approval appears.
+
+### Oman — CAA Directorate General of Meteorology
+
+Found 2026-08-19. New portal at `met.caa.gov.om` (WordPress; `met.gov.om` redirects there). Parts of the site are login-gated (free-account registration), and no anonymous radar image/tile endpoint was found in the pages fetched.
+
+Trigger to revisit: an anonymous radar endpoint or open-data publication.
 
 ### Turkey — MGM
 
@@ -340,6 +399,18 @@ Trigger to revisit: Vietnam publishes radar to WMO WIS2 (currently sparse — on
 App-only distribution policy. The national composite URL `https://inderaja.bmkg.go.id/Radar/Indonesia_ReflectivityQCComposite.png` is documented, but all `/Radar/*` requests return HTTP 301 → a generic splash image. BMKG's own viewer page states: *"Currently radar weather imagery can only be accessed through the Info BMKG application."* The open-data portal `data.bmkg.go.id` publishes forecasts, earthquakes, and nowcast alerts but radar is conspicuously absent.
 
 Trigger to revisit: BMKG adds radar to `data.bmkg.go.id` (where they already publish forecasts/earthquakes/nowcasts under a citation-required open licence). If that happens, BMKG jumps straight to Tier 1 — the composite product clearly exists and the agency is comfortable with the open-data model for other products. This is the most promising future SE Asia candidate if the policy ever flips.
+
+### South Africa — SAWS
+
+Probed 2026-08-19. `weathersa.co.za` is a React SPA behind Cloudflare challenge scripts (`cdn-cgi/challenge-platform`) — not server-side fetchable. SAWS also operates a commercial data-sales model. Southern Africa remains a radar void.
+
+Trigger to revisit: SAWS publishes radar to an anonymous endpoint or the AWS Open Data program.
+
+### China — CMA (radar)
+
+Probed 2026-08-19, complementing the existing CMA NWP entry in the NWP Tier 3 section. Public radar mosaics exist only as JS tile maps (`weather.com.cn/radar/`, tiles on `i.tq121.com.cn`) with no clean static raster; `data.cma.cn` is a registered-access portal and the public sites carry "All Rights Reserved" notices. Same structural blockers as the model side.
+
+Trigger to revisit: mirrors the CMA NWP trigger — an anonymous data channel or AWS Open Data publication.
 
 ### Iceland — Vedur.is
 
@@ -364,7 +435,7 @@ Trigger to revisit: DMN publishes radar to `data.gov.ma` (which would also requi
 
 Pre-war Ukraine had a small radar network operated by State Enterprise «UAMC» under the Ukrainian Hydrometeorological Center: Boryspil (UKBB) near Kyiv, relaunched April 2019 after years of dormancy, plus Zaporizhya (UKDE) listed historically by aggregators. Per the Ukrainian Hydrometeorological Center Wikipedia entry, *"Weather radar (operated by SE «UAMC» and relaunched in 2019, it was destroyed in 2022 during Russian invasion."* Many other surface stations were also lost or damaged.
 
-Current state (2026-05): `meteo.gov.ua` has no radar product in its public navigation, only forecasts, Meteosat-derived satellite composites, and warnings. Rain Viewer still lists UKBB+UKDE but the upstream WMS returns server errors for both — consistent with a long-term outage rather than a transient blip. Ukraine is not a EUMETNET member, so its radars were never part of the OPERA composite either. Aggregators currently displaying "Ukraine radar" (AccuWeather, Weather.com, meteoblue) are showing model-derived precipitation, not radar returns — the same approach LibreWXR uses with IFS over uncovered regions.
+Current state (2026-05): `meteo.gov.ua` has no radar product in its public navigation, only forecasts, Meteosat-derived satellite composites, and warnings. Rain Viewer still lists UKBB+UKDE but the upstream WMS returns server errors for both — consistent with a long-term outage rather than a transient blip. Ukraine is not a EUMETNET member, so its radars were never part of the OPERA composite either. Aggregators currently displaying "Ukraine radar" (AccuWeather, Weather.com, meteoblue) are showing model-derived precipitation, not radar returns — LibreWXR instead uses RRQPE observed precipitation (satellite-derived, 60S-70N band) over such uncovered in-band regions for past frames, with the model layer only poleward / fringe / RRQPE-decline.
 
 A different shape of Tier 3 blocker from the rest of this section: not licence, not policy, not API-key — infrastructure unavailable. The same shape applies in principle to other countries with ongoing severe disruption (Gaza, Sudan, Yemen); not worth surveying proactively, the agency announcement is the trigger.
 
@@ -389,6 +460,16 @@ Secondary blockers that would also need resolving if the policy block were ever 
 Coverage cost is acknowledged honestly: European Russia is the largest contiguous Eurasian radar void in our coverage map. OPERA's eastern edge sits at roughly the Baltic states + Belarus + Black Sea, and the gap east of that is substantial. The decision is not free of cost.
 
 No re-evaluation trigger tied to data access, licence, or WIS2 publication. The only relevant change of circumstance is the end of the war and a meaningful change in the Russian government's posture toward Ukraine.
+
+### Rapid triage notes (2026-08-19)
+
+One-line outcomes from the same sweep, recorded so they aren't re-probed blindly: **Kazakhstan** (Kazhydromet) — radar viewer exists at `kazhydromet.kz/vc/radar_viewer/` but states "radar data temporarily unavailable"; all-rights-reserved footer. **Israel** (IMS) — composite radar player exists but is a JS SPA behind a mandatory terms-of-use consent prompt (mirrors the NWP-side ToU friction). **Kenya** (KMD) — `meteo.go.ke` carries satellite imagery but no public radar product. **Unreachable from the research host** (timeouts, bot checks, or redirect loops — unverified, not confirmed-absent): Chile (meteochile.gob.cl), Cuba (insmet.cu), Iran (irimo.ir), Egypt (ema.gov.eg), Pakistan (pmd.gov.pk), Nigeria (nimet.gov.ng), Qatar (qweather.gov.qa).
+
+## Satellite — Implemented
+
+### NOAA GMGSI (LW + VIS) — shipped 2026-05-24
+
+Hourly global mosaic (±72.7 deg), VIS-over-LW composite with day/night terminator, S3 bucket noaa-gmgsi-pds. See docs/satellite-implementation-plan.md for the full record.
 
 ## NWP — Implemented
 
@@ -436,7 +517,7 @@ Outside the DINI domain: Iberia, southern Italy, Greece, Balkans, Belarus / Ukra
 
 ### ICON-EU (priority 35)
 
-7 km lat/lon, 3-hourly cycles. DWD opendata at `opendata.dwd.de/weather/nwp/icon-eu/`. `tot_prec` accumulated; difference consecutive steps for hourly rate; Marshall-Palmer Z-R with +6 dBZ calibration offset against OPERA radar.
+7 km lat/lon, 3-hourly cycles. DWD opendata at `opendata.dwd.de/weather/nwp/icon-eu/`. `tot_prec` accumulated; difference consecutive steps for hourly rate; Marshall-Palmer Z-R with +12 dBZ default calibration offset against OPERA radar.
 
 ### WRF-SMN Argentina (priority 40)
 
@@ -454,9 +535,9 @@ Per-file size (\~34 MB NetCDF4) makes serial download painfully slow, so this so
 
 Pairs with the JMA HRPN radar composite (JPCOMP, analysis-only post-revert) to give Japan a proper mesoscale NWP overlay instead of falling through to global IFS for the model side of the nowcast blend.
 
-### ECMWF IFS (priority 1000, global base)
+### ECMWF IFS (priority 1000, terminal model)
 
-9 km native (O1280 reduced Gaussian → regridded to 0.1° lat/lon). Open-Meteo S3 mirror, CC-BY-4.0. Provides pseudo-reflectivity (precipitation rate → dBZ via Marshall-Palmer) plus snow/rain classification globally. Optical flow interpolation of hourly IFS → 10-minute frames. This is the global base layer, not a "fallback" — it provides coverage everywhere a regional model isn't running.
+9 km native (O1280 reduced Gaussian → regridded to 0.1° lat/lon). Open-Meteo S3 mirror, CC-BY-4.0. Provides pseudo-reflectivity (precipitation rate → dBZ via Marshall-Palmer) plus snow/rain classification globally. Optical flow interpolation of hourly IFS → 10-minute frames. IFS is the terminal model of the chain — it provides model coverage everywhere a regional model isn't running. For past frames within the 60S-70N band that means it answers only poleward of the band, in the 2-degree fringe excluded by RRQPE's coverage polygon, and when RRQPE declines: the observed band layer is NOAA RRQPE, an always-on radar region (see Radar — Implemented), not IFS.
 
 ## NWP — Tier 2
 
@@ -476,7 +557,7 @@ The cadence is a real downside: **12-hourly cycles** mean the forecast at "now" 
 
 ### AROME Réunion-Mayotte / French Guiana / New Caledonia / French Polynesia
 
-Etalab-licensed, keyless on data.gouv.fr (same channel as AROME Antilles). 1.3 km native, hourly, 4× daily. Each domain is small and remote: Indian Ocean / Madagascar (Réunion-Mayotte), N. South America corner (French Guiana), SW Pacific (New Caledonia), S. Pacific (French Polynesia). Cheap to add once AROME Antilles is in — same source class with different domain constants. \~50 LOC + tests per added overseas variant.
+**Shipped** — see AROME Indien (Réunion/Mayotte), AROME Guyane, AROME Ncaled, and AROME Polyn under NWP — Implemented. The standalone "Réunion-Mayotte" domain no longer exists as a separate product; AROME Indien covers that area.
 
 ### Canada CAPS (Canadian Arctic Prediction System)
 

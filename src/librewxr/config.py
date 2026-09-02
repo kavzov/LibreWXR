@@ -17,13 +17,21 @@ _MODE_DEFAULTS: dict[str, dict[str, int]] = {
         "workers": 1,
         "tile_cache_mb": 200,
         "coord_cache_size": 2048,
+        "coord_store_mb": 1024,
         "warmer_threads": 0,  # 0 keeps the "auto = CPU-1" behaviour in single mode
+        "warm_coord_zoom": 6,
     },
     "multi": {
         "workers": 16,
         "tile_cache_mb": 128,
         "coord_cache_size": 512,
+        "coord_store_mb": 8192,
         "warmer_threads": 4,
+        # No eager coordinate warm in render workers: they serve immediately
+        # from the on-disk state snapshot and coordinate entries load lazily
+        # through the shared coord store.  A negative value here is the
+        # "disabled" resolution (see warm_coord_zoom below).
+        "warm_coord_zoom": -1,
     },
 }
 
@@ -50,6 +58,11 @@ class Settings(BaseSettings):
     fetch_interval: int = 600  # seconds between fetches (10 min = radar frame cadence)
     max_frames: int = 12
     max_zoom: int = 12
+    # Root log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
+    # (case-insensitive; normalized to uppercase by the validator).
+    log_level: str = "INFO"
+    # File capturing WARNING+ records (rotated 5 MB x 3); empty = disabled
+    log_file: str = "logs/librewxr.log"
     # Deployment shape.  Drives sensible defaults for workers, tile cache,
     # coord cache, and warmer threads via ``_apply_mode_defaults``.
     #   single  - one container, fetcher + renderer in the same process
@@ -61,10 +74,29 @@ class Settings(BaseSettings):
         "single",
         validation_alias=AliasChoices("LIBREWXR_MODE", "COMPOSE_PROFILES"),
     )
-    # All four below use 0 as a "use mode default" sentinel.  Set an
+    # All six below use 0 as a "use mode default" sentinel.  Set an
     # explicit value to override the per-mode default in _MODE_DEFAULTS.
     tile_cache_mb: int = 0  # Max tile cache size in MB (byte-capped); 0 = mode default
     coord_cache_size: int = 0  # LRU entries per coordinate cache; 0 = mode default
+    # Shared on-disk coordinate-array store (see data/coord_store.py).  The
+    # six cached tile-coordinate functions in tiles/coordinates.py publish /
+    # read their computed arrays here so multi-worker deployments compute
+    # each array once globally instead of once per worker.  Best-effort: any
+    # store failure falls back to the in-process compute path.
+    coord_store_enabled: bool = True  # Kill switch; False bypasses the store entirely
+    coord_store_mb: int = 0  # Coord-store size cap in MB; 0 = mode default (single 1024, multi 8192)
+    # Shared on-disk encoded-tile store (see tiles/shared_tile_store.py).
+    # Multi-mode only: render workers publish / read encoded tile bytes on
+    # the shared cache volume so one worker's encode serves all workers.
+    # Content-versioned keys (built by the wiring) make stale entries
+    # unreachable between fetch cycles.  Semantics:
+    #   None          - auto: render-only workers default to a 2048 MB
+    #                   budget; single-mode deployments leave the store
+    #                   disabled (the wiring decides).
+    #   0 or negative - disabled.
+    #   positive      - explicit MB budget for the shared encoded-tile
+    #                   store (multi-mode only).
+    shared_tile_store_mb: int | None = None
     memory_limit_mb: int = 0  # Container memory limit in MB (0 = auto-detect)
     memory_pressure_check_interval: int = 30  # Seconds between memory pressure checks
     smooth_radius: float = 1.0  # Baseline Gaussian blur radius; renderer auto-scales it up at high zoom on coarse sources
@@ -82,7 +114,14 @@ class Settings(BaseSettings):
     native_render: Literal["auto", "on", "off"] = "auto"
     workers: int = 0  # Number of uvicorn worker processes; 0 = mode default
     warmer_threads: int = 0  # Render thread pool size; 0 = mode default (auto in single, 4 in multi) (sizes the request-executor pool in multi mode; the warmer itself is single-mode only)
-    warm_coord_zoom: int = 6  # Pre-warm coordinate caches up to this zoom (0 = disable) (in multi mode runs in each render worker at startup)
+    # Pre-warm coordinate caches up to this zoom as a background task at
+    # startup (0 = mode default: single warms to 6, multi does no eager
+    # warm — see _MODE_DEFAULTS).  Any negative value disables the warm
+    # entirely in either mode; any positive value forces that zoom in
+    # either mode.  The warm never blocks the server from accepting
+    # requests, and coordinate wrappers fill unwarmed entries on demand
+    # via the shared on-disk store either way.
+    warm_coord_zoom: int = 0
     warm_overview_zoom: int = 4  # Pre-render ALL tiles up to this zoom on each fetch (-1 = disable) (single mode only; no-op in multi mode — the empty-tile fast path covers it)
     warm_overview_zoom_regional: int = 6  # Pre-render tiles overlapping enabled regions up to this zoom (-1 = disable) (single mode only; no-op in multi mode — the empty-tile fast path covers it)
     enabled_regions: str = "ALL"  # Region spec: CONUS, US, ALL, or comma-separated region names
@@ -167,8 +206,8 @@ class Settings(BaseSettings):
     # anonymous HTTPS at ``api.met.gov.my``.  10-min native cadence — one
     # animated GIF per fetch carries 6 frames (~60 min of backfill).
     # Decoded via 18-stop palette → dBZ table, sub-rectangle split into
-    # MYPENINSULAR + MYEAST regions.  CC-BY-4.0 licensed.  Sole source in
-    # the SOUTHEAST_ASIA region group.
+    # MYPENINSULAR + MYEAST regions.  CC-BY-4.0 licensed.  Shares the
+    # SOUTHEAST_ASIA region group with PAGASA (PHCOMP).
     mmd_base_url: str = "https://api.met.gov.my"
     mmd_enabled: bool = True
     # Publication lag (seconds) used as a ceiling when labelling frame
@@ -180,6 +219,15 @@ class Settings(BaseSettings):
     # response whose ``Last-Modified`` is more than this far behind wall
     # clock is treated as legitimately old data, not relabelled forward.
     mmd_publish_lag_sec: int = 600
+    # PAGASA (Philippine Atmospheric, Geophysical and Astronomical
+    # Services Administration) PANAHON radar mosaic via anonymous
+    # CloudFront-fronted JSON+PNG API.  15-min native cadence (the
+    # store grid is 10 min, so the source rounds each requested slot
+    # to the nearest native frame, ≤7.5 min off — invisible in
+    # animation).  Public domain license per Philippine IP code
+    # RA 8293 §176; attribution to PAGASA in README.
+    pagasa_base_url: str = "https://cdn.panahon.gov.ph"
+    pagasa_enabled: bool = True
     # DPC Italy national radar composite via the open Radar-DPC v2 REST API
     # (``radar-api.protezionecivile.it``).  Anonymous, 5-min native cadence,
     # Float32 GeoTIFF in spherical Transverse Mercator, CC-BY-SA 4.0.  Sole
@@ -220,13 +268,13 @@ class Settings(BaseSettings):
     # sources that don't carry a native snow-ratio field.  Each source
     # computes snow = (T_2m < threshold).  1.5 °C matches Open-Meteo's
     # softer threshold and captures wet-snow at ground level without
-    # painting cold rain as snow.  Used by HRRR, HRRR-Alaska, HRDPS,
-    # DMI DINI, ICON-EU, and WRF-SMN.  IFS uses its native snowfall
+    # painting cold rain as snow.  Used by HRRR, HRRR-Alaska, JMA MSM,
+    # WRF-SMN, DMI DINI, and ICON-EU.  IFS uses its native snowfall
     # ratio (``ecmwf_snow_ratio_threshold`` above) instead.
     regional_snow_temp_threshold: float = 1.5
     # Apply the same Farneback optical-flow temporal interpolation we use
     # on hourly IFS frames to regional NWP sources whose native cadence
-    # is also hourly (WRF-SMN, DMI DINI — others coming).  Without this,
+    # is also hourly (WRF-SMN, DMI DINI, ICON-EU, JMA MSM).  Without this,
     # a moving precip cell appears to cross-fade between hourly bracket
     # frames at intermediate query times, producing a visible "two faint
     # copies" ghost.  With this on, the cell translates smoothly along
@@ -257,6 +305,42 @@ class Settings(BaseSettings):
     # leaves IFS on; turn off only when you specifically want to see what
     # a regional model contributes on its own.
     ecmwf_enabled: bool = True
+    # NOAA Enterprise Rain Rate (RRQPE) GLB-5 blend — satellite-derived
+    # *observed* precipitation on a global uniform 0.02° grid, consumed
+    # from the anonymous NOAA Open Data bucket
+    # ``noaa-enterprise-rainrate-pds``.  Because it is observations
+    # rather than model output it is ingested as a RADAR source (a single
+    # coarse global region, ``sources/world/rrqpe``) rather than an NWP
+    # chain member: it participates in the radar compositor, nowcast
+    # extrapolation, carry-forward, and state sync like any other region,
+    # and only ever answers for past valid times — future / nowcast
+    # timestamps fall through to the models.
+    rrqpe_enabled: bool = True
+    rrqpe_base_url: str = "https://noaa-enterprise-rainrate-pds.s3.amazonaws.com"
+    # How long after a 10-min scan start the file is considered safely
+    # published.  The fetch window ends at ``now - publish_delay`` so
+    # not-yet-published slots are never requested; a missed scan simply
+    # has no key in its hour directory and is skipped.
+    rrqpe_publish_delay_minutes: int = 15
+    # dBZ calibration shift applied after Z-R conversion of RRQPE rain
+    # rates.  Same Marshall-Palmer caveat as ICON-EU / DINI: satellite
+    # QPE is a surface rain rate, radar reflectivity samples the storm
+    # column and reads higher, so nudge the derived dBZ up to match.
+    rrqpe_dbz_offset: float = 6.0
+    # Integer block-averaging factor for the 0.02° native grid
+    # (1/2/4 → 0.02°/0.04°/0.08°).  2 is the default: each decoded
+    # ~117 MB float32 frame becomes a ~29 MB uint8 store.
+    rrqpe_downsample: int = 2
+    # Match slack around the ideal constant-shift target slot: every frame
+    # is served the scan exactly ``RRQPE_LAG_SECONDS`` (30 min) its senior
+    # (see the RRQPE grid), and this value bounds how far the nearest
+    # stored scan may sit from that ideal target.  At the default it
+    # tolerates up to ~2 consecutive missed scan slots before the region
+    # declines for the affected frames — carry-forward / NWP fill take
+    # over until the next fetch cycle heals.  Not a publish-lag cap: the
+    # shift is constant by design.  Future/nowcast timestamps are
+    # rejected by the wall-clock observed-only gate in the RRQPE grid.
+    rrqpe_match_tolerance_seconds: int = 1800
     # North American NWP source for the chain. "ifs" uses ECMWF IFS as the
     # only source (current behavior). "hrrr" prepends NOAA HRRR-subh as the
     # CONUS-priority source, falling back to IFS outside HRRR's domain.
@@ -297,7 +381,7 @@ class Settings(BaseSettings):
     # the brightest part of the storm column and tends to read 5-10
     # dBZ higher than the surface rate would predict.  Tune up to make
     # convective cells closer in colour to OPERA radar.
-    icon_eu_dbz_offset: float = 6.0
+    icon_eu_dbz_offset: float = 12.0
     # DMI HARMONIE-AROME DINI is published anonymously on AWS Open Data
     # (s3://dmi-opendata in eu-north-1).  Each (run, lead) is a single
     # ~600 MB GRIB2 file; we fetch only the tp message (~9 MB) per leadtime
@@ -307,7 +391,7 @@ class Settings(BaseSettings):
     dmi_dini_publish_delay_minutes: int = 180  # files publish ~3 h after run init
     # Same Marshall-Palmer caveat as ICON-EU.  HARMONIE has no native
     # composite reflectivity output so we derive dBZ from accumulated tp.
-    dmi_dini_dbz_offset: float = 6.0
+    dmi_dini_dbz_offset: float = 12.0
     # ECCC HRDPS continental: 2.5 km native rotated lat/lon, 4 cycles/day
     # (00/06/12/18 UTC), 48 h horizon, 1-hour APCP accumulation.  Anonymous
     # HTTPS via dd.weather.gc.ca — no auth, no API key.  Independent toggle
@@ -367,7 +451,7 @@ class Settings(BaseSettings):
     # SMN Argentina WRF-DET: 4 km LCC over Argentina + Chile + Uruguay
     # + Bolivia + Paraguay + S. Brazil — first regional NWP for the
     # South American Cone.  Anonymous AWS Open Data S3 (smn-ar-wrf in
-    # us-east-1), 4 cycles/day (00/06/12/18 UTC), 72 h horizon, NetCDF4
+    # us-west-2), 4 cycles/day (00/06/12/18 UTC), 72 h horizon, NetCDF4
     # files (~34 MB each).  Independent toggle since this is the only
     # source covering the South American chain slot.
     wrf_smn_enabled: bool = True
@@ -397,10 +481,11 @@ class Settings(BaseSettings):
     nowcast_frames: int = 6
     nowcast_blend_mode: str = "blended"  # "radar", "blended", or "model"
     # Display-only motion-compensated frames inserted between each pair of
-    # native radar/nowcast timestamps.  1 disables interpolation; 2 adds one
-    # midpoint (2.5-minute display cadence when fetch_interval=300).  These
-    # frames never enter point-nowcast sampling or alert logic.
+    # native radar/nowcast timestamps. 1 disables interpolation; 2 adds one
+    # midpoint. These frames never enter point-nowcast sampling or alert logic.
     radar_animation_substeps: int = Field(default=1, ge=1, le=5)
+    nowcast_coarsen_enabled: bool = True  # Progressive smoothing of extrapolated radar with lead time
+    nowcast_coarsen_max_km: float = 3.0  # Effective resolution floor reached at the last blend step
     # Separate optical-flow computation used by the /v2/radar motion-arrow
     # overlay.  Arrows key off per-region Farneback flow between the two
     # most recent radar frames; that flow is otherwise computed only as a
@@ -423,7 +508,7 @@ class Settings(BaseSettings):
     arrow_flow_target_dim: int = 500
     # Resolution of the global composite NWP flow raster used by the
     # arrow overlay outside radar coverage, in degrees.  0.25 (default)
-    # gives a 720×360 float32 grid (~2 MB, <1s Farneback/cycle).  The
+    # gives a 721×1440 float32 grid (~4 MB, <1s Farneback/cycle).  The
     # 32/48px arrow draw grid can't resolve finer detail at most zooms,
     # so coarser is cheaper for no visible loss.  Finer values help
     # only at high zoom inside small convective cells — which inside
@@ -454,10 +539,21 @@ class Settings(BaseSettings):
     # before failing loudly.  0 = wait forever.
     state_wait_timeout: float = 300.0
     # Number of complete immutable snapshots to retain, including current.
-    # Three means current + two previous generations.  Must stay >= 2 so a
-    # renderer racing the atomic pointer switch can still finish opening the
-    # prior generation's memmaps.
+    # Keep at least two so a renderer racing the atomic pointer switch can
+    # finish opening the previous generation's memmaps.
     state_retention_generations: int = Field(default=3, ge=2)
+    # Seconds uvicorn's master waits for a worker healthcheck ping before
+    # killing + respawning the worker.  Render workers can stall past the
+    # 5 s default when they page-fault freshly written memmap frames off a
+    # slow backing disk while holding the GIL; 30 s lets a stalled worker
+    # recover instead of being SIGKILLed.  0 = uvicorn's built-in default.
+    worker_healthcheck_timeout: int = 30  # seconds; 0 = uvicorn default (5)
+    # Pipeline-only (multi mode): after each fetch cycle, preload freshly
+    # written memmap frame files into the host page cache via
+    # posix_fadvise(WILLNEED) so render workers don't cold-fault on slow
+    # disks (the host page cache is shared between the pipeline and
+    # renderer containers).
+    pagecache_prime_enabled: bool = True
 
     # WMO CAP Weather Alerts
     alerts_enabled: bool = True
@@ -479,6 +575,12 @@ class Settings(BaseSettings):
     # set.  4 fits comfortably in 8 GB; bump higher for fatter rigs to
     # bring fetch-cycle wall time closer to the slowest single source.
     nwp_fetch_concurrency: int = 4
+    # Maximum number of radar region-frame fetches (live or archive)
+    # running in parallel inside one fetch cycle.  Each in-flight fetch
+    # can hold 100-200 MB during decode (MRMS), so 8 caps transient
+    # decode RAM around 1.6 GB; raise on fatter rigs to shorten backfill
+    # wall time.
+    radar_fetch_concurrency: int = 8
     cors_origins: list[str] = ["*"]
 
     @field_validator("mode", mode="before")
@@ -500,6 +602,13 @@ class Settings(BaseSettings):
         if "single" in tokens:
             return "single"
         return "single"
+
+    @field_validator("log_level")
+    @classmethod
+    def _normalize_log_level(cls, v: str) -> str:
+        """Validate + canonicalize LIBREWXR_LOG_LEVEL via the shared helper."""
+        from librewxr.logging_setup import normalize_level
+        return normalize_level(v)
 
     @model_validator(mode="after")
     def _apply_mode_defaults(self):

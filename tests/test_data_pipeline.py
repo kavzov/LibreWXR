@@ -18,6 +18,7 @@ import asyncio
 import importlib
 import os
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -139,9 +140,16 @@ async def test_render_only_lifespan_picks_up_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "alerts_enabled", False)
     monkeypatch.setattr(settings, "state_wait_timeout", 5.0)
     monkeypatch.setattr(settings, "state_poll_interval", 0.1)
+    # Keeps the warm+jitter wiring covered without a multi-GB zoom-6 store
+    # publish in a unit test.
+    monkeypatch.setattr(settings, "warm_coord_zoom", 2)
 
     from librewxr import main as main_module
     from librewxr.api import routes
+
+    # The warm-pass jitter (uniform 0..15 s) would stall this smoke test;
+    # the constant is module-level precisely so tests can neutralize it.
+    monkeypatch.setattr(main_module, "_WARM_JITTER_MAX_S", 0.0)
 
     # FastAPI app stub — _render_only_lifespan only takes app for symmetry.
     class _StubApp:
@@ -159,6 +167,204 @@ async def test_render_only_lifespan_picks_up_snapshot(tmp_path, monkeypatch):
         assert routes.ecmwf_grid is None
 
     # cleanup happens inside the lifespan __aexit__; nothing to assert.
+
+
+@pytest.mark.asyncio
+async def test_render_only_lifespan_nowcast_store_skips_tmp_sweep(
+    tmp_path, monkeypatch,
+):
+    """Render workers construct their NowcastStore with ``cleanup_tmp=False``.
+
+    The pipeline owns the shared nowcast dir and may be mid-write when a
+    worker boots; a default ``True`` sweep in ``__init__`` would unlink
+    its in-flight ``*.tmp`` files (the sweep stays the pipeline's job at
+    its own boot).  Capture the constructor kwargs on the boot path.
+    """
+    from librewxr.config import settings
+    from librewxr.data.master_state import dump_state
+    from librewxr.data.store import FrameStore, RadarFrame
+    from librewxr.tiles.coordinates import COMPOSITE_HEIGHT, COMPOSITE_WIDTH
+    from librewxr import main as main_module
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    producer = FrameStore(max_frames=4, cache_dir=cache_dir)
+    arr = np.zeros((COMPOSITE_HEIGHT, COMPOSITE_WIDTH), dtype=np.uint8)
+    await producer.add_frame(RadarFrame(timestamp=42, regions={"USCOMP": arr}))
+    dump_state({"frame_store": producer}, cache_dir)
+
+    monkeypatch.setattr(settings, "render_only", True)
+    monkeypatch.setattr(settings, "cache_dir", str(cache_dir))
+    # Nowcast on so the boot path actually constructs the store; other
+    # optional stores stay off (the snapshot doesn't include them).
+    monkeypatch.setattr(settings, "satellite_enabled", False)
+    monkeypatch.setattr(settings, "nowcast_enabled", True)
+    monkeypatch.setattr(settings, "arrow_flow_enabled", False)
+    monkeypatch.setattr(settings, "alerts_enabled", False)
+    monkeypatch.setattr(settings, "state_wait_timeout", 5.0)
+    monkeypatch.setattr(settings, "state_poll_interval", 0.1)
+    monkeypatch.setattr(settings, "warm_coord_zoom", 2)
+    monkeypatch.setattr(main_module, "_WARM_JITTER_MAX_S", 0.0)
+
+    captured: list[dict] = []
+    real_nowcast_store = main_module.NowcastStore
+
+    def _capturing_nowcast_store(*args, **kwargs):
+        captured.append(kwargs)
+        return real_nowcast_store(*args, **kwargs)
+
+    monkeypatch.setattr(main_module, "NowcastStore", _capturing_nowcast_store)
+
+    class _StubApp:
+        pass
+
+    async with main_module._render_only_lifespan(_StubApp()):
+        # The boot path constructed the store with the sweep opt-out.
+        assert captured, "render-only boot did not construct NowcastStore"
+        assert all(
+            kwargs.get("cleanup_tmp") is False for kwargs in captured
+        )
+
+
+@pytest.mark.asyncio
+async def test_render_only_lifespan_storm_cell_store_skips_tmp_sweep(
+    tmp_path, monkeypatch,
+):
+    """Render workers construct their StormCellStore with ``cleanup_tmp=False``.
+
+    The pipeline owns the shared storm-cells dir and may be mid-write
+    when a worker boots; a default ``True`` sweep in ``__init__`` would
+    unlink its in-flight ``*.tmp`` files (the sweep stays the pipeline's
+    job at its own boot).  Capture the constructor kwargs on the boot
+    path.
+    """
+    from librewxr.config import settings
+    from librewxr.data.master_state import dump_state
+    from librewxr.data.store import FrameStore, RadarFrame
+    from librewxr.tiles.coordinates import COMPOSITE_HEIGHT, COMPOSITE_WIDTH
+    from librewxr import main as main_module
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    producer = FrameStore(max_frames=4, cache_dir=cache_dir)
+    arr = np.zeros((COMPOSITE_HEIGHT, COMPOSITE_WIDTH), dtype=np.uint8)
+    await producer.add_frame(RadarFrame(timestamp=42, regions={"USCOMP": arr}))
+    dump_state({"frame_store": producer}, cache_dir)
+
+    monkeypatch.setattr(settings, "render_only", True)
+    monkeypatch.setattr(settings, "cache_dir", str(cache_dir))
+    # Storm cells on so the boot path actually constructs the store;
+    # other optional stores stay off (the snapshot doesn't include them).
+    monkeypatch.setattr(settings, "satellite_enabled", False)
+    monkeypatch.setattr(settings, "nowcast_enabled", False)
+    monkeypatch.setattr(settings, "arrow_flow_enabled", False)
+    monkeypatch.setattr(settings, "alerts_enabled", False)
+    monkeypatch.setattr(settings, "storm_cells_enabled", True)
+    monkeypatch.setattr(settings, "state_wait_timeout", 5.0)
+    monkeypatch.setattr(settings, "state_poll_interval", 0.1)
+    monkeypatch.setattr(settings, "warm_coord_zoom", 2)
+    monkeypatch.setattr(main_module, "_WARM_JITTER_MAX_S", 0.0)
+
+    captured: list[dict] = []
+    real_storm_cell_store = main_module.StormCellStore
+
+    def _capturing_storm_cell_store(*args, **kwargs):
+        captured.append(kwargs)
+        return real_storm_cell_store(*args, **kwargs)
+
+    monkeypatch.setattr(
+        main_module, "StormCellStore", _capturing_storm_cell_store,
+    )
+
+    class _StubApp:
+        pass
+
+    async with main_module._render_only_lifespan(_StubApp()):
+        # The boot path constructed the store with the sweep opt-out.
+        assert captured, "render-only boot did not construct StormCellStore"
+        assert all(
+            kwargs.get("cleanup_tmp") is False for kwargs in captured
+        )
+
+
+@pytest.mark.asyncio
+async def test_render_only_lifespan_yields_before_coord_warm(tmp_path, monkeypatch):
+    """The coordinate warm must never block a render worker's readiness.
+
+    Regression for the slow-storage boot incident: with a cold shared
+    coord store the eager warm held the lifespan before ``yield`` for
+    14-26 minutes, so the worker served no tiles.  The warm now runs as
+    a background task after the lifespan yields; this test stubs
+    ``warm_coordinate_caches`` with a blocker and asserts the lifespan
+    enters (yields) while the warm is still blocked.
+    """
+    from librewxr.config import settings
+    from librewxr.data.master_state import dump_state
+    from librewxr.data.store import FrameStore, RadarFrame
+    from librewxr.tiles.coordinates import COMPOSITE_HEIGHT, COMPOSITE_WIDTH
+    from librewxr import main as main_module
+
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+
+    producer = FrameStore(max_frames=4, cache_dir=cache_dir)
+    arr = np.zeros((COMPOSITE_HEIGHT, COMPOSITE_WIDTH), dtype=np.uint8)
+    await producer.add_frame(RadarFrame(timestamp=42, regions={"USCOMP": arr}))
+    dump_state({"frame_store": producer}, cache_dir)
+
+    monkeypatch.setattr(settings, "render_only", True)
+    monkeypatch.setattr(settings, "cache_dir", str(cache_dir))
+    # Disable optional stores that don't appear in the snapshot — same
+    # rationale as test_render_only_lifespan_picks_up_snapshot.
+    monkeypatch.setattr(settings, "satellite_enabled", False)
+    monkeypatch.setattr(settings, "nowcast_enabled", False)
+    monkeypatch.setattr(settings, "arrow_flow_enabled", False)
+    monkeypatch.setattr(settings, "alerts_enabled", False)
+    monkeypatch.setattr(settings, "state_wait_timeout", 5.0)
+    monkeypatch.setattr(settings, "state_poll_interval", 0.1)
+    # Force the warm ON so this test proves it no longer blocks entry.
+    monkeypatch.setattr(settings, "warm_coord_zoom", 2)
+    monkeypatch.setattr(main_module, "_WARM_JITTER_MAX_S", 0.0)
+
+    warm_started = threading.Event()
+    release_warm = threading.Event()
+
+    def _blocking_warm(regions, max_zoom, tile_size=256):
+        warm_started.set()
+        release_warm.wait(30)
+        return 0
+
+    # Patch the module-level reference main.py resolves at call time.
+    monkeypatch.setattr(main_module, "warm_coordinate_caches", _blocking_warm)
+
+    class _StubApp:
+        pass
+
+    entered = asyncio.Event()
+
+    async def _hold():
+        async with main_module._render_only_lifespan(_StubApp()):
+            entered.set()
+            await asyncio.sleep(0.5)
+
+    task = asyncio.create_task(_hold())
+    try:
+        # Wait for the warm to be *running* (blocked in the stub), then
+        # assert the lifespan already yielded.  If the warm were still
+        # eager/synchronous, entered would never be set while the warm is
+        # blocked and this assertion fails.
+        assert await asyncio.to_thread(warm_started.wait, 5), (
+            "coordinate warm never started"
+        )
+        assert entered.is_set(), (
+            "render-only lifespan did not yield while the coord warm was "
+            "still running"
+        )
+    finally:
+        release_warm.set()
+        await task
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import random
+import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -13,7 +14,6 @@ import cv2
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from rich.logging import RichHandler
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from librewxr.api import routes
@@ -37,82 +37,47 @@ from librewxr.data.storm_cells import StormCellGenerator, StormCellStore
 from librewxr.data.nwp_source import NWPChain
 from librewxr.data.precip_mask import PrecipMaskStore
 from librewxr.data.store import FrameStore
+from librewxr.data.worker_pulse import PULSE_INTERVAL_S, write_worker_pulse
 from librewxr.sources import (
     collect_nowcast_contributions,
     collect_nwp_contributions,
     collect_radar_coverage_metadata,
     collect_satellite_contributions,
+    enabled_regions_with_always_on,
     nwp_grid_slug,
     satellite_source_slug,
 )
 from librewxr.data.alerts_store import AlertsStore
 from librewxr.data.alerts_fetcher import WMOAlertsFetcher
-from librewxr.memory import MemoryMonitor, detect_memory_limit_mb
+from librewxr.memory import (
+    MemoryMonitor,
+    describe_cgroup_memory,
+    detect_memory_limit_mb,
+)
+from librewxr.logging_setup import setup_logging
 from librewxr.tiles.cache import TileCache
 from librewxr.tiles.coordinates import (
     ALL_CACHES,
+    coord_store_cold,
+    prune_shared_coord_store,
     warm_coordinate_caches,
 )
 from librewxr.tiles.request_tracker import TileRequestTracker
+from librewxr.tiles.shared_tile_store import SharedTileStore
 from librewxr.tiles.warmer import TileWarmer
 
-# Map dotted logger names to short subsystem tags so concurrent startup
-# (radar / IFS / NWP / GMGSI all firing in parallel) reads cleanly in the log.
-# Anything not in the map falls back to the last segment of the module
-# path (e.g. an unmapped third-party logger keeps its own short name).
-_LOG_TAGS = {
-    "librewxr.main": "main",
-    "librewxr.config": "config",
-    "librewxr.memory": "memory",
-    "librewxr.api.routes": "api",
-    "librewxr.data.sources": "radar",
-    "librewxr.data.fetcher": "fetcher",
-    "librewxr.data.store": "store",
-    "librewxr.data.regions": "regions",
-    "librewxr.data.coverage": "coverage",
-    "librewxr.sources.world.ifs.grid": "ifs",
-    "librewxr.sources.world.ifs.interpolation": "ifs",
-    "librewxr.sources.regional.north_america.usa.nwp.hrrr.grid": "hrrr",
-    "librewxr.sources.regional.north_america.usa.nwp.hrrr_alaska.grid": "hrrr-ak",
-    "librewxr.sources.regional.europe.nwp.icon_eu.grid": "icon-eu",
-    "librewxr.sources.regional.europe.nwp.dmi_dini.grid": "dmi-dini",
-    "librewxr.sources.regional.north_america.canada.nwp.hrdps.grid": "hrdps",
-    "librewxr.sources.regional.caribbean.nwp.arome_antilles.grid": "arome-ant",
-    "librewxr.sources.regional.south_america.nwp.wrf_smn.grid": "wrf-smn",
-    "librewxr.data.nowcast": "nowcast",
-    "librewxr.tiles.warmer": "warmer",
-    "librewxr.tiles.cache": "tiles",
-    "librewxr.tiles.renderer": "tiles",
-    "librewxr.tiles.satellite_renderer": "tiles",
-    "librewxr.tiles.coordinates": "tiles",
-    "librewxr.data.alerts_fetcher": "alerts",
-    "librewxr.data.alerts_store": "alerts",
-}
-
-
-class _TagFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        record.tag = _LOG_TAGS.get(record.name, record.name.rsplit(".", 1)[-1])
-        return super().format(record)
-
-
-_handler = RichHandler(rich_tracebacks=True, show_path=False)
-_handler.setFormatter(_TagFormatter("[%(tag)s] %(message)s"))
-logging.basicConfig(
-    level=logging.INFO,
-    handlers=[_handler],
-    force=True,
-)
-# Suppress noisy per-request INFO logs from httpx/httpcore — we already log
-# fetch results ourselves in sources.py / fetcher.py.
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+# Centralized logging: Rich-tagged handler at LIBREWXR_LOG_LEVEL (default
+# INFO).  Called at module scope so import-time logging is configured,
+# exactly as the old inline setup was.
+setup_logging()
 logger = logging.getLogger(__name__)
 
 # The background mask-persistence task, held for the process lifetime so it
 # can't be garbage-collected mid-write (see ``_hold_mask_save_task``).  Only
 # one lifespan runs per process, so a single module-level slot suffices.
 _mask_save_task: asyncio.Task | None = None
+
+_WARM_JITTER_MAX_S = 15.0  # multi-mode warm-start de-synchronisation; patched to 0 in tests
 
 
 def _hold_mask_save_task(app: FastAPI, task: asyncio.Task) -> None:
@@ -136,6 +101,94 @@ def _clear_coord_caches() -> None:
     for fn in ALL_CACHES:
         fn.cache_clear()
     logger.info("Coordinate caches cleared by memory monitor")
+
+
+async def _worker_pulse_loop(stop: asyncio.Event, cache_dir: Path) -> None:
+    """Periodically publish this process's pulse to the shared cache dir.
+
+    Every PULSE_INTERVAL_S seconds (jittered like ``_poll_state`` so the
+    16 render workers don't write in lockstep) this worker writes its
+    compact /health payload to ``<cache_dir>/workers/worker_<pid>.json``
+    via ``asyncio.to_thread`` (``write_worker_pulse`` never raises, and
+    ``collect_worker_pulse`` is guarded, so the loop survives transient
+    store/cache hiccups).  Other workers aggregate these files for the
+    ``/health`` ``cluster`` section; the files are mtime-filtered and
+    swept when stale, so a crashed worker simply stops refreshing.
+    """
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(
+                stop.wait(),
+                timeout=PULSE_INTERVAL_S * (0.5 + random.random()),
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            payload = routes.collect_worker_pulse()
+            await asyncio.to_thread(write_worker_pulse, cache_dir, payload)
+        except Exception:
+            logger.exception("Worker pulse write failed")
+
+
+async def _warm_coord_caches_background(
+    executor: ThreadPoolExecutor,
+    regions: list[str],
+    zoom: int,
+    *,
+    jitter: bool,
+) -> None:
+    """Background coordinate-cache warm; never lets a failure escape.
+
+    Runs the trig-heavy warm on ``executor`` (off the event loop) and
+    swallows every exception: the coordinate wrappers already handle
+    unwarmed entries by computing on demand and publishing to the shared
+    on-disk store, so a failed warm must never take the worker down.
+    The caller holds the returned task so it can be cancelled at
+    shutdown.
+
+    ``jitter`` is the multi-mode start de-synchronisation: with 16 render
+    workers booting against a cold shared store, each would otherwise
+    compute + publish the same entries simultaneously (correct but
+    wasteful; converges on the first replace).  Once the store is warm
+    the pass is cheap mmap hits and the jitter is dead time.  Single
+    mode has no sibling workers to de-synchronise against.
+    """
+    try:
+        if jitter and coord_store_cold():
+            await asyncio.sleep(random.uniform(0.0, _WARM_JITTER_MAX_S))
+        start = time.time()
+        loop = asyncio.get_running_loop()
+        warmed = await loop.run_in_executor(
+            executor,
+            warm_coordinate_caches,
+            regions,
+            zoom,
+        )
+        logger.info(
+            "Coordinate caches warmed: %d entries up to zoom %d (%.2fs)",
+            warmed, zoom, time.time() - start,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "Coordinate cache warm failed; serving continues "
+            "(entries load lazily via the store)"
+        )
+
+
+async def _cancel_coord_warm_task(task: asyncio.Task | None) -> None:
+    """Cancel a background coordinate warm at shutdown; never raises."""
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Coordinate cache warm task error during shutdown")
 
 
 async def _wait_for_state(cache_dir, timeout: float) -> None:
@@ -282,6 +335,29 @@ def _compute_cache_invalidation(
     return invalidate, False
 
 
+def _maintain_shared_tiles(store, full_clear: bool, ts_set: set[int] | None) -> None:
+    """Shared-store maintenance after a state refresh (runs off the loop).
+
+    Mirrors the in-memory tile-cache invalidation: a signature change
+    (full clear) sweeps every published file because cached geometry may
+    have sampled stale NWP content; otherwise only the invalidated
+    timestamps' entries are removed (versioned keys already make stale
+    content unreachable - this just reclaims the space).  The full clear
+    sweeps final files only (``sweep_final_files``), keeping the tree and
+    any in-flight publishes: a concurrent publisher's ``.tmp`` survives
+    and its os.replace lands a current-version entry, while every
+    published file is removed so stale-NWP content is still fully
+    reclaimed.  ``prune`` (the full on-disk scan / budget enforcement) is
+    owned by the pipeline process, which prunes once per fetch cycle;
+    render workers only do correctness invalidation here.
+    """
+    if full_clear:
+        store.sweep_final_files()
+    else:
+        for ts in ts_set:
+            store.invalidate_timestamp(ts)
+
+
 def _drop_absent_stores(stores: dict, refreshed: list[str]) -> None:
     """Null stores absent from the first state snapshot.
 
@@ -389,6 +465,19 @@ async def _render_only_lifespan(app: FastAPI):
     # them — keep settings in sync between pipeline and render workers.
     store = FrameStore(max_frames=settings.max_frames, cache_dir=cache_dir)
     cache = TileCache(max_mb=settings.tile_cache_mb)
+    # Shared on-disk encoded-tile store: one worker's encode serves all
+    # workers (plain past-frame tiles only; see routes.radar_tile).  The
+    # content-versioned keys make stale entries unreachable between fetch
+    # cycles, so the poller only does correctness invalidation on
+    # signature changes (see _maintain_shared_tiles; the pipeline process
+    # owns budget pruning, once per fetch cycle).
+    # Auto = 2048 MB for render workers; 0 or negative disables.
+    shared_tiles = None
+    mb = settings.shared_tile_store_mb
+    mb = 2048 if mb is None else mb
+    if mb > 0:
+        shared_tiles = SharedTileStore(cache_dir, max_mb=mb)
+        logger.info("Shared tile store: %d MB budget under %s", mb, cache_dir)
     nwp_contribs = collect_nwp_contributions(settings, cache_dir)
     nwp_grids_by_slug: dict[str, object] = {
         nwp_grid_slug(c): c.instance for c in nwp_contribs
@@ -398,12 +487,19 @@ async def _render_only_lifespan(app: FastAPI):
         satellite_source_slug(c): c.instance for c in satellite_contribs
     }
     nowcast_store = (
-        NowcastStore(cache_dir=cache_dir)
+        # The pipeline owns the shared nowcast dir and may be mid-write;
+        # a worker boot must never delete its in-flight tmp files (the
+        # stale-tmp sweep stays the pipeline's job at its own boot).
+        NowcastStore(cache_dir=cache_dir, cleanup_tmp=False)
         if (settings.nowcast_enabled or settings.arrow_flow_enabled)
         else None
     )
     storm_cell_store = (
-        StormCellStore(cache_dir=cache_dir)
+        # The pipeline owns the shared storm-cells dir and may be
+        # mid-write; a worker boot must never delete its in-flight tmp
+        # files (the stale-tmp sweep stays the pipeline's job at its own
+        # boot).
+        StormCellStore(cache_dir=cache_dir, cleanup_tmp=False)
         if settings.storm_cells_enabled
         else None
     )
@@ -431,7 +527,7 @@ async def _render_only_lifespan(app: FastAPI):
             f"is something else writing to {cache_dir}?"
         )
     refreshed = apply_state(payload, stores)
-    logger.info(
+    logger.debug(
         "Render-only worker loaded snapshot: %s",
         ", ".join(refreshed) if refreshed else "(empty)",
     )
@@ -463,7 +559,10 @@ async def _render_only_lifespan(app: FastAPI):
     storm_cell_store = stores["storm_cell_store"]
     alerts_store = stores["alerts_store"]
 
-    enabled = settings.get_enabled_regions()
+    # The enabled set includes every always-on contribution region (the
+    # coarse global observed tier stays fetchable/renderable even under a
+    # narrow region spec).
+    enabled = enabled_regions_with_always_on(settings)
     station_map, range_overrides, coverage_polygons = collect_radar_coverage_metadata(settings)
     # Prefer the persisted masks (read-only memmap) when the pipeline has
     # already saved a set built from identical parameters; otherwise build
@@ -498,7 +597,7 @@ async def _render_only_lifespan(app: FastAPI):
         if nwp_grid_slug(c) in nwp_grids_by_slug
     ]
     nwp_chain = NWPChain(chain_sources)
-    logger.info(
+    logger.debug(
         "Render-only NWP chain: [%s]",
         ", ".join(s.name for s in nwp_chain.sources),
     )
@@ -513,8 +612,12 @@ async def _render_only_lifespan(app: FastAPI):
     # compute pool, floored at 2 - presents are short-lived, computes are
     # the bottleneck.
     present_executor = ThreadPoolExecutor(max_workers=max(2, pool_size // 2))
+    # Dedicated pool for shared-tile-store I/O + state-snapshot apply so
+    # they never queue behind geometry computes on the default executor.
+    io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='tile-io')
     asyncio.get_running_loop().set_default_executor(request_executor)
     routes.present_executor = present_executor
+    routes.io_executor = io_executor
 
     mem_limit = detect_memory_limit_mb(settings.memory_limit_mb)
     monitor = MemoryMonitor(
@@ -535,6 +638,10 @@ async def _render_only_lifespan(app: FastAPI):
 
     routes.frame_store = store
     routes.tile_cache = cache
+    # Shared encoded-tile store for the multi-worker fleet; None when
+    # disabled (0/negative budget) — the route's shared-store paths are
+    # then a complete no-op.
+    routes.shared_tile_store = shared_tiles
     routes.nwp_grids = nwp_grids_by_slug
     routes.ecmwf_grid = ecmwf_grid
     routes.nwp_chain = nwp_chain
@@ -564,11 +671,15 @@ async def _render_only_lifespan(app: FastAPI):
     # pipeline ships masks, and _maybe_resurrect_precip_mask is a safety
     # net for any future path that nulls the store mid-run.
     routes.precip_mask = stores["precip_mask"]
+    # Cluster /health: the monitor's cgroup anon/file/shmem split backs
+    # the ``cluster.memory.container`` block.
+    routes.memory_monitor = monitor
 
     last_mtime = state_mtime(cache_dir)
     # Seed the diff from the boot payload so the first poll skips unchanged stores.
     last_payload: dict | None = payload
     poller_stop = asyncio.Event()
+    pulse_stop = asyncio.Event()
 
     async def _poll_state() -> None:
         nonlocal last_mtime, last_payload
@@ -594,8 +705,8 @@ async def _render_only_lifespan(app: FastAPI):
                 # invalidation stays on the loop: it compares payload
                 # content, not in-memory store state, so skipping
                 # __setstate__ for unchanged stores never affects it.
-                payload, refreshed = await asyncio.to_thread(
-                    _load_and_apply_state, cache_dir, stores, last_payload,
+                payload, refreshed = await asyncio.get_running_loop().run_in_executor(
+                    io_executor, _load_and_apply_state, cache_dir, stores, last_payload,
                 )
                 if payload is None:
                     continue
@@ -657,33 +768,55 @@ async def _render_only_lifespan(app: FastAPI):
                 else:
                     for ts in ts_to_invalidate:
                         cache.invalidate_timestamp(ts)
+                if shared_tiles is not None:
+                    # Same invalidation semantics for the shared on-disk
+                    # encoded-tile store.  The store ops are file I/O, so
+                    # the whole maintenance pass runs off the event loop.
+                    await asyncio.get_running_loop().run_in_executor(
+                        io_executor,
+                        _maintain_shared_tiles,
+                        shared_tiles, full_clear, ts_to_invalidate,
+                    )
                 last_payload = payload
             except Exception:
                 logger.exception("Failed to refresh state from %s", cache_dir)
 
     poller_task = asyncio.create_task(_poll_state())
+    # Cluster /health pulse: this worker's share of the shared cache-dir
+    # aggregation.  cache_dir is guaranteed non-empty here (render-only
+    # requires it), but keep the guard for symmetry with the single-mode
+    # lifespan.
+    pulse_task = (
+        asyncio.create_task(_worker_pulse_loop(pulse_stop, cache_dir))
+        if settings.cache_dir
+        else None
+    )
     await monitor.start()
 
-    try:
-        # Pre-warm coordinate caches so the first tile requests at each zoom
-        # don't pay the cost of trigonometric projections and array allocations.
-        # Mirrors the single-mode lifespan call; here the compute pool
-        # (request_executor) plays the single-mode warmer's role.  Kept inside
-        # the try so a warm failure still tears down both executors.
-        if settings.warm_coord_zoom > 0:
-            start = time.time()
-            loop = asyncio.get_running_loop()
-            warmed = await loop.run_in_executor(
-                request_executor,
-                warm_coordinate_caches,
-                enabled,
-                settings.warm_coord_zoom,
+    # Pre-warm coordinate caches as a BACKGROUND task so the worker starts
+    # serving immediately: on slow storage (ZFS/HDD, cold page cache) an
+    # eager warm held boot for 14-26 minutes.  Coordinate wrappers handle
+    # unwarmed entries gracefully (compute on demand + publish to the shared
+    # on-disk coord store), so readiness never depends on the warm.
+    # Mirrors the single-mode lifespan call; here the compute pool
+    # (request_executor) plays the single-mode warmer's role.  The
+    # cold-probe/jitter logic lives inside the warm task — it only dedupes
+    # the publish stampede when a warm is actually enabled.  Disabled when
+    # the effective zoom is not positive (multi-mode default; see
+    # config._MODE_DEFAULTS), which is also the shipped default here.
+    warm_task = None
+    if settings.warm_coord_zoom > 0:
+        warm_task = asyncio.create_task(
+            _warm_coord_caches_background(
+                request_executor, enabled, settings.warm_coord_zoom, jitter=True,
             )
-            logger.info(
-                "Coordinate caches warmed: %d entries up to zoom %d (%.2fs)",
-                warmed, settings.warm_coord_zoom, time.time() - start,
-            )
+        )
+        logger.info(
+            "Coordinate cache warm running in background (zoom %d)",
+            settings.warm_coord_zoom,
+        )
 
+    try:
         logger.info(
             "Render-only worker ready (cache_dir=%s, regions=%s, tile_cache=%d MB)",
             cache_dir, ", ".join(enabled), settings.tile_cache_mb,
@@ -692,16 +825,25 @@ async def _render_only_lifespan(app: FastAPI):
         yield
     finally:
         poller_stop.set()
+        pulse_stop.set()
         try:
             await poller_task
         except Exception:
             logger.exception("Poller shutdown error")
+        if pulse_task is not None:
+            try:
+                await pulse_task
+            except Exception:
+                logger.exception("Pulse loop shutdown error")
+        await _cancel_coord_warm_task(warm_task)
         await monitor.stop()
         request_executor.shutdown(wait=False)
         present_executor.shutdown(wait=False)
+        io_executor.shutdown(wait=False)
         # Unwire the routes handle so a stale reference to a shut-down pool
         # can never be scheduled against (single mode always keeps None).
         routes.present_executor = None
+        routes.io_executor = None
         cache.clear()
         store.cleanup()
         if nowcast_store is not None:
@@ -725,8 +867,13 @@ async def lifespan(app: FastAPI):
     # Walk the auto-discovered NWP providers under ``librewxr.sources``;
     # each returns a contribution (or ``None`` when its config flag is
     # off).  Chain order is set by ``NWPContribution.priority``: HRRR
-    # (10) → HRRR-Alaska (11) → HRDPS (20) → AROME Antilles (25) → DMI
-    # DINI (30) → ICON-EU (35) → WRF-SMN (40) → IFS (1000 — catch-all).
+    # (10) → HRRR-Alaska (11) → HRDPS (20) → JMA MSM (20) → AROME
+    # Antilles (25) → AROME Guyane (26) → AROME Indien (27) → AROME
+    # Ncaled (28) → AROME Polyn (29) → DMI DINI (30) → ICON-EU (35) →
+    # WRF-SMN (40) → IFS (1000 — global catch-all).  NOAA RRQPE used to
+    # lead the chain at priority 5; it is now the global *observed*
+    # radar region (``sources/world/rrqpe``) and flows through the
+    # FrameStore / radar compositor instead of the NWP chain.
     nwp_contribs = collect_nwp_contributions(settings, nwp_cache_dir)
     nwp_grids_by_slug: dict[str, object] = {
         nwp_grid_slug(c): c.instance for c in nwp_contribs
@@ -746,7 +893,10 @@ async def lifespan(app: FastAPI):
             "Satellite chain: [%s]",
             ", ".join(c.name for c in satellite_contribs),
         )
-    enabled = settings.get_enabled_regions()
+    # The enabled set includes every always-on contribution region (the
+    # coarse global observed tier stays fetchable/renderable even under a
+    # narrow region spec).
+    enabled = enabled_regions_with_always_on(settings)
 
     # Precompute radar station coverage masks used by the ECMWF fallback
     # to distinguish "outside radar range" from "clear sky within range".
@@ -908,6 +1058,10 @@ async def lifespan(app: FastAPI):
     # Wire up the shared state
     routes.frame_store = store
     routes.tile_cache = cache
+    # Single mode has one process — the per-worker in-memory cache is
+    # enough, so the shared store stays off.  The explicit None also
+    # guards module reuse across test runs (no leaked multi-mode store).
+    routes.shared_tile_store = None
     routes.nwp_grids = nwp_grids_by_slug
     routes.ecmwf_grid = ecmwf_grid
     routes.nwp_chain = nwp_chain
@@ -918,6 +1072,9 @@ async def lifespan(app: FastAPI):
     routes.tile_request_tracker = tile_request_tracker
     routes.start_time = time.time()
     routes.enabled_regions = enabled
+    # Cluster /health: the monitor's cgroup anon/file/shmem split backs
+    # the ``cluster.memory.container`` block.
+    routes.memory_monitor = monitor
 
     radar_cache = None
     if settings.cache_dir:
@@ -967,6 +1124,9 @@ async def lifespan(app: FastAPI):
                 )
             except Exception:
                 logger.exception("Failed to dump state snapshot (single mode)")
+            # Single mode owns coord-store maintenance (render workers never
+            # prune).  Invoked like dump_state above; the helper never raises.
+            prune_shared_coord_store()
 
     fetcher = RadarFetcher(
         store, cache,
@@ -1001,24 +1161,44 @@ async def lifespan(app: FastAPI):
     await fetcher.start()
     await monitor.start()
 
-    # Pre-warm coordinate caches so the first tile requests at each zoom
-    # don't pay the cost of trigonometric projections and array allocations.
+    # Cluster /health pulse: this process publishes its /health payload to
+    # the shared cache dir so any worker can aggregate the whole cluster.
+    # Gated on cache_dir (no shared volume = nothing to publish into).
+    pulse_stop = asyncio.Event()
+    pulse_task = None
+    if settings.cache_dir:
+        pulse_task = asyncio.create_task(
+            _worker_pulse_loop(pulse_stop, Path(settings.cache_dir))
+        )
+
+    # Pre-warm coordinate caches as a BACKGROUND task so boot finishes
+    # immediately and the warm proceeds alongside serving (same slow-storage
+    # rationale as the render-only lifespan; single mode has no sibling
+    # workers to de-synchronise against, so jitter=False).  A warm failure
+    # is swallowed inside the task — coordinate wrappers compute on demand
+    # via the store either way.  Disabled when the effective zoom is not
+    # positive (set a negative LIBREWXR_WARM_COORD_ZOOM to turn it off).
+    warm_task = None
     if settings.warm_coord_zoom > 0:
-        start = time.time()
-        loop = asyncio.get_running_loop()
-        warmed = await loop.run_in_executor(
-            warmer_executor,
-            warm_coordinate_caches,
-            enabled,
-            settings.warm_coord_zoom,
+        warm_task = asyncio.create_task(
+            _warm_coord_caches_background(
+                warmer_executor, enabled, settings.warm_coord_zoom, jitter=False,
+            )
         )
         logger.info(
-            "Coordinate caches warmed: %d entries up to zoom %d (%.2fs)",
-            warmed, settings.warm_coord_zoom, time.time() - start,
+            "Coordinate cache warm running in background (zoom %d)",
+            settings.warm_coord_zoom,
         )
 
     yield
 
+    pulse_stop.set()
+    if pulse_task is not None:
+        try:
+            await pulse_task
+        except Exception:
+            logger.exception("Pulse loop shutdown error")
+    await _cancel_coord_warm_task(warm_task)
     await monitor.stop()
     await fetcher.stop()
     if alerts_fetcher is not None:
@@ -1054,7 +1234,7 @@ if settings.mcp_enabled:
 
         mcp_app = build_mcp_http_app()
         combined_lifespan = combine_lifespans(lifespan, mcp_app.lifespan)
-        logger.info("MCP HTTP transport built; will mount at %s", settings.mcp_path)
+        logger.debug("MCP HTTP transport built; will mount at %s", settings.mcp_path)
     except Exception:
         logger.exception(
             "MCP HTTP app build failed; MCP transport disabled. "
@@ -1079,7 +1259,7 @@ if mcp_app is not None:
     # Matches the tool names registered by _register_tools in
     # librewxr/mcp/server.py.  Update this list when a new tool is added.
     routes.mcp_tools = ["get_precip_nowcast", "get_active_alerts", "get_storm_cells"]
-    logger.info("MCP HTTP transport mounted at %s", settings.mcp_path)
+    logger.debug("MCP HTTP transport mounted at %s", settings.mcp_path)
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
@@ -1092,6 +1272,20 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     )
 
 
+def _describe_worker_exit(exitcode: int) -> str:
+    """Human-readable reason for a render worker exit code."""
+    if exitcode < 0:
+        signum = -exitcode
+        try:
+            signame = signal.Signals(signum).name
+        except ValueError:
+            signame = f"signal {signum}"
+        if signum == signal.SIGKILL:
+            return f"killed by {signame} (exit code {exitcode}) - OOM-killed or externally killed"
+        return f"killed by {signame} (exit code {exitcode})"
+    return f"exit status {exitcode}"
+
+
 def main():
     import uvicorn
     # Optional direct TLS: only enabled when both cert and key are set.
@@ -1102,13 +1296,78 @@ def main():
             "ssl_certfile": settings.ssl_certfile,
             "ssl_keyfile": settings.ssl_keyfile,
         }
+    if settings.workers > 1:
+        # uvicorn logs worker deaths at INFO without the exit code, and the
+        # rotating file handler only records WARNING+, so nothing durable
+        # captures why a render worker died. Swap in a supervisor subclass
+        # that logs the reaped worker's exit code/signal at WARNING.
+        # Guarded for uvicorn versions whose supervisor lacks this method.
+        # NOTE: ``import uvicorn.main`` binds the click Command (uvicorn's
+        # __init__ re-exports ``main``), so the module - and its
+        # call-time ``Multiprocess`` global - is reached via importlib.
+        import importlib
+
+        uvicorn_main = importlib.import_module("uvicorn.main")
+        base_supervisor = uvicorn_main.Multiprocess
+        if hasattr(base_supervisor, "keep_subprocess_alive"):
+
+            class _DeathLoggingMultiprocess(base_supervisor):
+                """Multiprocess supervisor that logs worker death reasons."""
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self._last_mem_ctx = describe_cgroup_memory()
+
+                def keep_subprocess_alive(self) -> None:
+                    # Fresh memory context each tick so the death line
+                    # reflects the cgroup state just before the kill.
+                    self._last_mem_ctx = describe_cgroup_memory()
+                    # Snapshot liveness BEFORE the reap: uvicorn replaces the
+                    # wrapper in self.processes the same tick it reaps, so each
+                    # snapshot entry is processed exactly once and needs no
+                    # prior-exitcode gate (exitcode is a polling property and
+                    # would otherwise self-swallow genuine deaths).
+                    before = [
+                        (p, p.process.pid, p.process.is_alive())
+                        for p in self.processes
+                    ]
+                    super().keep_subprocess_alive()
+                    for process, pid, was_alive in before:
+                        exitcode = process.exitcode
+                        if exitcode is None or exitcode == 3:
+                            # Still alive this tick, or a STARTUP_FAILURE that
+                            # uvicorn already reports at ERROR before stopping.
+                            continue
+                        if was_alive and exitcode == -signal.SIGKILL:
+                            # Alive but unresponsive: uvicorn's master sent the
+                            # SIGKILL itself (healthcheck ping timeout), so the
+                            # kernel log shows no OOM entry.
+                            reason = (
+                                "unresponsive to healthcheck; "
+                                "killed by supervisor (SIGKILL)"
+                            )
+                        else:
+                            reason = _describe_worker_exit(exitcode)
+                        suffix = f" ({self._last_mem_ctx})" if self._last_mem_ctx else ""
+                        logger.warning(
+                            "Render worker [pid=%d] died: %s; respawning a replacement%s",
+                            pid,
+                            reason,
+                            suffix,
+                        )
+
+            uvicorn_main.Multiprocess = _DeathLoggingMultiprocess
     uvicorn.run(
         "librewxr.main:app",
         host=settings.host,
         port=settings.port,
         workers=settings.workers,
+        timeout_worker_healthcheck=settings.worker_healthcheck_timeout,
         log_level="info",
         access_log=False,
+        # Don't let uvicorn install its own handlers/format — its loggers
+        # propagate to our shared Rich-tagged root handler instead.
+        log_config=None,
         # Trust X-Forwarded-Proto/Host from any peer: LibreWXR is documented
         # as a behind-reverse-proxy deployment (cloudflared tunnel / nginx
         # on the Docker network, not localhost), and forwarded headers only

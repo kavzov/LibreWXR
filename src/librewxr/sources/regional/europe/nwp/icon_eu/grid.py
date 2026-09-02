@@ -389,7 +389,7 @@ class ICONEUGrid(WeatherFieldSourceMixin):
             self._memmap_dir = Path(tempfile.mkdtemp(prefix="librewxr_icon_eu_"))
             self._persistent = False
         self._memmap_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(
+        logger.debug(
             "ICON-EU memmap directory: %s (persistent=%s)",
             self._memmap_dir, self._persistent,
         )
@@ -443,7 +443,7 @@ class ICONEUGrid(WeatherFieldSourceMixin):
                 self._latest_run_ts = run_ts
             loaded += 1
         if loaded:
-            logger.info("ICON-EU: loaded %d cached frame(s) from disk", loaded)
+            logger.debug("ICON-EU: loaded %d cached frame(s) from disk", loaded)
 
         # Second pass: snow masks.  Orphans (no matching precip frame)
         # are removed so they don't accumulate across restarts.
@@ -472,7 +472,7 @@ class ICONEUGrid(WeatherFieldSourceMixin):
             self._snow_masks[(run_ts, lead_s)] = mm
             snow_loaded += 1
         if snow_loaded:
-            logger.info(
+            logger.debug(
                 "ICON-EU: loaded %d cached snow mask(s) from disk",
                 snow_loaded,
             )
@@ -726,7 +726,7 @@ class ICONEUGrid(WeatherFieldSourceMixin):
             self._evict_outside_window(window_start, window_end)
 
             if total_fetched:
-                logger.info(
+                logger.debug(
                     "ICON-EU: %d hourly frame(s) ingested + %d interpolated "
                     "across %d run(s); store now holds %d frame(s)",
                     total_fetched, total_interpolated,
@@ -971,7 +971,7 @@ class ICONEUGrid(WeatherFieldSourceMixin):
         self._client = None
         if not self._persistent:
             shutil.rmtree(self._memmap_dir, ignore_errors=True)
-            logger.info("ICON-EU memmap directory cleaned up")
+            logger.debug("ICON-EU memmap directory cleaned up")
         else:
             logger.info(
                 "ICON-EU cache retained at %s for warm restart", self._memmap_dir,

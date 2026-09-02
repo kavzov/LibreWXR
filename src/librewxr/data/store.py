@@ -36,6 +36,9 @@ class FrameStore:
     def __init__(self, max_frames: int = 12, cache_dir: Path | None = None):
         self._max_frames = max_frames
         self._frames: list[RadarFrame] = []
+        # O(1) timestamp -> frame index, kept in sync with ``_frames`` on
+        # every append / merge / eviction / reload / cleanup.
+        self._by_ts: dict[int, RadarFrame] = {}
         # Per-timestamp content version: set to 1 when a new frame is
         # appended, bumped on every merge into an existing timestamp, and
         # removed on eviction.  Render workers diff this against the
@@ -54,7 +57,7 @@ class FrameStore:
         # atomic writes don't trip on existing files.
         for path in self._memmap_dir.glob("*.tmp"):
             path.unlink(missing_ok=True)
-        logger.info(
+        logger.debug(
             "Frame memmap directory: %s (persistent=%s)",
             self._memmap_dir, self._persistent,
         )
@@ -89,13 +92,17 @@ class FrameStore:
         Returns (evicted_timestamp | None, was_merged).
         """
         async with self._lock:
-            # Convert regions to memory-mapped files.  The write +
-            # flush runs in a worker thread (USCOMP is ~63 MB) while the
-            # async lock still serialises concurrent add_frame calls.
-            for name, data in list(frame.regions.items()):
-                frame.regions[name] = await asyncio.to_thread(
-                    self._to_memmap, frame.timestamp, name, data,
-                )
+            # Convert regions to memory-mapped files.  Each region's
+            # write + flush runs in its own worker thread (USCOMP is
+            # ~63 MB) so all regions of one frame write concurrently;
+            # the async lock still serialises concurrent add_frame calls.
+            region_items = list(frame.regions.items())
+            memmaps = await asyncio.gather(*[
+                asyncio.to_thread(self._to_memmap, frame.timestamp, name, data)
+                for name, data in region_items
+            ])
+            for (name, _data), memmap in zip(region_items, memmaps):
+                frame.regions[name] = memmap
 
             # Merge into existing frame if same timestamp.
             # Copy-on-write: build a NEW regions dict and swap the reference instead of
@@ -116,6 +123,8 @@ class FrameStore:
                     self._frame_versions[frame.timestamp] = (
                         self._frame_versions.get(frame.timestamp, 0) + 1
                     )
+                    # Merge keeps the same object, so the ``_by_ts`` entry
+                    # stays valid — the dict lookup returns the live frame.
                     return None, True
 
             evicted_ts = None
@@ -124,18 +133,30 @@ class FrameStore:
                 evicted_ts = evicted.timestamp
                 self._cleanup_timestamp(evicted_ts)
                 self._frame_versions.pop(evicted_ts, None)
+                self._by_ts.pop(evicted_ts, None)
 
             self._frames.append(frame)
             self._frames.sort(key=lambda f: f.timestamp)
             self._frame_versions[frame.timestamp] = 1
+            self._by_ts[frame.timestamp] = frame
             return evicted_ts, False
 
     async def get_frame(self, timestamp: int) -> RadarFrame | None:
         async with self._lock:
-            for f in self._frames:
-                if f.timestamp == timestamp:
-                    return f
-        return None
+            return self._by_ts.get(timestamp)
+
+    def frame_version(self, timestamp: int) -> int | None:
+        """Content version for a timestamp, or None when unknown.
+
+        Used by the shared tile store to key encoded tiles by frame content
+        identity (versions bump on merges, vanish on eviction).  Synchronous
+        and lock-free on purpose: ``_frame_versions`` is replaced atomically
+        by ``__setstate__`` and only mutated under the async lock by the
+        pipeline, so a plain dict.get under the GIL always sees a consistent
+        snapshot.  Nowcast timestamps never appear here — callers use that
+        to exclude nowcast tiles from the shared store.
+        """
+        return self._frame_versions.get(timestamp)
 
     async def get_latest_frame(self) -> RadarFrame | None:
         async with self._lock:
@@ -213,18 +234,58 @@ class FrameStore:
         in place so existing references to ``FrameStore`` stay valid for
         ongoing renders (Linux holds the old memmap inodes alive until
         all readers release them).
+
+        Region arrays are reused in place instead of re-opened whenever
+        the timestamp's content version is unchanged between the previous
+        state and this one.  The reuse is version-guarded because merges
+        rewrite the same basename via ``os.replace`` (see ``add_frame``
+        and ``_to_memmap``): an unchanged filename does not imply
+        unchanged content, so the per-timestamp version is bumped on every
+        merge and an unchanged version is the only safe signal that the
+        live memmap still matches the payload.  The payload descriptor
+        (basename, dtype, shape) is also verified against the live array
+        before reuse; anything that fails the check is re-opened fresh.
         """
         max_frames = state["max_frames"]
         memmap_dir = Path(state["memmap_dir"])
+        # JSON coerces int keys to strings; convert back.  The .get(..., {})
+        # default handles snapshots written before this field existed.
+        new_versions = {
+            int(k): v for k, v in state.get("frame_versions", {}).items()
+        }
+        old_versions = getattr(self, "_frame_versions", {}) or {}
+        old_by_ts = getattr(self, "_by_ts", {}) or {}
         new_frames: list[RadarFrame] = []
+        reused = 0
+        reopened = 0
         for f_info in state["frames"]:
-            frame = RadarFrame(timestamp=f_info["timestamp"])
+            ts = f_info["timestamp"]
+            frame = RadarFrame(timestamp=ts)
+            old_frame = old_by_ts.get(ts)
+            version_ok = (
+                old_frame is not None
+                and old_versions.get(ts) is not None
+                and new_versions.get(ts) is not None
+                and old_versions.get(ts) == new_versions.get(ts)
+            )
             for name, (basename, dtype_str, shape) in f_info["regions"].items():
-                frame.regions[name] = np.memmap(
-                    memmap_dir / basename,
-                    dtype=np.dtype(dtype_str), mode="r",
-                    shape=tuple(shape),
-                )
+                old_arr = old_frame.regions.get(name) if old_frame is not None else None
+                if (
+                    version_ok
+                    and old_arr is not None
+                    and os.path.basename(str(old_arr.filename)) == basename
+                    and old_arr.dtype.str == dtype_str
+                    and list(old_arr.shape) == list(shape)
+                ):
+                    frame.regions[name] = old_arr
+                    reused += 1
+                else:
+                    frame.regions[name] = np.memmap(
+                        memmap_dir / basename,
+                        dtype=np.dtype(dtype_str), mode="r",
+                        shape=tuple(shape),
+                    )
+                    reopened += 1
             new_frames.append(frame)
         new_frames.sort(key=lambda f: f.timestamp)
 
@@ -233,14 +294,17 @@ class FrameStore:
         self._max_frames = max_frames
         self._memmap_dir = memmap_dir
         self._frames = new_frames
-        # JSON coerces int keys to strings; convert back.  The .get(..., {})
-        # default handles snapshots written before this field existed.
-        self._frame_versions = {
-            int(k): v for k, v in state.get("frame_versions", {}).items()
-        }
+        # Rebuild the O(1) timestamp index alongside the frame list so
+        # the two never drift apart across snapshot refreshes.
+        self._by_ts = {f.timestamp: f for f in new_frames}
+        self._frame_versions = new_versions
         self._persistent = True
         if not hasattr(self, "_lock"):
             self._lock = asyncio.Lock()
+        logger.debug(
+            'FrameStore refresh: %d regions reused, %d reopened across %d frames',
+            reused, reopened, len(new_frames),
+        )
 
     def cleanup(self) -> None:
         """Release in-memory frame references; remove temp dir if non-persistent.
@@ -250,8 +314,9 @@ class FrameStore:
         warm-restart logic or via __setstate__.
         """
         self._frames = []
+        self._by_ts.clear()
         if self._persistent:
             logger.info("Frame memmaps retained on disk at %s", self._memmap_dir)
         else:
             shutil.rmtree(self._memmap_dir, ignore_errors=True)
-            logger.info("Frame memmap directory cleaned up")
+            logger.debug("Frame memmap directory cleaned up")

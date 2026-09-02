@@ -472,11 +472,11 @@ class HRDPSGrid(WeatherFieldSourceMixin):
             self._memmap_dir = Path(tempfile.mkdtemp(prefix="librewxr_hrdps_"))
             self._persistent = False
         self._memmap_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(
+        logger.debug(
             "HRDPS memmap directory: %s (persistent=%s)",
             self._memmap_dir, self._persistent,
         )
-        logger.info(
+        logger.debug(
             "HRDPS rotated origin: rlon0=%.4f rlat0_north=%.4f "
             "(from documented La1=%.3f Lo1=%.3f)",
             HRDPS_GRID_RLON_ORIGIN, HRDPS_GRID_RLAT_ORIGIN_NORTH,
@@ -532,7 +532,7 @@ class HRDPSGrid(WeatherFieldSourceMixin):
                 self._latest_run_ts = run_ts
             loaded += 1
         if loaded:
-            logger.info("HRDPS: loaded %d cached frame(s) from disk", loaded)
+            logger.debug("HRDPS: loaded %d cached frame(s) from disk", loaded)
 
     def __getstate__(self) -> dict:
         """Serialize state for cross-process reload (multi-worker mode).
@@ -723,7 +723,7 @@ class HRDPSGrid(WeatherFieldSourceMixin):
             self._evict_outside_window(window_start, window_end)
 
             if total_fetched:
-                logger.info(
+                logger.debug(
                     "HRDPS: %d frame(s) ingested across %d run(s); "
                     "store now holds %d frame(s)",
                     total_fetched, len(runs_to_consider), len(self._frames),
@@ -813,7 +813,7 @@ class HRDPSGrid(WeatherFieldSourceMixin):
         self._client = None
         if not self._persistent:
             shutil.rmtree(self._memmap_dir, ignore_errors=True)
-            logger.info("HRDPS memmap directory cleaned up")
+            logger.debug("HRDPS memmap directory cleaned up")
         else:
             logger.info(
                 "HRDPS cache retained at %s for warm restart", self._memmap_dir,

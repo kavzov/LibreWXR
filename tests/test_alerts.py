@@ -9,11 +9,12 @@ from pathlib import Path
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from shapely.geometry import Polygon
+from shapely.geometry import Point, Polygon, shape
 
 from librewxr.api import routes
 from librewxr.data.alerts_fetcher import (
     WMOAlertsFetcher,
+    _ZONE_FAILURE_TTL,
     _extract_polygons_from_cap,
     _parse_cap_time,
 )
@@ -270,6 +271,125 @@ class TestAlertsEndpoint:
 
 
 @pytest.mark.alerts
+class TestMultiAreaAlertGrouping:
+    """CAP alerts covering many regions (Bulgaria, Romania, France, ...) arrive
+    as several AlertEntry objects sharing one url. The endpoint must merge each
+    group into a single feature carrying the full polygon footprint."""
+
+    @staticmethod
+    def _make_multi_area_entries():
+        poly_a = Polygon([
+            (20.0, 41.0), (22.0, 41.0), (22.0, 43.0), (20.0, 43.0), (20.0, 41.0),
+        ])
+        poly_b = Polygon([
+            (26.0, 43.0), (28.0, 43.0), (28.0, 45.0), (26.0, 45.0), (26.0, 43.0),
+        ])
+        return [
+            AlertEntry(
+                source_id="bg-plovdiv-xx",
+                event="Heat Wave",
+                description="Extreme heat across Bulgaria",
+                severity="Severe",
+                effective="2026-05-07T00:00:00+03:00",
+                expires="2099-05-07T23:00:00+03:00",
+                area_desc="Region A",
+                url="https://example.com/multi",
+                polygon=poly_a,
+            ),
+            AlertEntry(
+                source_id="bg-plovdiv-xx",
+                event="Heat Wave",
+                description="Extreme heat across Bulgaria",
+                severity="Severe",
+                effective="2026-05-07T00:00:00+03:00",
+                expires="2099-05-07T23:00:00+03:00",
+                area_desc="Region B",
+                url="https://example.com/multi",
+                polygon=poly_b,
+            ),
+        ]
+
+    async def _get(self, entries, path):
+        store = AlertsStore()
+        store.replace_all(entries)
+        app = FastAPI()
+        app.include_router(routes.router)
+        routes.alerts_store = store
+        routes.alerts_enabled = True
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            return await ac.get(path)
+
+    async def test_global_groups_by_url_and_unions_polygons(self):
+        resp = await self._get(self._make_multi_area_entries(), "/v2/alerts")
+        assert resp.status_code == 200
+        data = resp.json()
+        # Two regions sharing one url -> exactly one feature
+        assert len(data["features"]) == 1
+        feature = data["features"][0]
+        props = feature["properties"]
+        assert props["uri"] == "https://example.com/multi"
+        assert props["title"] == "Heat Wave"
+        assert props["regions"] == ["Region A", "Region B"]
+        # Disjoint polygons union to a MultiPolygon covering both regions
+        assert feature["geometry"] is not None
+        assert feature["geometry"]["type"] == "MultiPolygon"
+        merged = shape(feature["geometry"])
+        assert merged.contains(Point(21.0, 42.0))  # inside Region A
+        assert merged.contains(Point(27.0, 44.0))  # inside Region B
+
+    async def test_point_lookup_returns_only_matching_region(self):
+        resp = await self._get(
+            self._make_multi_area_entries(), "/v2/alerts?lat=42.0&lon=21.0"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        # Point hits only Region A -> single feature, single region
+        assert len(data["features"]) == 1
+        feature = data["features"][0]
+        props = feature["properties"]
+        assert props["uri"] == "https://example.com/multi"
+        assert props["regions"] == ["Region A"]
+        # 1-element group unions to the polygon itself
+        assert feature["geometry"] is not None
+        assert feature["geometry"]["type"] == "Polygon"
+
+    async def test_null_polygon_group_collapses_to_one_null_feature(self):
+        entries = [
+            AlertEntry(
+                source_id="fr-meteofrance-xx",
+                event="Heavy Rain",
+                description="Heavy rain expected",
+                severity="Moderate",
+                effective="2026-05-07T06:00:00+02:00",
+                expires="2099-05-07T12:00:00+02:00",
+                area_desc="Region A",
+                url="https://example.com/nullgeom",
+                polygon=None,
+            ),
+            AlertEntry(
+                source_id="fr-meteofrance-xx",
+                event="Heavy Rain",
+                description="Heavy rain expected",
+                severity="Moderate",
+                effective="2026-05-07T06:00:00+02:00",
+                expires="2099-05-07T12:00:00+02:00",
+                area_desc="Region B",
+                url="https://example.com/nullgeom",
+                polygon=None,
+            ),
+        ]
+        resp = await self._get(entries, "/v2/alerts")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["features"]) == 1
+        feature = data["features"][0]
+        assert feature["properties"]["uri"] == "https://example.com/nullgeom"
+        assert feature["properties"]["regions"] == ["Region A", "Region B"]
+        assert feature["geometry"] is None
+
+
+@pytest.mark.alerts
 class TestAlertsStoreSnapshot:
     """Round-trip __getstate__ / __setstate__ via the multi-worker mechanism.
 
@@ -428,9 +548,11 @@ class TestAlertsStore:
 # ---------------------------------------------------------------------------
 
 class _FakeNwsResponse:
-    def __init__(self, status_code=200, payload=None):
+    def __init__(self, status_code=200, payload=None, content=b"", text=""):
         self.status_code = status_code
         self._payload = payload
+        self.content = content
+        self.text = text
 
     def json(self):
         return self._payload
@@ -457,6 +579,24 @@ def _zone_geojson(bounds):
     return {
         "type": "Polygon",
         "coordinates": [[[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy], [minx, miny]]],
+    }
+
+
+def _zone_geometrycollection():
+    """GeometryCollection wrapping two disjoint triangle polygons (area 0.5
+    each) - mirrors how the NWS API serves some zone geometries (e.g. FLZ011)."""
+    return {
+        "type": "GeometryCollection",
+        "geometries": [
+            {
+                "type": "Polygon",
+                "coordinates": [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0]]],
+            },
+            {
+                "type": "Polygon",
+                "coordinates": [[[2.0, 0.0], [3.0, 0.0], [2.0, 1.0], [2.0, 0.0]]],
+            },
+        ],
     }
 
 
@@ -614,3 +754,304 @@ class TestNwsZoneResolution:
         assert entries[0].polygon is not None
         assert entries[0].polygon.area == pytest.approx(0.5)
         assert set(u for u in client.calls if u != alerts_url) == {zone_a, zone_c}
+
+    async def test_geometrycollection_zone_resolves_to_union(self, tmp_path):
+        zone_a = "https://api.weather.gov/zones/forecast/FLZ011"
+        alerts_url = "https://api.weather.gov/alerts/active"
+        client = _FakeNwsClient({
+            alerts_url: _FakeNwsResponse(200, {
+                "features": [_nws_feature([zone_a])],
+            }),
+            zone_a: _FakeNwsResponse(200, {"geometry": _zone_geometrycollection()}),
+        })
+
+        entries = await self._fetch(tmp_path, client)
+
+        # GeometryCollection of two disjoint triangles unions to a MultiPolygon
+        assert len(entries) == 1
+        assert entries[0].polygon is not None
+        assert entries[0].polygon.geom_type == "MultiPolygon"
+        assert entries[0].polygon.area == pytest.approx(1.0)
+        # Resolved polygon written to the disk cache
+        zones_dir = Path(tmp_path) / "alerts" / "zones"
+        assert (zones_dir / "FLZ011.json").exists()
+
+    async def test_alert_feature_with_geometrycollection_polygon(self, tmp_path):
+        alerts_url = "https://api.weather.gov/alerts/active"
+        feature = _nws_poly_feature("urn:oid:gc-alert")
+        feature["geometry"] = {
+            "type": "GeometryCollection",
+            "geometries": [
+                {
+                    "type": "Polygon",
+                    "coordinates": [[[-105.5, 39.0], [-105.0, 39.0], [-105.25, 39.5], [-105.5, 39.0]]],
+                },
+            ],
+        }
+        client = _FakeNwsClient({
+            alerts_url: _FakeNwsResponse(200, {"features": [feature]}),
+        })
+
+        entries = await self._fetch(tmp_path, client)
+
+        assert len(entries) == 1
+        assert entries[0].polygon is not None
+        assert entries[0].polygon.area == pytest.approx(0.125)
+
+    async def test_null_geometry_writes_failure_marker_and_suppresses_retry(
+        self, tmp_path, caplog
+    ):
+        zone_a = "https://api.weather.gov/zones/forecast/FLZ011"
+        client = _FakeNwsClient({zone_a: _FakeNwsResponse(200, {"geometry": None})})
+        fetcher = WMOAlertsFetcher(store=AlertsStore(), cache_dir=str(tmp_path))
+
+        async def _get_client():
+            return client
+
+        fetcher._get_client = _get_client  # type: ignore[method-assign]
+
+        with caplog.at_level("WARNING"):
+            result = await fetcher._fetch_zone_polygons({zone_a})
+
+        assert result == {}
+        assert "NWS zone FLZ011 has no usable geometry" in caplog.text
+
+        # Failure marker written to the zone cache path
+        marker = Path(tmp_path) / "alerts" / "zones" / "FLZ011.json"
+        assert marker.exists()
+        data = json.loads(marker.read_text())
+        assert data["failed"] is True
+        assert data["geometry"] is None
+
+        # Fresh marker: second call makes no HTTP request and logs nothing
+        client.calls.clear()
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            result2 = await fetcher._fetch_zone_polygons({zone_a})
+
+        assert result2 == {}
+        assert client.calls == []
+        assert caplog.records == []
+
+    async def test_stale_failure_marker_triggers_refetch(self, tmp_path):
+        zone_a = "https://api.weather.gov/zones/forecast/FLZ011"
+        marker = Path(tmp_path) / "alerts" / "zones" / "FLZ011.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({
+            "fetched_at": time.time() - _ZONE_FAILURE_TTL - 60,
+            "geometry": None,
+            "failed": True,
+        }))
+
+        client = _FakeNwsClient({
+            zone_a: _FakeNwsResponse(200, {"geometry": _zone_geojson((-105.5, 39.0, -105.0, 39.5))}),
+        })
+        fetcher = WMOAlertsFetcher(store=AlertsStore(), cache_dir=str(tmp_path))
+
+        async def _get_client():
+            return client
+
+        fetcher._get_client = _get_client  # type: ignore[method-assign]
+
+        result = await fetcher._fetch_zone_polygons({zone_a})
+
+        # Stale marker ignored -> zone refetched and now resolved
+        assert zone_a in result
+        assert result[zone_a] is not None
+        assert client.calls == [zone_a]
+        # Success now cached in place of the failure marker
+        data = json.loads(marker.read_text())
+        assert data.get("failed") is not True
+        assert data.get("geometry") is not None
+
+
+# ---------------------------------------------------------------------------
+# Ingest cycle: WMO degradation must not orphan/freeze the parallel NWS fetch
+# ---------------------------------------------------------------------------
+
+_WMO_SOURCES_URL = "https://severeweather.wmo.int/json/sources.json"
+_WMO_ALL_URL = "https://severeweather.wmo.int/v2/json/wmo_all.json"
+_NWS_ACTIVE_URL = "https://api.weather.gov/alerts/active"
+
+
+def _nws_poly_feature(alert_id="urn:oid:poly"):
+    """NWS feature carrying inline geometry (no zone resolution needed)."""
+    return {
+        "type": "Feature",
+        "id": f"https://api.weather.gov/alerts/{alert_id}",
+        "geometry": _zone_geojson((-105.5, 39.0, -105.0, 39.5)),
+        "properties": {
+            "status": "Actual",
+            "messageType": "Alert",
+            "headline": "Severe Thunderstorm Warning issued",
+            "event": "Severe Thunderstorm Warning",
+            "description": "Severe thunderstorms expected",
+            "severity": "Severe",
+            "effective": "2026-05-07T00:15:00-05:00",
+            "expires": "2099-05-07T06:00:00-05:00",
+            "areaDesc": "Test County",
+            "id": f"https://api.weather.gov/alerts/{alert_id}",
+        },
+    }
+
+
+def _cap_xml_with_polygon():
+    """Minimal CAP 1.2 XML with a usable polygon."""
+    return """<?xml version="1.0" encoding="UTF-8"?>
+    <alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+      <info>
+        <language>en-US</language>
+        <event>Severe Thunderstorm Warning</event>
+        <headline>Severe Thunderstorm Warning issued</headline>
+        <description>Severe thunderstorms expected</description>
+        <urgency>Immediate</urgency>
+        <severity>Severe</severity>
+        <effective>2026-05-07T00:15:00-05:00</effective>
+        <expires>2099-05-07T06:00:00-05:00</expires>
+        <area>
+          <areaDesc>Test Area</areaDesc>
+          <polygon>32.5,-85.2 32.6,-85.1 32.5,-85.0 32.4,-85.1 32.5,-85.2</polygon>
+        </area>
+      </info>
+    </alert>"""
+
+
+def _rss_with_item():
+    """Minimal RSS 2.0 with one item whose guid matches a wmo_all id."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<rss version=\"2.0\"><channel>"
+        "<item><link>https://severeweather.wmo.int/cap/fr-meteofrance-xx/1.xml</link>"
+        "<guid>wmo-alert-1</guid></item>"
+        "</channel></rss>"
+    )
+
+
+def _non_nws_alert():
+    """A pre-existing non-NWS alert used to check preservation on degradation."""
+    return AlertEntry(
+        source_id="fr-meteofrance-xx",
+        event="Heavy Rain Warning",
+        description="Heavy rain expected in Normandy",
+        severity="Moderate",
+        effective="2026-05-07T06:00:00+02:00",
+        expires="2099-05-07T12:00:00+02:00",
+        area_desc="Normandy",
+        url="https://example.com/alert",
+        polygon=None,
+    )
+
+
+@pytest.mark.alerts
+class TestFetchOnceDegradedPath:
+    """WMO sources.json / wmo_all.json failures must not freeze the US slice."""
+
+    def _fetcher(self, store, client, tmp_path):
+        fetcher = WMOAlertsFetcher(store=store, cache_dir=str(tmp_path))
+
+        async def _get_client():
+            return client
+
+        fetcher._get_client = _get_client  # type: ignore[method-assign]
+        return fetcher
+
+    def _sources_fail_client(self):
+        return _FakeNwsClient({
+            _WMO_SOURCES_URL: _FakeNwsResponse(500),
+            _NWS_ACTIVE_URL: _FakeNwsResponse(
+                200, {"features": [_nws_poly_feature("urn:oid:degraded")]}
+            ),
+        })
+
+    def _wmo_all_fail_client(self):
+        return _FakeNwsClient({
+            _WMO_SOURCES_URL: _FakeNwsResponse(200, {"sources": []}),
+            _WMO_ALL_URL: _FakeNwsResponse(500),
+            _NWS_ACTIVE_URL: _FakeNwsResponse(
+                200, {"features": [_nws_poly_feature("urn:oid:degraded")]}
+            ),
+        })
+
+    async def test_sources_failure_refreshes_nws_and_preserves_others(self, tmp_path):
+        store = AlertsStore()
+        store.replace_all([_non_nws_alert()])
+
+        fetcher = self._fetcher(store, self._sources_fail_client(), tmp_path)
+        await fetcher._fetch_once()
+
+        assert store.fetch_success is False
+        alerts = store.alerts
+        nws = [a for a in alerts if a.source_id == "nws-api"]
+        others = [a for a in alerts if a.source_id != "nws-api"]
+        assert len(nws) == 1
+        assert nws[0].event == "Severe Thunderstorm Warning issued"
+        assert nws[0].polygon is not None
+        assert len(others) == 1
+        assert others[0].event == "Heavy Rain Warning"
+
+    async def test_wmo_all_failure_refreshes_nws_and_preserves_others(self, tmp_path):
+        store = AlertsStore()
+        store.replace_all([_non_nws_alert()])
+
+        fetcher = self._fetcher(store, self._wmo_all_fail_client(), tmp_path)
+        await fetcher._fetch_once()
+
+        assert store.fetch_success is False
+        alerts = store.alerts
+        nws = [a for a in alerts if a.source_id == "nws-api"]
+        others = [a for a in alerts if a.source_id != "nws-api"]
+        assert len(nws) == 1
+        assert nws[0].event == "Severe Thunderstorm Warning issued"
+        assert len(others) == 1
+        assert others[0].event == "Heavy Rain Warning"
+
+    async def test_degraded_path_bumps_last_updated(self, tmp_path):
+        store = AlertsStore()
+        store.replace_all([_non_nws_alert()])
+        old_ts = store.last_updated
+
+        fetcher = self._fetcher(store, self._sources_fail_client(), tmp_path)
+        await fetcher._fetch_once()
+
+        assert store.last_updated >= old_ts
+
+    def _wmo_ok_client(self):
+        rss = _rss_with_item()
+        cap_xml = _cap_xml_with_polygon()
+        return _FakeNwsClient({
+            _WMO_SOURCES_URL: _FakeNwsResponse(200, {
+                "sources": [
+                    {"source": {
+                        "sourceId": "fr-meteofrance-xx",
+                        "capAlertFeedStatus": "operating",
+                    }},
+                ],
+            }),
+            _WMO_ALL_URL: _FakeNwsResponse(200, {
+                "items": [{"id": "wmo-alert-1", "capURL": "fr-meteofrance-xx", "url": ""}],
+            }),
+            "https://severeweather.wmo.int/v2/cap-alerts/fr-meteofrance-xx/rss.xml": (
+                _FakeNwsResponse(200, content=rss.encode("utf-8"))
+            ),
+            "https://severeweather.wmo.int/cap/fr-meteofrance-xx/1.xml": (
+                _FakeNwsResponse(200, text=cap_xml)
+            ),
+        })
+
+    async def test_nws_failure_does_not_block_wmo_alerts(self, tmp_path):
+        store = AlertsStore()
+        fetcher = self._fetcher(store, self._wmo_ok_client(), tmp_path)
+
+        async def _boom():
+            raise RuntimeError("NWS API down")
+
+        fetcher._fetch_nws_alerts = _boom  # type: ignore[method-assign]
+
+        await fetcher._fetch_once()
+
+        assert store.fetch_success is True
+        alerts = store.alerts
+        assert len(alerts) == 1
+        assert alerts[0].source_id == "fr-meteofrance-xx"
+        assert alerts[0].event == "Severe Thunderstorm Warning issued"
+        assert alerts[0].polygon is not None

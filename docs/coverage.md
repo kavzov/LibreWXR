@@ -4,9 +4,12 @@ Visual reference for the radar composites and regional NWP grids
 LibreWXR fuses into its tiles.
 
 **ECMWF IFS is not drawn.** IFS provides 9 km global coverage as the
-base of the NWP chain — it covers every pixel everywhere, so showing
-it as a polygon would just paint the whole map. The two maps below
-highlight where the regional chain wins over the global IFS layer.
+terminal model of the NWP chain — as a model layer it covers every
+pixel everywhere, so showing it as a polygon would just paint the
+whole map. Within the 60S-70N band the observed bottom tier is the
+always-on RRQPE radar region (see the NOAA RRQPE note below the radar
+table). The two maps below highlight where the regional chain wins
+over the global IFS model layer.
 
 Polygon shapes follow each grid's actual projected domain (LCC, polar
 stereographic, LAEA, rotated lat/lon, or regular lat/lon) — not a
@@ -31,18 +34,20 @@ box that would have implied coverage where none exists.
 
 | Source | Stations | Per-station range | Composite cadence | Composite resolution |
 |---|---|---|---|---|
-| NOAA MRMS — CONUS | NEXRAD WSR-88D (~160) | 240 km | 2 min | ~0.005° (~500 m) |
+| NOAA MRMS — CONUS | NEXRAD WSR-88D (146) | 240 km | 2 min | ~0.005° (~500 m) |
 | NOAA MRMS — Alaska | NEXRAD WSR-88D (7) | 240 km | 2 min | ~0.01° |
 | NOAA MRMS — Hawaii | NEXRAD WSR-88D (4) | 240 km | 2 min | ~0.005° |
 | NOAA MRMS — Puerto Rico | NEXRAD WSR-88D (1) | 240 km | 2 min | ~0.01° |
 | NOAA MRMS — Guam | NEXRAD WSR-88D (1) | 240 km | 2 min | ~0.0085° |
-| ECCC MSC Canada | S-band dual-pol (32) | 240 km | 6 min | ~0.025° |
-| EUMETNET OPERA | C-band (~155, 24 countries) | 300 km | 5 min | 1 km LAEA |
+| ECCC MSC Canada | S-band dual-pol (33) | 240 km | 6 min | ~0.025° |
+| EUMETNET OPERA | C-band (184, 27 countries) | 300 km | 5 min | 1 km LAEA |
 | DPC Italy (VMI) | C-band + X-band (24: 11 DPC + 13 partner) | 150 km | 5 min | 1 km tmerc |
 | MARN El Salvador | S-band (1, San Andrés) | 120 km | 5 min | ~0.009° (~1 km) |
-| CWA Taiwan QPESUMS | S/C-band (7) | 240 km | 10 min | ~0.0125° (~1.4 km) |
-| MET Malaysia | S-band (12, national network) | 240 km | 10 min | ~0.022° lon / 0.019° lat (~2.5 km) |
+| CWA Taiwan QPESUMS | S/C-band (7) | 450 km | 10 min | ~0.0125° (~1.4 km) |
+| MET Malaysia | S-band (12, national network) | 350-375 km | 10 min | ~0.022° lon / 0.019° lat (~2.5 km) |
+| PAGASA Philippines | S-band (9, national mosaic) | 240 km | 15 min | ~0.0069° lon / 0.0091° lat (~770 m) |
 | JMA HRPN (Japan) | C-band (20) + XRAIN X-band + AMeDAS gauges | 240 km | 5 min | ~0.0125° (~1.4 km) |
+| NOAA RRQPE (observed) | geostationary IR blend (no radar stations) | — | 10 min | 0.04° stored (0.02° native) |
 
 MRMS and MSC ingest each other's stations along the US/Canada border,
 so the cross-border zone has overlap rather than a hard seam.
@@ -63,6 +68,16 @@ LibreWXR's internal optical-flow extrapolation, blended with the
 **JMA MSM** mesoscale NWP source over the same domain (see the
 Regional NWP models section below).
 
+NOAA RRQPE is not a radar network — it is the Enterprise Rain Rate
+GLB-5 blend, satellite-derived **observed** precipitation (an IR-based
+estimate) covering the 60°S–70°N geostationary ring at all
+longitudes.  LibreWXR ingests it as a single coarse global radar
+region that sorts **last** in the multi-region compositor: the
+always-on observed tier that fills only pixels no finer radar region
+claims, beneath every regional composite.  It joins radar nowcast
+extrapolation like any other region and stays active even under narrow
+`LIBREWXR_ENABLED_REGIONS` specs.
+
 ---
 
 ## Regional NWP models
@@ -71,7 +86,11 @@ Regional NWP models section below).
 
 The NWP chain dispatches per pixel to the **narrowest** model whose
 domain covers it, soft-feathering at every domain edge so seams don't
-show. Anywhere none of these models reach, ECMWF IFS fills in.
+show. Anywhere none of these models reach, ECMWF IFS fills in — for
+past frames within the 60S-70N band, RRQPE's observed fill (the
+always-on bottom radar tier above) applies first, and the models only
+cover the polar fringe outside the band, the fringe excluded by
+RRQPE's coverage polygon, and RRQPE-decline pixels.
 
 | Source | Coverage | Resolution | Projection | Cycles |
 |---|---|---|---|---|
@@ -136,8 +155,8 @@ fringe:
 ### East Asia
 
 Radar — MET Malaysia (Peninsular Malaysia and East Malaysia / Borneo),
-CWA / QPESUMS Taiwan, and JMA HRPN Japan, with MRMS Guam clipping in
-from the Western Pacific:
+PAGASA Philippines (Luzon, Visayas, and Mindanao), CWA / QPESUMS Taiwan,
+and JMA HRPN Japan, with MRMS Guam clipping in from the Western Pacific:
 
 ![East Asia radar coverage](coverage-map-east-asia-radar.png)
 
@@ -155,8 +174,8 @@ outside the rectangle:
 The PNGs are committed to the repository so they appear in the README
 and on GitHub without any rendering pipeline. Regenerate them with
 [`scripts/generate_coverage_map.py`](../scripts/generate_coverage_map.py)
-after adding or changing a radar source or NWP grid. The script header
-documents the throwaway-venv recipe; in short:
+after adding or changing a radar source or NWP grid. Use a throwaway venv for map regeneration (the script's only dependencies
+are matplotlib, pyproj, and shapely):
 
 ```bash
 python3 -m venv /tmp/coverage-map-venv

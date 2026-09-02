@@ -109,13 +109,7 @@ def _snapshot_sources(
     value: Any,
     cache_dir: Path,
 ) -> dict[Path, set[Path] | None]:
-    """Collect persistent roots and, where possible, exact files to retain.
-
-    Most stores advertise a ``memmap_dir`` and reopen either explicit
-    descriptors or every matching file below it.  ``None`` means a legacy
-    rescan-based store needs the complete tree.  GMGSI advertises the cache
-    root and timestamp list instead, so its small ``gmgsi`` subtree is kept.
-    """
+    """Collect persistent roots and, where possible, exact files to retain."""
     sources: dict[Path, set[Path] | None] = {}
     if isinstance(value, dict):
         memmap_dir = value.get("memmap_dir")
@@ -129,9 +123,7 @@ def _snapshot_sources(
                 )
                 existing = sources.get(root, set())
                 sources[root] = (
-                    None
-                    if existing is None or files is None
-                    else existing | files
+                    None if existing is None or files is None else existing | files
                 )
         cache_root = value.get("cache_root")
         if isinstance(cache_root, str):
@@ -142,18 +134,14 @@ def _snapshot_sources(
             for root, files in _snapshot_sources(child, cache_dir).items():
                 existing = sources.get(root, set())
                 sources[root] = (
-                    None
-                    if existing is None or files is None
-                    else existing | files
+                    None if existing is None or files is None else existing | files
                 )
     elif isinstance(value, list):
         for child in value:
             for root, files in _snapshot_sources(child, cache_dir).items():
                 existing = sources.get(root, set())
                 sources[root] = (
-                    None
-                    if existing is None or files is None
-                    else existing | files
+                    None if existing is None or files is None else existing | files
                 )
     return sources
 
@@ -168,15 +156,11 @@ def _hardlink_tree(source: Path, destination: Path) -> int:
         root_path = Path(root)
         target_root = destination / root_path.relative_to(source)
         target_root.mkdir(parents=True, exist_ok=True)
-        # Snapshot only complete files.  Every persistent writer uses a .tmp
-        # followed by os.replace, so a .tmp is never part of a valid state.
         dirnames[:] = [name for name in dirnames if not name.endswith(".tmp")]
         for filename in filenames:
             if filename.endswith(".tmp"):
                 continue
-            src = root_path / filename
-            dst = target_root / filename
-            os.link(src, dst)
+            os.link(root_path / filename, target_root / filename)
             linked += 1
     return linked
 
@@ -220,45 +204,29 @@ def _rewrite_store_paths(value: Any, cache_dir: Path, snapshot_root: Path) -> An
 def _prune_generations(generations_dir: Path, keep: int) -> None:
     """Remove complete generations older than the newest *keep* entries."""
     complete = sorted(
-        path for path in generations_dir.iterdir()
+        path
+        for path in generations_dir.iterdir()
         if path.is_dir() and not path.name.startswith(".")
     )
     for path in complete[:-keep]:
         shutil.rmtree(path)
 
 
-def dump_state(
-    stores: dict[str, Any],
-    cache_dir: Path,
-    retention_generations: int = DEFAULT_STATE_RETENTION_GENERATIONS,
-) -> Path:
-    """Publish an immutable, atomically-selected state generation.
+def snapshot_state(stores: dict[str, Any]) -> dict:
+    """Build the ``state.json`` payload dict from a mapping of stores.
 
-    Store data is hardlinked into ``state-generations/<id>/files`` before
-    either manifest becomes visible.  Hardlinks make unchanged generations
-    effectively free while preserving old inodes when the pipeline replaces
-    or unlinks their live-cache names.  The top-level ``state.json`` remains
-    the compatibility/current pointer consumed by existing readers.
+    Extracted from ``dump_state`` so the (fast) in-memory dict building
+    half can run on the event loop while the (slower) JSON serialisation
+    + atomic rename runs in a worker thread.
 
     Args:
         stores: mapping of store name → store object.  Values that are
             ``None`` are skipped.  Each non-None value must implement
             ``__getstate__()`` returning a JSON-serialisable dict.
-        cache_dir: directory shared with the tile-server workers.
-            ``state.json`` is written at the top level of this directory.
-
-        retention_generations: total complete generations to retain, including
-            the current one.  At least two are required so a reader that saw
-            the old manifest during the atomic switch can still open it.
 
     Returns:
-        The path to the newly-published top-level ``state.json``.
+        The payload dict, ready for :func:`write_state_snapshot`.
     """
-    if retention_generations < 2:
-        raise ValueError("retention_generations must be at least 2")
-
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
         "version": STATE_VERSION,
         "written_at": int(time.time()),
@@ -283,6 +251,36 @@ def dump_state(
             )
             continue
         payload["stores"][name] = store_state
+    return payload
+
+
+def write_state_snapshot(
+    payload: dict,
+    cache_dir: Path,
+    retention_generations: int = DEFAULT_STATE_RETENTION_GENERATIONS,
+) -> Path:
+    """Publish an immutable, atomically-selected state generation.
+
+    The caller may build ``payload`` on the event loop and run this slower
+    hardlink/JSON/fsync phase in a worker thread.  The input mapping is not
+    mutated, so it remains suitable for page-cache priming afterwards.
+
+    Args:
+        payload: dict built by :func:`snapshot_state`.
+        cache_dir: directory shared with the tile-server workers.
+            ``state.json`` is written at the top level of this directory.
+        retention_generations: complete generations to retain, including the
+            current one.  At least two keep racing readers safe.
+
+    Returns:
+        The path to the newly-written ``state.json``.
+    """
+    if retention_generations < 2:
+        raise ValueError("retention_generations must be at least 2")
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
 
     generations_dir = cache_dir / STATE_GENERATIONS_DIRNAME
     generations_dir.mkdir(parents=True, exist_ok=True)
@@ -298,9 +296,11 @@ def dump_state(
     staging_files.mkdir(parents=True)
 
     linked = 0
+    published_payload = dict(payload)
+    published_payload["stores"] = dict(payload.get("stores", {}))
     try:
         for source_root, relative_paths in _snapshot_sources(
-            payload, cache_dir,
+            published_payload, cache_dir
         ).items():
             relative = _path_under(source_root, cache_dir)
             if relative is None:
@@ -309,19 +309,17 @@ def dump_state(
             if relative_paths is None:
                 linked += _hardlink_tree(source_root, destination)
             else:
-                linked += _hardlink_selected(
-                    source_root, destination, relative_paths,
-                )
+                linked += _hardlink_selected(source_root, destination, relative_paths)
 
-        payload["stores"] = _rewrite_store_paths(
-            payload["stores"], cache_dir, final_files,
+        published_payload["stores"] = _rewrite_store_paths(
+            published_payload["stores"], cache_dir, final_files
         )
-        payload["generation"] = {
+        published_payload["generation"] = {
             "id": generation_id,
             "path": str(generation_dir),
             "retention_generations": retention_generations,
         }
-        _write_json(staging / STATE_FILENAME, payload)
+        _write_json(staging / STATE_FILENAME, published_payload)
         os.replace(staging, generation_dir)
         _fsync_directory(generations_dir)
     except Exception:
@@ -330,7 +328,7 @@ def dump_state(
 
     final = cache_dir / STATE_FILENAME
     tmp = cache_dir / f".{STATE_FILENAME}.tmp"
-    _write_json(tmp, payload)
+    _write_json(tmp, published_payload)
     os.replace(tmp, final)
     _fsync_directory(cache_dir)
     try:
@@ -340,10 +338,49 @@ def dump_state(
         # but cannot compromise readers, so leave cleanup for the next cycle.
         logger.exception("Failed to prune old state generations")
     logger.debug(
-        "Published state generation %s: %d store(s), %d hardlink(s) → %s",
-        generation_id, len(payload["stores"]), linked, final,
+        "Published state generation %s: %d store(s), %d hardlink(s) → %s "
+        "(%.2fs)",
+        generation_id,
+        len(published_payload["stores"]),
+        linked,
+        final,
+        time.monotonic() - started,
     )
     return final
+
+
+def dump_state(
+    stores: dict[str, Any],
+    cache_dir: Path,
+    retention_generations: int = DEFAULT_STATE_RETENTION_GENERATIONS,
+) -> Path:
+    """Atomically write a snapshot of every store's ``__getstate__`` to disk.
+
+    Composes the two halves of the pipeline's snapshot path —
+    :func:`snapshot_state` builds the payload from the live stores and
+    :func:`write_state_snapshot` writes it atomically — so callers that
+    need the write off the event loop can invoke the halves separately.
+
+    The write goes to ``<cache_dir>/.state.json.tmp`` first and is then
+    atomically renamed to ``state.json``.  Concurrent readers either see
+    the old file (if they read before the rename) or the new file
+    (after) — never a partial write.
+
+    Args:
+        stores: mapping of store name → store object.  Values that are
+            ``None`` are skipped.  Each non-None value must implement
+            ``__getstate__()`` returning a JSON-serialisable dict.
+        cache_dir: directory shared with the tile-server workers.
+            ``state.json`` is written at the top level of this directory.
+
+    Returns:
+        The path to the newly-written ``state.json``.
+    """
+    return write_state_snapshot(
+        snapshot_state(stores),
+        cache_dir,
+        retention_generations=retention_generations,
+    )
 
 
 def load_state(cache_dir: Path) -> dict[str, Any] | None:

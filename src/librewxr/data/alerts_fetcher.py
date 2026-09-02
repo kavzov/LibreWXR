@@ -28,7 +28,11 @@ _WMO_ALL_URL = f"{_WMO_BASE}/v2/json/wmo_all.json"
 
 # NWS API (direct GeoJSON, avoids WMO lag for US alerts)
 _NWS_API_URL = "https://api.weather.gov/alerts/active"
-_NWS_USER_AGENT = "(LibreWXR, librewxr@localhost)"
+# Shared User-Agent for all outbound alert requests (WMO, NWS, MeteoAlarm,
+# RSS/CAP).  NWS requires a contact UA; sending the default httpx UA to WMO
+# was a likely trigger for rejections, so every request now identifies as
+# LibreWXR.  Per-request headers (NWS) still override the client default.
+_USER_AGENT = "(LibreWXR, librewxr@localhost)"
 
 # Zone-based NWS alerts (Tornado Watches, Special Weather Statements, ...)
 # ship with ``geometry: null`` — their polygons come from affected zones.
@@ -37,6 +41,7 @@ _NWS_USER_AGENT = "(LibreWXR, librewxr@localhost)"
 # replaces the old per-request ``?point=`` enrichment: no query path ever
 # touches api.weather.gov at request time anymore.
 _ZONE_CACHE_TTL = 30 * 24 * 60 * 60  # 30 days
+_ZONE_FAILURE_TTL = 24 * 60 * 60  # 1 day - retry genuinely-broken zones daily, not every cycle
 
 # UGC codes encode the zone type in the 3rd character: Z = forecast zone,
 # C = county.  Only these two map to api.weather.gov zone URLs.
@@ -139,6 +144,7 @@ def _extract_polygons_from_cap(
         effective = _cap_text(info, "effective", ns) or _cap_text(info, "onset", ns)
         expires = _cap_text(info, "expires", ns)
 
+        n_before = len(results)
         for area in info.findall("cap:area" if ns else "area", ns):
             area_desc = (
                 area.findtext("cap:areaDesc" if ns else "areaDesc", "", ns) or ""
@@ -228,6 +234,18 @@ def _extract_polygons_from_cap(
                             )
                         )
 
+        # Fully-processed <info> that produced no entry (no usable <polygon>
+        # and no EMMA_ID/NUTS3 geocode resolved) is dropped — surface it at
+        # DEBUG so dropped alerts are discoverable.
+        if len(results) == n_before:
+            logger.debug(
+                "Dropped CAP alert for %s: no usable polygon or EMMA_ID/NUTS3 "
+                "geocode (event=%r headline=%r)",
+                source_id,
+                event or "",
+                headline or "",
+            )
+
     return results
 
 
@@ -316,6 +334,30 @@ def _parse_cap_time(value: str) -> int | None:
 # NWS zone geometry helpers
 # ---------------------------------------------------------------------------
 
+def _polygonal(geom: dict | None) -> Optional[Polygon]:
+    """Parse GeoJSON geometry to a Polygon/MultiPolygon, unwrapping
+    GeometryCollections by unioning their polygonal members (NWS serves
+    some zone geometries as GeometryCollection-wrapped MultiPolygons).
+    Returns None for missing, unparseable, empty, or non-polygonal input."""
+    if geom is None:
+        return None
+    try:
+        parsed = shape(geom)
+    except Exception:
+        return None
+    if parsed.geom_type == "GeometryCollection":
+        members = [
+            m for m in parsed.geoms
+            if m.geom_type in ("Polygon", "MultiPolygon") and not m.is_empty
+        ]
+        if not members:
+            return None
+        parsed = unary_union(members)
+    if parsed.is_empty or parsed.geom_type not in ("Polygon", "MultiPolygon"):
+        return None
+    return parsed
+
+
 def _nws_zone_urls(props: dict) -> list[str]:
     """Resolve an NWS feature's zone references to api.weather.gov URLs.
 
@@ -358,13 +400,7 @@ def _read_zone_cache(cache_path: Path) -> Optional[Polygon]:
             data = json.load(f)
         if time.time() - float(data["fetched_at"]) > _ZONE_CACHE_TTL:
             return None
-        geom = data.get("geometry")
-        if geom is None:
-            return None
-        polygon = shape(geom)
-        if polygon.is_empty:
-            return None
-        return polygon
+        return _polygonal(data.get("geometry"))
     except Exception:
         return None
 
@@ -378,6 +414,34 @@ def _write_zone_cache(cache_path: Path, polygon: Polygon) -> None:
             f,
         )
     os.replace(tmp_path, cache_path)
+
+
+def _write_zone_failure(cache_path: Path) -> None:
+    """Atomically write a failure marker so genuinely-broken zones are
+    retried at most once per day instead of every fetch cycle."""
+    tmp_path = cache_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"fetched_at": int(time.time()), "geometry": None, "failed": True},
+            f,
+        )
+    os.replace(tmp_path, cache_path)
+
+
+def _read_zone_failure(cache_path: Path) -> bool:
+    """True iff a fresh failure marker exists for the zone.
+
+    Any unparseable/missing marker or a marker older than
+    ``_ZONE_FAILURE_TTL`` reads as False so the zone is refetched.
+    """
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not data.get("failed"):
+            return False
+        return time.time() - float(data["fetched_at"]) <= _ZONE_FAILURE_TTL
+    except Exception:
+        return False
 
 
 def _alert_entry_from_nws(
@@ -440,7 +504,11 @@ class WMOAlertsFetcher:
                 max_connections=self._concurrency,
                 max_keepalive_connections=self._concurrency,
             )
-            self._client = httpx.AsyncClient(limits=limits, timeout=self._timeout)
+            self._client = httpx.AsyncClient(
+                limits=limits,
+                timeout=self._timeout,
+                headers={"User-Agent": _USER_AGENT},
+            )
         return self._client
 
     async def _ensure_meteoalarm_data(self) -> None:
@@ -517,12 +585,16 @@ class WMOAlertsFetcher:
             if polygon is not None:
                 polygons[url] = polygon
                 return
+            if _read_zone_failure(cache_path):
+                # Genuinely-broken zone: retried at most once per day, stays
+                # silent (and HTTP-free) in between.
+                return
             async with sem:
                 client = await self._get_client()
                 try:
                     resp = await client.get(
                         url,
-                        headers={"User-Agent": _NWS_USER_AGENT},
+                        headers={"User-Agent": _USER_AGENT},
                         timeout=self._timeout,
                     )
                 except Exception as exc:
@@ -530,18 +602,19 @@ class WMOAlertsFetcher:
                     return
                 if resp.status_code != 200:
                     logger.warning("NWS zone %s returned %d", zone_id, resp.status_code)
+                    _write_zone_failure(cache_path)
                     return
                 try:
-                    geom = resp.json().get("geometry")
-                    if geom is None:
-                        logger.warning("NWS zone %s has null geometry", zone_id)
-                        return
-                    polygon = shape(geom)
-                    if polygon.is_empty or polygon.geom_type not in ("Polygon", "MultiPolygon"):
-                        logger.warning("NWS zone %s has unusable geometry", zone_id)
-                        return
+                    polygon = _polygonal(resp.json().get("geometry"))
                 except Exception as exc:
-                    logger.warning("Failed to parse NWS zone %s geometry: %s", zone_id, exc)
+                    logger.warning(
+                        "Failed to parse NWS zone %s geometry: %s", zone_id, exc
+                    )
+                    _write_zone_failure(cache_path)
+                    return
+                if polygon is None:
+                    logger.warning("NWS zone %s has no usable geometry", zone_id)
+                    _write_zone_failure(cache_path)
                     return
                 _write_zone_cache(cache_path, polygon)
                 polygons[url] = polygon
@@ -567,7 +640,7 @@ class WMOAlertsFetcher:
         try:
             resp = await client.get(
                 _NWS_API_URL,
-                headers={"User-Agent": _NWS_USER_AGENT},
+                headers={"User-Agent": _USER_AGENT},
                 timeout=self._timeout,
             )
             if resp.status_code != 200:
@@ -597,10 +670,7 @@ class WMOAlertsFetcher:
             # Geometry already in GeoJSON [lon, lat] order
             polygon = None
             if geom is not None:
-                try:
-                    polygon = shape(geom)
-                except Exception:
-                    pass
+                polygon = _polygonal(geom)
 
             zone_urls = _nws_zone_urls(props)
             if polygon is None and zone_urls:
@@ -629,8 +699,17 @@ class WMOAlertsFetcher:
                         polygon = union
                 entries.append(_alert_entry_from_nws(feature, props, polygon))
 
-        logger.info("NWS API: %d active alerts", len(entries))
+        logger.debug("NWS API: %d active alerts", len(entries))
         return entries
+
+    async def _await_nws(self, nws_task: asyncio.Task) -> list[AlertEntry]:
+        """Await the parallel NWS fetch task, never letting its failure kill
+        the cycle — a WMO outage must not freeze the US slice either."""
+        try:
+            return await nws_task
+        except Exception:
+            logger.warning("NWS alert fetch failed", exc_info=True)
+            return []
 
     async def _fetch_once(self) -> None:
         """Full ingest pipeline."""
@@ -643,7 +722,13 @@ class WMOAlertsFetcher:
         resp = await retry_get(client, _SOURCES_URL, log_name="wmo_sources")
         if resp is None or resp.status_code != 200:
             logger.warning("Failed to fetch sources.json")
-            self._store.mark_failed()
+            # WMO is down: still salvage the US slice from the NWS API and
+            # keep last-known non-NWS alerts (expiry filtering on the serve
+            # side hides stale ones).  fetch_success stays False so the
+            # outage stays visible in /health.
+            nws_alerts = await self._await_nws(nws_task)
+            kept = [a for a in self._store.alerts if a.source_id != "nws-api"]
+            self._store.replace_all(kept + nws_alerts, fetch_success=False)
             return
         sources_data = resp.json()
         sources = sources_data.get("sources", [])
@@ -652,7 +737,9 @@ class WMOAlertsFetcher:
         resp = await retry_get(client, _WMO_ALL_URL, log_name="wmo_all")
         if resp is None or resp.status_code != 200:
             logger.warning("Failed to fetch wmo_all.json")
-            self._store.mark_failed()
+            nws_alerts = await self._await_nws(nws_task)
+            kept = [a for a in self._store.alerts if a.source_id != "nws-api"]
+            self._store.replace_all(kept + nws_alerts, fetch_success=False)
             return
         wmo_all_data = resp.json()
         wmo_all_items = wmo_all_data.get("items", [])
@@ -681,7 +768,7 @@ class WMOAlertsFetcher:
             if sid in current_agencies:
                 source_ids.append(sid)
 
-        logger.info("Fetching alerts from %d WMO sources", len(source_ids))
+        logger.debug("Fetching alerts from %d WMO sources", len(source_ids))
 
         # 3. Fetch RSS feeds and CAP XMLs
         sem = asyncio.Semaphore(self._concurrency)
@@ -727,7 +814,7 @@ class WMOAlertsFetcher:
         await asyncio.gather(*(process_feed(sid) for sid in source_ids))
 
         # 4. Merge NWS results
-        nws_alerts = await nws_task
+        nws_alerts = await self._await_nws(nws_task)
         all_alerts.extend(nws_alerts)
 
         # 5. Replace store
