@@ -114,6 +114,9 @@ class Settings(BaseSettings):
     native_render: Literal["auto", "on", "off"] = "auto"
     workers: int = 0  # Number of uvicorn worker processes; 0 = mode default
     warmer_threads: int = 0  # Render thread pool size; 0 = mode default (auto in single, 4 in multi) (sizes the request-executor pool in multi mode; the warmer itself is single-mode only)
+    present_threads: int = Field(0, ge=0)  # Encode/colorize pool per render worker; 0 = max(2, render_threads / 2)
+    io_threads: int = Field(2, ge=1)  # Shared-store/state I/O pool per render worker
+    opencv_threads: int = Field(2, ge=1)  # OpenCV threads inside each render worker
     # Pre-warm coordinate caches up to this zoom as a background task at
     # startup (0 = mode default: single warms to 6, multi does no eager
     # warm — see _MODE_DEFAULTS).  Any negative value disables the warm

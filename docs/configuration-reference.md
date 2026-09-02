@@ -522,7 +522,7 @@ Best-effort: any store failure (unwritable cache dir, corrupt files, version mis
 
 ### `LIBREWXR_COORD_STORE_MB`
 
-Size cap of the shared on-disk coordinate store, in megabytes. The cap is **soft**: the store is pruned once per fetch cycle by whichever process owns store maintenance (the pipeline in multi mode, the main process in single mode — via the ~30 s-debounced cycle hook), so it can briefly overshoot between prunes.
+Hard size cap of the shared on-disk coordinate store, in megabytes. Every publish checks the shared byte ledger under an inter-process lock and evicts oldest entries down to 90% when capacity is needed. The periodic fetch-cycle prune remains as reconciliation for manual file changes and crashed writers.
 
 The default tracks `LIBREWXR_MODE`: 1024 in single mode, 8192 in multi mode. In multi mode the budget is **shared by ALL render workers** — every worker reads the same on-disk store, so the 8192 MB default covers the combined warm set rather than 8192 MB per worker. Settable via `.env` like any knob; a restart applies the change. Requires `LIBREWXR_CACHE_DIR`; the store disables itself when the cache dir is unset.
 
@@ -542,6 +542,22 @@ Thread pool size for background tile cache warming, **single mode only** — in 
 | **Type** | integer |
 
 The empty-tile fast path (see `tile_requests.fast_path` in `/health`) and per-worker LRU caches cover the cold-render case in multi mode.
+
+### `LIBREWXR_PRESENT_THREADS`
+
+Per-render-worker thread pool for colorization and image encoding. `0` derives
+`max(2, render threads / 2)`. Keeping this separate prevents quick encodes from
+queuing behind coordinate and NWP sampling work.
+
+### `LIBREWXR_IO_THREADS`
+
+Per-render-worker pool for shared tile-store and state I/O. Default: `2`.
+
+### `LIBREWXR_OPENCV_THREADS`
+
+OpenCV threads allowed inside each render worker. Default: `2`. The product of
+renderer workers, request threads, and this value should remain below the CPU
+capacity reserved for LibreWXR.
 
 ### `LIBREWXR_WARM_COORD_ZOOM`
 

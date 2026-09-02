@@ -418,6 +418,75 @@ fn sample_radar_bilinear_u8<'py>(
 }
 
 #[pyfunction]
+#[pyo3(signature = (radar, model, model_raw, feather, blend_weight, pixel_threshold=None))]
+fn blend_radar_nowcast_u8<'py>(
+    py: Python<'py>,
+    radar: PyReadonlyArray2<'py, u8>,
+    model: PyReadonlyArray2<'py, f32>,
+    model_raw: PyReadonlyArray2<'py, u8>,
+    feather: PyReadonlyArray2<'py, f32>,
+    blend_weight: f32,
+    pixel_threshold: Option<u8>,
+) -> PyResult<Bound<'py, PyArray2<u8>>> {
+    let shape = radar.shape();
+    for (name, actual) in [
+        ("model", model.shape()),
+        ("model_raw", model_raw.shape()),
+        ("feather", feather.shape()),
+    ] {
+        if actual != shape {
+            return Err(PyValueError::new_err(format!(
+                "{name} shape {actual:?} does not match radar {shape:?}"
+            )));
+        }
+    }
+    if !blend_weight.is_finite() || !(0.0..=1.0).contains(&blend_weight) {
+        return Err(PyValueError::new_err(
+            "blend_weight must be finite and within [0, 1]",
+        ));
+    }
+    let rows = shape[0];
+    let cols = shape[1];
+    let radar = radar
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("radar must be C-contiguous"))?;
+    let model = model
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("model must be C-contiguous"))?;
+    let model_raw = model_raw
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("model_raw must be C-contiguous"))?;
+    let feather = feather
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("feather must be C-contiguous"))?;
+    let result = py.allow_threads(|| {
+        radar
+            .iter()
+            .zip(model)
+            .zip(model_raw)
+            .zip(feather)
+            .map(|(((&radar, &model), &model_raw), &feather)| {
+                if radar == 0 && model_raw == 0 {
+                    return 0;
+                }
+                let mut model = model;
+                if blend_weight > 0.0
+                    && pixel_threshold
+                        .is_some_and(|threshold| model < threshold as f32 && radar >= threshold)
+                {
+                    model = pixel_threshold.expect("threshold checked") as f32;
+                }
+                let weight = blend_weight * feather.clamp(0.0, 1.0);
+                (weight * radar as f32 + (1.0 - weight) * model + 0.5).clamp(0.0, 255.0) as u8
+            })
+            .collect::<Vec<_>>()
+    });
+    let array = Array2::from_shape_vec((rows, cols), result)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(array.into_pyarray(py))
+}
+
+#[pyfunction]
 #[pyo3(signature = (values, rain_lut, snow_lut=None, snow_mask=None, display_threshold=None))]
 fn colorize_radar_u8<'py>(
     py: Python<'py>,
@@ -543,6 +612,7 @@ fn _librewxr_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sample_derived_humidity, module)?)?;
     module.add_function(wrap_pyfunction!(sample_wind_speed, module)?)?;
     module.add_function(wrap_pyfunction!(sample_radar_bilinear_u8, module)?)?;
+    module.add_function(wrap_pyfunction!(blend_radar_nowcast_u8, module)?)?;
     module.add_function(wrap_pyfunction!(colorize_radar_u8, module)?)?;
     module.add_function(wrap_pyfunction!(encode_png_rgba, module)?)?;
     Ok(())

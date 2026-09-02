@@ -60,7 +60,9 @@ def _get_store() -> CoordStore | None:
         return _STORE
     try:
         _STORE = CoordStore(
-            Path(settings.cache_dir), settings.get_enabled_regions(),
+            Path(settings.cache_dir),
+            settings.get_enabled_regions(),
+            settings.coord_store_mb * 1024 * 1024,
         )
     except Exception:
         logger.warning(
@@ -380,7 +382,7 @@ def region_pixel_indices(
         row_idx, col_idx = _compute_region_pixel_indices(region, z, x, y, tile_size)
         _try_publish(
             store, KIND_INDICES, region.name, z, x, y, tile_size, 0,
-            np.stack((row_idx, col_idx)),
+            (row_idx, col_idx),
         )
         # Re-open so the lru pins shared file-backed pages, not these heap
         # arrays.  Identical bytes even if a racing worker won the publish
@@ -452,7 +454,7 @@ def region_pixel_indices_padded(
         )
         _try_publish(
             store, KIND_INDICES_PAD, region.name, z, x, y, tile_size, pad,
-            np.stack((row_idx, col_idx)),
+            (row_idx, col_idx),
         )
         # Re-open so the lru pins shared file-backed pages, not these heap
         # arrays.  Identical bytes even if a racing worker won the publish
@@ -515,7 +517,7 @@ def region_pixel_indices_fractional(
         )
         _try_publish(
             store, KIND_FRACTIONAL, region.name, z, x, y, tile_size, 0,
-            np.stack((row_grid, col_grid)),
+            (row_grid, col_grid),
         )
         # Re-open so the lru pins shared file-backed pages, not these heap
         # arrays.  Identical bytes even if a racing worker won the publish
@@ -578,7 +580,7 @@ def region_pixel_indices_fractional_padded(
         )
         _try_publish(
             store, KIND_FRACTIONAL_PAD, region.name, z, x, y, tile_size, pad,
-            np.stack((row_grid, col_grid)),
+            (row_grid, col_grid),
         )
         # Re-open so the lru pins shared file-backed pages, not these heap
         # arrays.  Identical bytes even if a racing worker won the publish
@@ -679,7 +681,7 @@ def tile_pixel_latlons(
         lat_grid, lon_grid = _compute_tile_pixel_latlons(z, x, y, tile_size)
         _try_publish(
             store, KIND_LATLON, None, z, x, y, tile_size, 0,
-            np.stack((lat_grid, lon_grid)),
+            (lat_grid, lon_grid),
         )
         # Re-open so the lru pins shared file-backed pages, not these heap
         # arrays.  Identical bytes even if a racing worker won the publish
@@ -731,7 +733,7 @@ def tile_pixel_latlons_padded(
         )
         _try_publish(
             store, KIND_LATLON_PAD, None, z, x, y, tile_size, pad,
-            np.stack((lat_grid, lon_grid)),
+            (lat_grid, lon_grid),
         )
         # Re-open so the lru pins shared file-backed pages, not these heap
         # arrays.  Identical bytes even if a racing worker won the publish

@@ -25,12 +25,15 @@ imported.  Callers pass ``cache_dir`` and ``enabled_regions``.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import logging
 import os
 import time
 import uuid
 from pathlib import Path
+from contextlib import contextmanager
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -62,6 +65,8 @@ _TMP_TTL_SECONDS = 3600.0
 _PRUNE_TARGET_FRACTION = 0.9
 # stats() on-disk scan TTL (time.monotonic).
 _STATS_TTL_SECONDS = 60.0
+_LOCK_NAME = ".budget.lock"
+_USAGE_NAME = ".usage"
 
 # RegionDef fields the projection math in tiles/coordinates.py reads.
 # Signature over-inclusion is harmless (it only busts the cache more often);
@@ -97,9 +102,12 @@ class CoordStore:
     (EIO / EAGAIN / EMFILE) fall through to compute WITHOUT unlinking.
     """
 
-    def __init__(self, cache_dir: Path, enabled_regions: list[str]) -> None:
+    def __init__(
+        self, cache_dir: Path, enabled_regions: list[str], budget_bytes: int = 0,
+    ) -> None:
         self._cache_dir = Path(cache_dir)
         self._enabled_regions = list(enabled_regions)
+        self._budget_bytes = max(0, int(budget_bytes))
         self._signature: str | None = None
         self._hits = 0
         self._misses = 0
@@ -108,6 +116,88 @@ class CoordStore:
         # Cached (entries, bytes) from a recursive on-disk scan; TTL below.
         self._scan: tuple[int, int] | None = None
         self._scan_cached_at: float | None = None
+
+    @contextmanager
+    def _budget_lock(self):
+        """Serialize capacity decisions and publishes across all workers."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock_path = self.root / _LOCK_NAME
+        with lock_path.open("a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    def _usage_path(self) -> Path:
+        return self.root / _USAGE_NAME
+
+    def _scan_entries(self) -> list[tuple[Path, int, float]]:
+        entries: list[tuple[Path, int, float]] = []
+        if self.root.is_dir():
+            for path in self.root.rglob("*.npy"):
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                entries.append((path, st.st_size, st.st_mtime))
+        return entries
+
+    def _read_usage_locked(self) -> int:
+        try:
+            return max(0, int(self._usage_path().read_text()))
+        except (OSError, ValueError):
+            total = sum(size for _path, size, _mtime in self._scan_entries())
+            self._write_usage_locked(total)
+            return total
+
+    def _write_usage_locked(self, value: int) -> None:
+        path = self._usage_path()
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        tmp.write_text(str(max(0, int(value))))
+        os.replace(tmp, path)
+
+    def _remove_orphan_tmps_locked(
+        self, *, stale_only: bool = False,
+    ) -> tuple[int, int]:
+        """Remove tmp files; optionally retain files younger than the TTL."""
+        removed_bytes = 0
+        removed_entries = 0
+        now = time.time()
+        if not self.root.is_dir():
+            return removed_bytes, removed_entries
+        for path in self.root.rglob("*.tmp"):
+            try:
+                stat = path.stat()
+                if stale_only and now - stat.st_mtime <= _TMP_TTL_SECONDS:
+                    continue
+                size = stat.st_size
+                path.unlink()
+            except OSError:
+                continue
+            removed_bytes += size
+            removed_entries += 1
+        return removed_bytes, removed_entries
+
+    def _prune_entries_locked(self, target_bytes: int) -> tuple[int, int, int]:
+        """Prune oldest .npy entries and return removed bytes/count/remaining."""
+        entries = self._scan_entries()
+        total = sum(size for _path, size, _mtime in entries)
+        removed_bytes = 0
+        removed_entries = 0
+        entries.sort(key=lambda entry: entry[2])
+        for path, size, _mtime in entries:
+            if total <= target_bytes:
+                break
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            total -= size
+            removed_bytes += size
+            removed_entries += 1
+        self._write_usage_locked(total)
+        return removed_bytes, removed_entries, total
 
     @property
     def root(self) -> Path:
@@ -228,7 +318,8 @@ class CoordStore:
 
     def publish(
         self, kind: str, region: str | None, z: int, x: int, y: int,
-        tile_size: int, pad: int, data: np.ndarray,
+        tile_size: int, pad: int,
+        data: np.ndarray | Sequence[np.ndarray],
     ) -> bool:
         """Persist ``data`` for the key; True when a new file was written.
 
@@ -240,29 +331,95 @@ class CoordStore:
         raises.  The first successful publish of the process also writes
         the manifest.
         """
+        if isinstance(data, np.ndarray):
+            shape = data.shape
+            dtype = data.dtype
+            parts = None
+            data_bytes = data.nbytes
+        else:
+            parts = tuple(data)
+            if not parts:
+                return False
+            first = np.asarray(parts[0])
+            if any(
+                np.asarray(part).shape != first.shape
+                or np.asarray(part).dtype != first.dtype
+                for part in parts[1:]
+            ):
+                logger.warning("coord_store: publish parts have mismatched layout")
+                return False
+            shape = (len(parts), *first.shape)
+            dtype = first.dtype
+            data_bytes = sum(np.asarray(part).nbytes for part in parts)
+
+        # The .npy header is normally 128 bytes.  A 4 KiB allowance keeps
+        # the physical store below the configured byte budget without
+        # depending on NumPy's private header-size implementation.
+        projected_bytes = data_bytes + 4096
         path = self.entry_path(kind, region, z, x, y, tile_size, pad)
-        if path.exists():
-            return False
         tmp: Path | None = None
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(
-                f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-            )
-            mm = np.lib.format.open_memmap(
-                tmp, mode="w+", dtype=data.dtype, shape=data.shape,
-            )
-            try:
-                mm[:] = data
-                mm.flush()
-            finally:
-                del mm
-            os.replace(tmp, path)
+            with self._budget_lock():
+                if path.exists():
+                    return False
+                self._remove_orphan_tmps_locked()
+                usage = self._read_usage_locked()
+                if self._budget_bytes:
+                    if projected_bytes > self._budget_bytes:
+                        logger.warning(
+                            "coord_store: entry %s (%d bytes) exceeds %d-byte budget",
+                            path, projected_bytes, self._budget_bytes,
+                        )
+                        return False
+                    target = max(
+                        0,
+                        int(self._budget_bytes * _PRUNE_TARGET_FRACTION)
+                        - projected_bytes,
+                    )
+                    if usage + projected_bytes > self._budget_bytes:
+                        _removed_b, _removed_n, usage = self._prune_entries_locked(
+                            target,
+                        )
+                    # Reserve the conservative on-disk size before the file
+                    # becomes visible. A crash can only leave an over-count,
+                    # never an unaccounted entry that permits overshoot.
+                    self._write_usage_locked(usage + projected_bytes)
+
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(
+                    f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                )
+                mm = np.lib.format.open_memmap(
+                    tmp, mode="w+", dtype=dtype, shape=shape,
+                )
+                try:
+                    if parts is None:
+                        mm[:] = data
+                    else:
+                        for index, part in enumerate(parts):
+                            mm[index] = part
+                    mm.flush()
+                finally:
+                    del mm
+                actual_bytes = tmp.stat().st_size
+                if self._budget_bytes and usage + actual_bytes > self._budget_bytes:
+                    tmp.unlink(missing_ok=True)
+                    self._write_usage_locked(usage)
+                    return False
+                os.replace(tmp, path)
+                self._write_usage_locked(usage + actual_bytes)
         except Exception:
             logger.warning("coord_store: failed to publish %s", path, exc_info=True)
             if tmp is not None:
                 try:
                     tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if self._budget_bytes:
+                try:
+                    with self._budget_lock():
+                        entries = self._scan_entries()
+                        self._write_usage_locked(sum(item[1] for item in entries))
                 except OSError:
                     pass
             return False
@@ -283,46 +440,21 @@ class CoordStore:
         Returns ``(removed_bytes, removed_entries)`` including the tmp
         sweep.  Per-file failures are swallowed and eviction continues.
         """
-        removed_bytes = 0
-        removed_entries = 0
-        now = time.time()
-        entries: list[tuple[Path, int, float]] = []  # (path, size, mtime)
-        total = 0
-        if self.root.is_dir():
-            for path in self.root.rglob("*"):
-                if not path.is_file():
-                    continue
-                try:
-                    st = path.stat()
-                except OSError:
-                    continue
-                if path.name.endswith(".tmp"):
-                    if now - st.st_mtime > _TMP_TTL_SECONDS:
-                        try:
-                            path.unlink()
-                        except OSError:
-                            continue
-                        removed_bytes += st.st_size
-                        removed_entries += 1
-                    continue
-                entries.append((path, st.st_size, st.st_mtime))
-                total += st.st_size
-
-        if total <= budget_bytes:
-            return removed_bytes, removed_entries
-
-        target = int(budget_bytes * _PRUNE_TARGET_FRACTION)
-        entries.sort(key=lambda e: e[2])  # oldest mtime first
-        for path, size, _mtime in entries:
-            if total <= target:
-                break
-            try:
-                path.unlink()
-            except OSError:
-                continue
-            total -= size
-            removed_bytes += size
-            removed_entries += 1
+        with self._budget_lock():
+            removed_bytes, removed_entries = self._remove_orphan_tmps_locked(
+                stale_only=True,
+            )
+            entries = self._scan_entries()
+            total = sum(size for _path, size, _mtime in entries)
+            if total > budget_bytes:
+                target = int(budget_bytes * _PRUNE_TARGET_FRACTION)
+                pruned_bytes, pruned_entries, total = self._prune_entries_locked(
+                    target,
+                )
+                removed_bytes += pruned_bytes
+                removed_entries += pruned_entries
+            else:
+                self._write_usage_locked(total)
 
         # Remove now-empty shard dirs (rmdir only succeeds on empty dirs;
         # the manifest lives at root level and keeps root itself alive).
@@ -352,16 +484,9 @@ class CoordStore:
         ):
             entries = 0
             bytes_ = 0
-            if self.root.is_dir():
-                for path in self.root.rglob("*"):
-                    if not path.is_file():
-                        continue
-                    try:
-                        st = path.stat()
-                    except OSError:
-                        continue
-                    entries += 1
-                    bytes_ += st.st_size
+            for _path, size, _mtime in self._scan_entries():
+                entries += 1
+                bytes_ += size
             self._scan = (entries, bytes_)
             self._scan_cached_at = now
         return {
@@ -370,6 +495,10 @@ class CoordStore:
             "publishes": self._publishes,
             "entries": self._scan[0],
             "bytes": self._scan[1],
+            "budget_bytes": self._budget_bytes,
+            "over_budget": bool(
+                self._budget_bytes and self._scan[1] > self._budget_bytes
+            ),
         }
 
     def write_manifest(self) -> None:

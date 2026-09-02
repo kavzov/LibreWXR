@@ -16,6 +16,7 @@ from librewxr.data.weather_sampling import build_regular_sampling_plan
 from librewxr import native_weather
 from librewxr.native_weather import (
     active_implementation,
+    blend_radar_nowcast,
     ensure_native_render_available,
     colorize_radar,
     encode_radar_png,
@@ -226,6 +227,27 @@ def test_native_radar_bilinear_matches_numpy(require_native):
     rust = sample_radar_bilinear(frame, row, col, implementation="rust")
 
     np.testing.assert_array_equal(rust, python)
+
+
+def test_native_radar_nowcast_blend_matches_numpy(require_native):
+    rng = np.random.default_rng(161803)
+    radar = rng.integers(0, 256, (47, 59), dtype=np.uint8)
+    model_raw = rng.integers(0, 256, radar.shape, dtype=np.uint8)
+    model = np.ascontiguousarray(
+        model_raw.astype(np.float32) * rng.uniform(0.85, 1.15, radar.shape),
+        dtype=np.float32,
+    )
+    feather = np.ascontiguousarray(rng.random(radar.shape), dtype=np.float32)
+    for blend_weight, threshold in ((0.0, None), (0.4, 108), (1.0, 108)):
+        python = blend_radar_nowcast(
+            radar, model, model_raw, feather, blend_weight, threshold,
+            implementation="python",
+        )
+        rust = blend_radar_nowcast(
+            radar, model, model_raw, feather, blend_weight, threshold,
+            implementation="rust",
+        )
+        np.testing.assert_array_equal(rust, python)
 
 
 def test_native_radar_colorize_and_png_are_lossless(require_native):

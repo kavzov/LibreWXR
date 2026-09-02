@@ -17,11 +17,15 @@ COPY src/ src/
 COPY --from=native-builder /wheels/ /wheels/
 
 # Install with the [mcp] extra so the MCP HTTP transport mounts on startup,
-# plus the optional abi3 Rust sampling kernels. ``auto`` selects them at
-# runtime and still permits an operator to force the Python path with
-# LIBREWXR_NATIVE_RENDER=off.
+# plus the abi3 Rust sampling kernels. The container defaults to strict native
+# mode below; an operator can still explicitly force the Python path with
+# LIBREWXR_NATIVE_RENDER=off for diagnosis.
 RUN pip install --no-cache-dir '.[mcp]' /wheels/*.whl \
     && rm -rf /wheels
+
+# Container builds always carry the wheel, so fail closed if it ever becomes
+# unloadable instead of silently falling back to the slower NumPy path.
+ENV LIBREWXR_NATIVE_RENDER=on
 
 EXPOSE 8080
 

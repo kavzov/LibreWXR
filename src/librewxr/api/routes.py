@@ -74,7 +74,7 @@ from librewxr.tiles.motion_renderer import (
     MOTION_VECTOR_SCALE,
     render_motion_tile,
 )
-from librewxr.tiles.request_tracker import TileRequestTracker
+from librewxr.tiles.request_tracker import RENDER_STAGE_NAMES, TileRequestTracker
 from librewxr.tiles.satellite_renderer import (
     render_gmgsi_composite_tile,
     render_gmgsi_tile,
@@ -175,6 +175,29 @@ mcp_tools: list[str] = []
 # Per-process cold-render singleflight. Render workers do not share an event
 # loop or byte cache, so each worker owns its own in-flight task map.
 _weather_tile_flights: dict[tuple, asyncio.Task[CachedRender]] = {}
+_geometry_flights: dict[tuple, asyncio.Task] = {}
+
+
+async def _singleflight(
+    flights: dict[tuple, asyncio.Task],
+    key: tuple,
+    factory: Callable[[], Awaitable],
+) -> tuple[object, bool]:
+    """Return one shared task result and whether this caller created it."""
+
+    task = flights.get(key)
+    leader = task is None
+    if task is None:
+        task = asyncio.create_task(factory())
+        flights[key] = task
+
+        def _remove(done: asyncio.Task) -> None:
+            if flights.get(key) is done:
+                flights.pop(key, None)
+
+        task.add_done_callback(_remove)
+    # A cancelled client must not cancel the shared render needed by peers.
+    return await asyncio.shield(task), leader
 
 
 async def _weather_tile_singleflight(
@@ -183,18 +206,8 @@ async def _weather_tile_singleflight(
 ) -> CachedRender:
     """Share one cold weather render among concurrent identical requests."""
 
-    task = _weather_tile_flights.get(key)
-    if task is None:
-        task = asyncio.create_task(factory())
-        _weather_tile_flights[key] = task
-
-        def _remove(done: asyncio.Task[CachedRender]) -> None:
-            if _weather_tile_flights.get(key) is done:
-                _weather_tile_flights.pop(key, None)
-
-        task.add_done_callback(_remove)
-    # A cancelled client must not cancel the shared render needed by peers.
-    return await asyncio.shield(task)
+    result, _leader = await _singleflight(_weather_tile_flights, key, factory)
+    return result
 
 
 def _nwp_grid_health_blocks() -> dict[str, dict]:
@@ -314,6 +327,7 @@ def collect_worker_pulse() -> dict:
                 "compute_count": lat["compute_count"],
                 "present_ns_total": lat["present_ns_total"],
                 "present_count": lat["present_count"],
+                "stages": lat["stages"],
             }
 
     return payload
@@ -412,6 +426,8 @@ def _cluster_health_section() -> dict:
             **store_sums,
             "entries": live_store["entries"],
             "bytes": live_store["bytes"],
+            "budget_bytes": live_store.get("budget_bytes", 0),
+            "over_budget": live_store.get("over_budget", False),
         }
 
     # Tracked tile counts: hot_tiles is summed and can double-count a tile
@@ -451,10 +467,18 @@ def _cluster_health_section() -> dict:
         "present_ns_total": 0,
         "present_count": 0,
     }
+    stage_sums = {
+        name: {"ns_total": 0, "count": 0}
+        for name in RENDER_STAGE_NAMES
+    }
     for pulse in pulses:
         lat = pulse.get("tile_latency") or {}
         for key in lat_sums:
             lat_sums[key] += lat.get(key, 0)
+        for name, stage_sum in stage_sums.items():
+            stage = (lat.get("stages") or {}).get(name) or {}
+            stage_sum["ns_total"] += stage.get("ns_total", 0)
+            stage_sum["count"] += stage.get("count", 0)
     tile_latency_block = {
         "avg_request_ms": _avg_ms(
             lat_sums["request_ns_total"], lat_sums["request_count"],
@@ -465,6 +489,13 @@ def _cluster_health_section() -> dict:
         "avg_present_ms": _avg_ms(
             lat_sums["present_ns_total"], lat_sums["present_count"],
         ),
+        "stages": {
+            name: {
+                "avg_ms": _avg_ms(stage["ns_total"], stage["count"]),
+                "count": stage["count"],
+            }
+            for name, stage in stage_sums.items()
+        },
     }
 
     return {
@@ -1504,35 +1535,41 @@ async def _motion_geometry(
     if geometry is not None:
         return geometry
 
-    frame = await frame_store.get_frame(timestamp)
-    nowcast_blend = None
-    if frame is None and nowcast_store is not None:
-        frame, nowcast_blend = await nowcast_store.get_frame(timestamp)
-    if frame is None and nowcast_store is not None:
-        animation_frame = await nowcast_store.get_animation_frame(timestamp)
-        if animation_frame is not None:
-            frame = animation_frame
-            if animation_frame.period == "forecast":
-                nowcast_blend = animation_frame.blend_weight
-    if frame is None:
-        raise HTTPException(status_code=404, detail="Frame not found")
+    async def _compute_once():
+        frame = await frame_store.get_frame(timestamp)
+        nowcast_blend = None
+        if frame is None and nowcast_store is not None:
+            frame, nowcast_blend = await nowcast_store.get_frame(timestamp)
+        if frame is None and nowcast_store is not None:
+            animation_frame = await nowcast_store.get_animation_frame(timestamp)
+            if animation_frame is not None:
+                frame = animation_frame
+                if animation_frame.period == "forecast":
+                    nowcast_blend = animation_frame.blend_weight
+        if frame is None:
+            raise HTTPException(status_code=404, detail="Frame not found")
 
-    geometry = await asyncio.to_thread(
-        compute_tile_geometry,
-        frame_regions=frame.regions,
-        z=z,
-        x=x,
-        y=y,
-        tile_size=tile_size,
-        smooth=True,
-        snow=True,
-        nwp_chain=nwp_chain,
-        enabled_regions=enabled_regions,
-        frame_timestamp=timestamp,
-        nowcast_blend=nowcast_blend,
-        precip_mask=precip_mask,
+        computed = await asyncio.to_thread(
+            compute_tile_geometry,
+            frame_regions=frame.regions,
+            z=z,
+            x=x,
+            y=y,
+            tile_size=tile_size,
+            smooth=True,
+            snow=True,
+            nwp_chain=nwp_chain,
+            enabled_regions=enabled_regions,
+            frame_timestamp=timestamp,
+            nowcast_blend=nowcast_blend,
+            precip_mask=precip_mask,
+        )
+        tile_cache.put(geom_key, computed)
+        return computed
+
+    geometry, _leader = await _singleflight(
+        _geometry_flights, geom_key, _compute_once,
     )
-    tile_cache.put(geom_key, geometry)
     return geometry
 
 
@@ -1704,6 +1741,7 @@ async def radar_tile(
     need_frame = geom is None or bool(arrow_style) or bool(cell_style)
     compute_ns = None
     present_ns = None
+    stage_timings: dict[str, int] = {}
     if not present_cache_hit:
         # Shared-store lookup: plain past-frame tiles only.  A hit here still
         # counts as a geometry miss in ``record_request`` above (accepted -
@@ -1781,22 +1819,34 @@ async def radar_tile(
                     if tile_request_tracker is not None and geom.fast_path is not None:
                         tile_request_tracker.record_fast_path(geom.fast_path)
                 else:
-                    compute_start = time.perf_counter_ns()
-                    geom = await asyncio.to_thread(
-                        compute_tile_geometry,
-                        frame_regions=frame.regions,
-                        z=z, x=xi, y=yi,
-                        tile_size=tile_size,
-                        smooth=smooth,
-                        snow=snow,
-                        nwp_chain=nwp_chain,
-                        enabled_regions=enabled_regions,
-                        frame_timestamp=timestamp,
-                        nowcast_blend=nowcast_blend,
-                        precip_mask=precip_mask,
+                    async def _compute_once():
+                        local_timings: dict[str, int] = {}
+                        compute_start = time.perf_counter_ns()
+                        computed = await asyncio.to_thread(
+                            compute_tile_geometry,
+                            frame_regions=frame.regions,
+                            z=z, x=xi, y=yi,
+                            tile_size=tile_size,
+                            smooth=smooth,
+                            snow=snow,
+                            nwp_chain=nwp_chain,
+                            enabled_regions=enabled_regions,
+                            frame_timestamp=timestamp,
+                            nowcast_blend=nowcast_blend,
+                            precip_mask=precip_mask,
+                            stage_timings=local_timings,
+                        )
+                        elapsed_ns = time.perf_counter_ns() - compute_start
+                        tile_cache.put(geom_key, computed)
+                        return computed, elapsed_ns, local_timings
+
+                    result, flight_leader = await _singleflight(
+                        _geometry_flights, geom_key, _compute_once,
                     )
-                    compute_ns = time.perf_counter_ns() - compute_start
-                    tile_cache.put(geom_key, geom)
+                    geom, flight_compute_ns, flight_timings = result
+                    if flight_leader:
+                        compute_ns = flight_compute_ns
+                        stage_timings.update(flight_timings)
                     # Only fire on the cold-compute path: a fast-path label here means
                     # this request actually paid for the empty-tile work (cache hits
                     # of a previously-computed transparent geometry are already counted
@@ -1882,6 +1932,7 @@ async def radar_tile(
                             cell_style=eff_cells,
                             cells_by_region=cells_by_region,
                             cell_counts=cell_counts,
+                            stage_timings=stage_timings,
                         )
                         present_ns = time.perf_counter_ns() - present_start
                         tile_cache.put(present_key, CachedRender(data=tile_bytes, etag=etag))
@@ -1971,6 +2022,7 @@ async def radar_tile(
                             cell_style=eff_cells,
                             cells_by_region=cells_by_region,
                             cell_counts=cell_counts,
+                            stage_timings=stage_timings,
                         )
                         present_ns = time.perf_counter_ns() - present_start
                         tile_cache.put(overlay_key, CachedRender(data=tile_bytes, etag=etag))
@@ -2032,6 +2084,7 @@ async def radar_tile(
     if tile_request_tracker is not None:
         tile_request_tracker.record_latency(
             time.perf_counter_ns() - t0, compute_ns, present_ns,
+            stages_ns=stage_timings,
         )
 
     return conditional_response(

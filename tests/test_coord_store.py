@@ -61,6 +61,19 @@ def test_roundtrip_int32_and_float32_stacked(tmp_path):
         assert not out.flags.writeable
 
 
+def test_roundtrip_tuple_avoids_stacked_input(tmp_path):
+    """Publish accepts two arrays without allocating an intermediate stack."""
+    store = _store(tmp_path)
+    data = _data(tile_size=16)
+    assert store.publish(
+        KIND_INDICES, "USCOMP", 3, 2, 1, 16, 0, (data[0], data[1]),
+    ) is True
+    out = store.open(
+        KIND_INDICES, "USCOMP", 3, 2, 1, 16, 0, data.shape, data.dtype,
+    )
+    np.testing.assert_array_equal(out, data)
+
+
 def test_open_miss_returns_none(tmp_path):
     """Missing entry -> None, and nothing is created on disk."""
     store = _store(tmp_path)
@@ -230,6 +243,30 @@ def test_prune_noop_when_within_budget(tmp_path):
     assert store.prune(1 << 40) == (0, 0)
     path = store.entry_path(KIND_INDICES, "USCOMP", 3, 2, 1, 16, 0)
     assert path.exists()
+
+
+def test_publish_enforces_hard_byte_budget(tmp_path):
+    """Every completed publish keeps the .npy store at or below budget."""
+    data = _data(tile_size=16)
+    probe = _store(tmp_path)
+    assert probe.publish(KIND_INDICES, "USCOMP", 3, 2, 1, 16, 0, data)
+    entry_bytes = next(probe.root.rglob("*.npy")).stat().st_size
+
+    capped_path = tmp_path / "capped"
+    store = CoordStore(capped_path, _ENABLED, entry_bytes + 4096)
+    assert store.publish(KIND_INDICES, "USCOMP", 3, 2, 1, 16, 0, data)
+    assert store.publish(KIND_INDICES, "USCOMP", 3, 2, 2, 16, 0, data)
+    stats = store.stats()
+    assert stats["entries"] == 1
+    assert stats["bytes"] <= stats["budget_bytes"]
+    assert stats["over_budget"] is False
+
+
+def test_publish_skips_entry_larger_than_budget(tmp_path):
+    data = _data(tile_size=16)
+    store = CoordStore(tmp_path, _ENABLED, data.nbytes)
+    assert store.publish(KIND_INDICES, "USCOMP", 3, 2, 1, 16, 0, data) is False
+    assert list(store.root.rglob("*.npy")) == []
 
 
 def test_stats_counters(tmp_path):

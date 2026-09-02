@@ -424,6 +424,61 @@ def sample_radar_bilinear(
     )
 
 
+def blend_radar_nowcast(
+    radar: np.ndarray,
+    model: np.ndarray,
+    model_raw: np.ndarray,
+    feather: np.ndarray,
+    blend_weight: float,
+    pixel_threshold: int | None,
+    *,
+    implementation: Implementation | None = None,
+) -> np.ndarray:
+    """Blend radar/model fields in one allocation-free native pixel kernel."""
+
+    radar = np.asarray(radar)
+    model = np.asarray(model)
+    model_raw = np.asarray(model_raw)
+    feather = np.asarray(feather)
+    shape = radar.shape
+    expected = (
+        ("radar", radar, np.dtype(np.uint8)),
+        ("model", model, np.dtype(np.float32)),
+        ("model_raw", model_raw, np.dtype(np.uint8)),
+        ("feather", feather, np.dtype(np.float32)),
+    )
+    for name, array, dtype in expected:
+        if array.ndim != 2 or array.shape != shape or array.dtype != dtype:
+            raise TypeError(f"{name} must be a {dtype} array matching radar")
+        if not array.flags.c_contiguous:
+            raise ValueError(f"{name} must be C-contiguous")
+    if not np.isfinite(blend_weight) or not 0.0 <= blend_weight <= 1.0:
+        raise ValueError("blend_weight must be finite and within [0, 1]")
+    if pixel_threshold is not None and not 0 <= pixel_threshold <= 255:
+        raise ValueError("pixel_threshold must be within [0, 255]")
+
+    if active_implementation(implementation) == "rust":
+        return _native.blend_radar_nowcast_u8(
+            radar, model, model_raw, feather, blend_weight, pixel_threshold,
+        )
+
+    adjusted_model = model
+    if blend_weight > 0 and pixel_threshold is not None:
+        dry_model = model < pixel_threshold
+        live_radar = radar >= pixel_threshold
+        adjusted_model = np.where(
+            dry_model & live_radar, pixel_threshold, model,
+        )
+    effective_weight = blend_weight * feather
+    blended = (
+        effective_weight * radar.astype(np.float32)
+        + (1.0 - effective_weight) * adjusted_model
+    )
+    result = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
+    result[(radar == 0) & (model_raw == 0)] = 0
+    return result
+
+
 def colorize_radar(
     values: np.ndarray,
     rain_lut: np.ndarray,

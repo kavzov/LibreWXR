@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Joshua Kimsey
 import io
 import math
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -26,6 +27,7 @@ from librewxr.tiles.coordinates import (
 )
 from librewxr.tiles.png_palette import encode_png
 from librewxr.native_weather import (
+    blend_radar_nowcast,
     colorize_radar,
     encode_radar_png,
     sample_radar_bilinear,
@@ -33,6 +35,17 @@ from librewxr.native_weather import (
 
 if TYPE_CHECKING:
     from librewxr.data.precip_mask import PrecipMaskStore
+
+
+def _stage_start(timings: dict[str, int] | None) -> int:
+    return time.perf_counter_ns() if timings is not None else 0
+
+
+def _stage_finish(
+    timings: dict[str, int] | None, name: str, started_ns: int,
+) -> None:
+    if timings is not None:
+        timings[name] = timings.get(name, 0) + time.perf_counter_ns() - started_ns
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +171,7 @@ def compute_tile_geometry(
     frame_timestamp: int | None = None,
     nowcast_blend: float | None = None,
     precip_mask=None,  # PrecipMaskStore | None — multi-mode only
+    stage_timings: dict[str, int] | None = None,
 ) -> TileGeometry:
     """Compute the cacheable geometry for a tile.
 
@@ -167,6 +181,7 @@ def compute_tile_geometry(
     color schemes / output formats / arrow styles can be rendered from
     via ``present_tile``.
     """
+    stage_started = _stage_start(stage_timings)
     regions = overlapping_regions(z, x, y, enabled_regions)
     regions_with_data = [r for r in regions if r.name in frame_regions]
 
@@ -176,13 +191,14 @@ def compute_tile_geometry(
         frame_regions, z, x, y, enabled_regions, nwp_chain, precip_mask,
         frame_timestamp, nowcast_blend,
     )
+    _stage_finish(stage_timings, "coordinates", stage_started)
     if label is not None:
         return TileGeometry.transparent(tile_size, fast_path=label)
 
     if not regions_with_data:
         return _compute_nwp_only_geometry(
             nwp_chain, z, x, y, tile_size, smooth, snow, frame_timestamp,
-            precip_mask,
+            precip_mask, stage_timings,
         )
 
     # Determine blur radius from local geometry: scale Gaussian kernel
@@ -190,9 +206,11 @@ def compute_tile_geometry(
     # Uses the highest-priority (finest) region's Jacobian so that mixed
     # coarse + fine tiles size their blur to the resolution that's
     # actually visible at the center.
+    stage_started = _stage_start(stage_timings)
     blur_radius = compute_blur_radius(
         regions_with_data[0], z, x, y, tile_size,
     ) if smooth else 0.0
+    _stage_finish(stage_timings, "coordinates", stage_started)
 
     use_blur = blur_radius >= 0.5
     pad = int(blur_radius * 3) if use_blur else 0
@@ -202,12 +220,12 @@ def compute_tile_geometry(
         region = regions_with_data[0]
         values = _sample_region(
             frame_regions[region.name], region, z, x, y, tile_size,
-            smooth, use_blur, pad,
+            smooth, use_blur, pad, stage_timings,
         )
     else:
         values = _composite_regions(
             frame_regions, regions_with_data, z, x, y, tile_size,
-            smooth, use_blur, pad,
+            smooth, use_blur, pad, stage_timings,
         )
 
     # Compute the noise-floor threshold ONCE here for the radar-empty
@@ -234,6 +252,7 @@ def compute_tile_geometry(
     # (blocking NWP fill, leaving a hole) and its feather (suppressing
     # the model over its footprint) (issue #24).
     if has_nwp:
+        stage_started = _stage_start(stage_timings)
         if nowcast_blend is not None:
             values = _blend_nowcast(
                 values, regions_with_data, z, x, y, tile_size, pad, nwp_chain,
@@ -244,6 +263,7 @@ def compute_tile_geometry(
                 values, regions_with_data, z, x, y, tile_size, pad, nwp_chain,
                 frame_timestamp, smooth,
             )
+        _stage_finish(stage_timings, "nwp_blend", stage_started)
 
     if settings.noise_floor_dbz > -32:
         pixel_threshold = int((settings.noise_floor_dbz + 32) * 2)
@@ -269,11 +289,13 @@ def compute_tile_geometry(
 
     snow_mask = None
     if snow and nwp_chain is not None:
+        stage_started = _stage_start(stage_timings)
         if pad > 0:
             lat_grid, lon_grid = tile_pixel_latlons_padded(z, x, y, tile_size, pad)
         else:
             lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
         snow_mask = nwp_chain.get_snow_mask(lat_grid, lon_grid, frame_timestamp)
+        _stage_finish(stage_timings, "snow", stage_started)
 
     return TileGeometry(
         values=values,
@@ -292,6 +314,7 @@ def _compute_nwp_only_geometry(
     snow: bool,
     frame_timestamp: int | None,
     precip_mask=None,  # PrecipMaskStore | None — multi-mode only
+    stage_timings: dict[str, int] | None = None,
 ) -> TileGeometry:
     """Geometry for a tile entirely from NWP (no radar regions overlap)."""
     # Tier 2: skip the full-grid NWP sample entirely when the global
@@ -303,10 +326,14 @@ def _compute_nwp_only_geometry(
     ):
         return TileGeometry.transparent(tile_size, fast_path="tier2_mask_nwp_only")
 
+    stage_started = _stage_start(stage_timings)
     lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
+    _stage_finish(stage_timings, "coordinates", stage_started)
+    stage_started = _stage_start(stage_timings)
     values = nwp_chain.sample(
         lat_grid, lon_grid, frame_timestamp, bilinear=smooth,
     )
+    _stage_finish(stage_timings, "sampling", stage_started)
 
     if settings.noise_floor_dbz > -32:
         pixel_threshold = int((settings.noise_floor_dbz + 32) * 2)
@@ -321,7 +348,9 @@ def _compute_nwp_only_geometry(
 
     snow_mask = None
     if snow:
+        stage_started = _stage_start(stage_timings)
         snow_mask = nwp_chain.get_snow_mask(lat_grid, lon_grid, frame_timestamp)
+        _stage_finish(stage_timings, "snow", stage_started)
 
     return TileGeometry(
         values=values,
@@ -356,6 +385,7 @@ def present_tile(
     cell_style: str = "",
     cells_by_region: dict[str, np.ndarray] | None = None,
     cell_counts: dict[str, int] | None = None,
+    stage_timings: dict[str, int] | None = None,
 ) -> bytes:
     """Render a cached ``TileGeometry`` to encoded bytes.
 
@@ -382,6 +412,7 @@ def present_tile(
             1, int(math.ceil((display_min_dbz + 32.0) * 2.0))
         )
 
+    stage_started = _stage_start(stage_timings)
     rgba = colorize_radar(
         geom.values,
         get_lut(color_scheme, snow=False),
@@ -392,10 +423,12 @@ def present_tile(
         snow_mask=geom.snow_mask,
         display_threshold=display_threshold,
     )
+    _stage_finish(stage_timings, "colorize", stage_started)
 
     img = Image.fromarray(rgba, "RGBA")
 
     if geom.blur_radius >= 0.5:
+        stage_started = _stage_start(stage_timings)
         r, g, b, a = img.split()
         rgb = Image.merge("RGB", (r, g, b))
         rgb = rgb.filter(ImageFilter.GaussianBlur(radius=geom.blur_radius))
@@ -407,6 +440,7 @@ def present_tile(
             img = img.crop(
                 (geom.pad, geom.pad, geom.pad + geom.tile_size, geom.pad + geom.tile_size)
             )
+        _stage_finish(stage_timings, "blur", stage_started)
 
     if arrow_style and (flow_regions or nwp_flow is not None):
         regions = overlapping_regions(z, x, y, enabled_regions)
@@ -445,7 +479,10 @@ def present_tile(
             z, x, y, geom.tile_size, cell_style,
         )
 
-    return _encode_image(img, fmt)
+    stage_started = _stage_start(stage_timings)
+    encoded = _encode_image(img, fmt)
+    _stage_finish(stage_timings, "encode", stage_started)
+    return encoded
 
 
 # ---------------------------------------------------------------------------
@@ -544,28 +581,41 @@ def _sample_region(
     smooth: bool,
     use_blur: bool,
     pad: int,
+    stage_timings: dict[str, int] | None = None,
 ) -> np.ndarray:
     """Sample pixel values from a single region."""
     if pad > 0:
+        stage_started = _stage_start(stage_timings)
         row_idx, col_idx = region_pixel_indices_padded(
             region, z, x, y, tile_size, pad
         )
+        _stage_finish(stage_timings, "coordinates", stage_started)
         if smooth:
             values = _bilinear_sample(
                 frame_data, region, z, x, y, tile_size, pad=pad,
+                stage_timings=stage_timings,
             )
             oob = (row_idx == -1) | (col_idx == -1)
             values[oob] = 0
         else:
+            stage_started = _stage_start(stage_timings)
             values = _gather_clipped(frame_data, row_idx, col_idx)
+            _stage_finish(stage_timings, "sampling", stage_started)
     else:
+        stage_started = _stage_start(stage_timings)
         row_idx, col_idx = region_pixel_indices(region, z, x, y, tile_size)
+        _stage_finish(stage_timings, "coordinates", stage_started)
         if smooth:
-            values = _bilinear_sample(frame_data, region, z, x, y, tile_size)
+            values = _bilinear_sample(
+                frame_data, region, z, x, y, tile_size,
+                stage_timings=stage_timings,
+            )
             oob = (row_idx == -1) | (col_idx == -1)
             values[oob] = 0
         else:
+            stage_started = _stage_start(stage_timings)
             values = _gather_clipped(frame_data, row_idx, col_idx)
+            _stage_finish(stage_timings, "sampling", stage_started)
     return values
 
 
@@ -577,6 +627,7 @@ def _composite_regions(
     smooth: bool,
     use_blur: bool,
     pad: int,
+    stage_timings: dict[str, int] | None = None,
 ) -> np.ndarray:
     """Composite values from multiple overlapping regions.
 
@@ -595,32 +646,39 @@ def _composite_regions(
 
     # Tile lat/lon grid for coverage-mask lookups (matches the output
     # buffer, including padding when smoothing is enabled).
+    stage_started = _stage_start(stage_timings)
     if pad > 0:
         tile_lats, tile_lons = tile_pixel_latlons_padded(
             z, x, y, tile_size, pad
         )
     else:
         tile_lats, tile_lons = tile_pixel_latlons(z, x, y, tile_size)
+    _stage_finish(stage_timings, "coordinates", stage_started)
 
     for region in regions:
         data = frame_regions.get(region.name)
         if data is None:
             continue
 
+        stage_started = _stage_start(stage_timings)
         if pad > 0:
             row_idx, col_idx = region_pixel_indices_padded(
                 region, z, x, y, tile_size, pad
             )
         else:
             row_idx, col_idx = region_pixel_indices(region, z, x, y, tile_size)
+        _stage_finish(stage_timings, "coordinates", stage_started)
 
         if smooth:
             region_values = _bilinear_sample(
                 data, region, z, x, y, tile_size, pad=pad,
+                stage_timings=stage_timings,
             )
+            stage_started = _stage_start(stage_timings)
             oob = (row_idx == -1) | (col_idx == -1)
             region_values[oob] = 0
         else:
+            stage_started = _stage_start(stage_timings)
             region_values = _gather_clipped(data, row_idx, col_idx)
 
         # Fill: only where no higher-priority region has claimed the
@@ -634,6 +692,7 @@ def _composite_regions(
             region.name, tile_lats, tile_lons
         )
         claimed |= region_coverage
+        _stage_finish(stage_timings, "sampling", stage_started)
 
     return values
 
@@ -791,9 +850,6 @@ def _blend_nowcast(
     for region in regions_with_data:
         feather = np.maximum(feather, sample_feather(region.name, lat_grid, lon_grid))
 
-    # Per-pixel effective radar weight
-    effective_w = blend_weight * feather
-
     # Pixels where the model is dry must not drag real radar echoes
     # below the display noise floor.  Model pixel value 0 encodes
     # -32 dBZ — the bottom of the scale, NOT "no data" — so blending
@@ -814,38 +870,40 @@ def _blend_nowcast(
     # Skipped when ``blend_weight == 0`` — "model" blend mode (or steps
     # past the blend window) intends pure model output — and when the
     # noise floor is disabled there is nothing to fade toward.
+    pixel_threshold = None
     if blend_weight > 0 and settings.noise_floor_dbz > -32:
         pixel_threshold = int((settings.noise_floor_dbz + 32) * 2)
-        dry_model = model_f < pixel_threshold
-        live_radar = radar_values >= pixel_threshold
-        model_f = np.where(dry_model & live_radar, pixel_threshold, model_f)
 
-    # Blend: extrapolated radar × weight + model × (1 − weight)
-    radar_f = radar_values.astype(np.float32)
-    blended = effective_w * radar_f + (1.0 - effective_w) * model_f
-
-    # Don't hallucinate precipitation where neither source has any
-    both_zero = (radar_values == 0) & (model_values == 0)
-    result = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
-    result[both_zero] = 0
-
-    return result
+    return blend_radar_nowcast(
+        radar_values,
+        np.ascontiguousarray(model_f),
+        model_values,
+        feather,
+        blend_weight,
+        pixel_threshold,
+    )
 
 
 def _bilinear_sample(
     frame_data: np.ndarray, region: RegionDef,
     z: int, x: int, y: int, tile_size: int,
     pad: int = 0,
+    stage_timings: dict[str, int] | None = None,
 ) -> np.ndarray:
     """Sample frame data using bilinear interpolation for smooth rendering."""
+    stage_started = _stage_start(stage_timings)
     if pad > 0:
         row_f, col_f = region_pixel_indices_fractional_padded(
             region, z, x, y, tile_size, pad
         )
     else:
         row_f, col_f = region_pixel_indices_fractional(region, z, x, y, tile_size)
+    _stage_finish(stage_timings, "coordinates", stage_started)
 
-    return sample_radar_bilinear(frame_data, row_f, col_f)
+    stage_started = _stage_start(stage_timings)
+    result = sample_radar_bilinear(frame_data, row_f, col_f)
+    _stage_finish(stage_timings, "sampling", stage_started)
+    return result
 
 
 def _sample_flow_at(

@@ -431,9 +431,10 @@ class TestCoordStoreBacked:
         np.testing.assert_array_equal(col, exp_col)
         assert coord._STORE is None
 
-    def test_prune_returns_counts_and_shrinks(self, coord_store_env, monkeypatch):
-        """Prune helper returns (removed_bytes, removed_entries) and brings
-        the on-disk store back under the MiB budget."""
+    def test_publish_enforces_budget_and_periodic_prune_reconciles(
+        self, coord_store_env, monkeypatch,
+    ):
+        """Publishes stay under budget; the periodic prune is then a no-op."""
         monkeypatch.setattr(settings, "coord_store_mb", 1)
         region = REGIONS[self._REGION]
         ts = 64
@@ -443,13 +444,12 @@ class TestCoordStoreBacked:
             self._six_calls(region, z, x, y, ts)
 
         assert coord._STORE is not None
-        assert coord._STORE.stats()["bytes"] > 1024 * 1024
+        stats = coord._STORE.stats()
+        assert 0 < stats["bytes"] <= 1024 * 1024
+        assert stats["over_budget"] is False
 
         result = coord.prune_shared_coord_store()
-        assert result is not None
-        removed_bytes, removed_entries = result
-        assert removed_entries > 0
-        assert removed_bytes > 0
+        assert result == (0, 0)
         assert coord._STORE.stats()["bytes"] <= 1024 * 1024
 
     def test_prune_disabled_returns_none(self, coord_store_env, monkeypatch):

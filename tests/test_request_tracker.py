@@ -128,3 +128,37 @@ class TestTileRequestTracker:
         # Additive keys also present.
         assert "fast_path" in stats
         assert "cache" in stats
+
+    def test_latency_tracks_render_stages(self):
+        tracker = TileRequestTracker()
+        tracker.record_latency(
+            10_000_000,
+            7_000_000,
+            3_000_000,
+            stages_ns={"coordinates": 2_000_000, "encode": 1_000_000},
+        )
+        tracker.record_latency(
+            5_000_000,
+            None,
+            None,
+            stages_ns={"coordinates": 4_000_000, "unknown": 99},
+        )
+
+        latency = tracker.stats()["latency"]
+        assert latency["avg_request_ms"] == pytest.approx(7.5)
+        assert latency["avg_compute_ms"] == pytest.approx(7.0)
+        assert latency["avg_present_ms"] == pytest.approx(3.0)
+        assert latency["stages"]["coordinates"] == {
+            "count": 2,
+            "avg_ms": pytest.approx(3.0),
+        }
+        assert latency["stages"]["encode"] == {
+            "count": 1,
+            "avg_ms": pytest.approx(1.0),
+        }
+
+        snapshot = tracker.latency_snapshot()
+        assert snapshot["stages"]["coordinates"] == {
+            "ns_total": 6_000_000,
+            "count": 2,
+        }

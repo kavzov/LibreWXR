@@ -668,6 +668,7 @@ class TestHealthCluster:
         if coord["store"] is not None:
             assert set(coord["store"]) == {
                 "hits", "misses", "publishes", "entries", "bytes",
+                "budget_bytes", "over_budget",
             }
 
         requests = cluster["requests"]
@@ -717,6 +718,8 @@ class TestHealthCluster:
                 "store": {
                     "hits": 0, "misses": 0, "publishes": 0,
                     "entries": 9, "bytes": 9 * 1024 * 1024,
+                    "budget_bytes": 16 * 1024 * 1024,
+                    "over_budget": False,
                 },
             },
         )
@@ -778,6 +781,8 @@ class TestHealthCluster:
             assert store["publishes"] == 3
             assert store["entries"] == 9
             assert store["bytes"] == 9 * 1024 * 1024
+            assert store["budget_bytes"] == 16 * 1024 * 1024
+            assert store["over_budget"] is False
 
             # Requests: synthetic worker's counters summed in.
             req = cluster["requests"]

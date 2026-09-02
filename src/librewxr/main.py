@@ -55,6 +55,7 @@ from librewxr.memory import (
     detect_memory_limit_mb,
 )
 from librewxr.logging_setup import setup_logging
+from librewxr.native_weather import ensure_native_render_available
 from librewxr.tiles.cache import TileCache
 from librewxr.tiles.coordinates import (
     ALL_CACHES,
@@ -603,7 +604,7 @@ async def _render_only_lifespan(app: FastAPI):
     )
 
     # 16 render workers x small tiles would oversubscribe the 48-thread host at OpenCV's default hardware-concurrency pool; in multi mode each worker only does per-tile blurs so 2 threads is ample.
-    cv2.setNumThreads(2)
+    cv2.setNumThreads(settings.opencv_threads)
     pool_size = settings.warmer_threads or max((os.cpu_count() or 4) - 1, 1)
     request_executor = ThreadPoolExecutor(max_workers=pool_size)
     # Separate present pool: the cheap ``present_tile`` tail (colorize,
@@ -611,10 +612,13 @@ async def _render_only_lifespan(app: FastAPI):
     # on the shared default executor during a cold-tile burst.  Half the
     # compute pool, floored at 2 - presents are short-lived, computes are
     # the bottleneck.
-    present_executor = ThreadPoolExecutor(max_workers=max(2, pool_size // 2))
+    present_pool_size = settings.present_threads or max(2, pool_size // 2)
+    present_executor = ThreadPoolExecutor(max_workers=present_pool_size)
     # Dedicated pool for shared-tile-store I/O + state-snapshot apply so
     # they never queue behind geometry computes on the default executor.
-    io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='tile-io')
+    io_executor = ThreadPoolExecutor(
+        max_workers=settings.io_threads, thread_name_prefix="tile-io",
+    )
     asyncio.get_running_loop().set_default_executor(request_executor)
     routes.present_executor = present_executor
     routes.io_executor = io_executor
@@ -855,6 +859,9 @@ async def _render_only_lifespan(app: FastAPI):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail at process startup, before accepting traffic, when production
+    # explicitly requires the native radar/weather hot path.
+    ensure_native_render_available()
     if settings.render_only:
         async with _render_only_lifespan(app):
             yield

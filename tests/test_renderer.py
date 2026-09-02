@@ -125,6 +125,23 @@ class TestTileGeometryCache:
         assert geom.blur_radius == 0.0
         assert geom.pad == 0
 
+    def test_compute_and_present_report_stage_timings(self, sample_frame_data):
+        timings = {}
+        geom = compute_tile_geometry(
+            {"USCOMP": sample_frame_data},
+            z=5,
+            x=7,
+            y=12,
+            tile_size=256,
+            smooth=True,
+            stage_timings=timings,
+        )
+        present_tile(
+            geom, color_scheme=2, fmt="png", stage_timings=timings,
+        )
+        assert timings.keys() >= {"coordinates", "sampling", "colorize", "encode"}
+        assert all(value > 0 for value in timings.values())
+
     def test_transparent_when_no_data(self):
         """Tiles with no radar AND no NWP return the transparent sentinel."""
         regions = {}  # no radar data

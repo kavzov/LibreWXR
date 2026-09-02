@@ -14,6 +14,16 @@ whether traffic is power-law (a few hot tiles) or diffuse.
 from collections import Counter
 from threading import Lock
 
+RENDER_STAGE_NAMES = (
+    "coordinates",
+    "sampling",
+    "nwp_blend",
+    "snow",
+    "colorize",
+    "blur",
+    "encode",
+)
+
 
 def _avg_ms(total_ns: int, count: int) -> float:
     """Mean latency in milliseconds from ns totals; 0.0 when empty."""
@@ -42,6 +52,8 @@ class TileRequestTracker:
         self._lat_compute_count = 0
         self._lat_present_ns_total = 0
         self._lat_present_count = 0
+        self._stage_ns_total = {name: 0 for name in RENDER_STAGE_NAMES}
+        self._stage_count = {name: 0 for name in RENDER_STAGE_NAMES}
         self._lock = Lock()
 
     def record(self, z: int, x: int, y: int) -> None:
@@ -107,6 +119,7 @@ class TileRequestTracker:
         request_ns: int,
         compute_ns: int | None,
         present_ns: int | None,
+        stages_ns: dict[str, int] | None = None,
     ) -> None:
         """Accumulate request/compute/present latency in nanoseconds.
 
@@ -123,6 +136,11 @@ class TileRequestTracker:
             if present_ns is not None:
                 self._lat_present_ns_total += present_ns
                 self._lat_present_count += 1
+            for name, elapsed_ns in (stages_ns or {}).items():
+                if name not in self._stage_ns_total or elapsed_ns < 0:
+                    continue
+                self._stage_ns_total[name] += elapsed_ns
+                self._stage_count[name] += 1
 
     def latency_snapshot(self) -> dict:
         """Read-only snapshot of the latency accumulators (under lock)."""
@@ -134,6 +152,13 @@ class TileRequestTracker:
                 "compute_count": self._lat_compute_count,
                 "present_ns_total": self._lat_present_ns_total,
                 "present_count": self._lat_present_count,
+                "stages": {
+                    name: {
+                        "ns_total": self._stage_ns_total[name],
+                        "count": self._stage_count[name],
+                    }
+                    for name in RENDER_STAGE_NAMES
+                },
             }
 
     def stats(self, top_n: int = 10, hot_threshold: int = 5) -> dict:
@@ -172,6 +197,15 @@ class TileRequestTracker:
                 "avg_present_ms": _avg_ms(
                     self._lat_present_ns_total, self._lat_present_count,
                 ),
+                "stages": {
+                    name: {
+                        "count": self._stage_count[name],
+                        "avg_ms": _avg_ms(
+                            self._stage_ns_total[name], self._stage_count[name],
+                        ),
+                    }
+                    for name in RENDER_STAGE_NAMES
+                },
             }
         return {
             "min_zoom": self._min_zoom,
