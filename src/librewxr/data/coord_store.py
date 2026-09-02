@@ -67,6 +67,7 @@ _PRUNE_TARGET_FRACTION = 0.9
 _STATS_TTL_SECONDS = 60.0
 _LOCK_NAME = ".budget.lock"
 _USAGE_NAME = ".usage"
+_RESERVATION_DIRNAME = ".reservations"
 
 # RegionDef fields the projection math in tiles/coordinates.py reads.
 # Signature over-inclusion is harmless (it only busts the cache more often);
@@ -147,7 +148,7 @@ class CoordStore:
         try:
             return max(0, int(self._usage_path().read_text()))
         except (OSError, ValueError):
-            total = sum(size for _path, size, _mtime in self._scan_entries())
+            total = self._reconciled_usage_locked()
             self._write_usage_locked(total)
             return total
 
@@ -179,7 +180,36 @@ class CoordStore:
             removed_entries += 1
         return removed_bytes, removed_entries
 
-    def _prune_entries_locked(self, target_bytes: int) -> tuple[int, int, int]:
+    def _reservation_path(self, entry_path: Path) -> Path:
+        return self.root / _RESERVATION_DIRNAME / f"{entry_path.stem}.reserve"
+
+    def _reservation_bytes_locked(self, *, clean_stale: bool = False) -> int:
+        total = 0
+        now = time.time()
+        root = self.root / _RESERVATION_DIRNAME
+        if not root.is_dir():
+            return 0
+        for path in root.glob("*.reserve"):
+            try:
+                stat = path.stat()
+                if clean_stale and now - stat.st_mtime > _TMP_TTL_SECONDS:
+                    path.unlink()
+                    continue
+                total += max(0, int(path.read_text()))
+            except (OSError, ValueError):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        return total
+
+    def _reconciled_usage_locked(self) -> int:
+        entries = sum(size for _path, size, _mtime in self._scan_entries())
+        return entries + self._reservation_bytes_locked(clean_stale=True)
+
+    def _prune_entries_locked(
+        self, target_bytes: int, reserved_bytes: int = 0,
+    ) -> tuple[int, int, int]:
         """Prune oldest .npy entries and return removed bytes/count/remaining."""
         entries = self._scan_entries()
         total = sum(size for _path, size, _mtime in entries)
@@ -187,7 +217,7 @@ class CoordStore:
         removed_entries = 0
         entries.sort(key=lambda entry: entry[2])
         for path, size, _mtime in entries:
-            if total <= target_bytes:
+            if total + reserved_bytes <= target_bytes:
                 break
             try:
                 path.unlink()
@@ -196,8 +226,9 @@ class CoordStore:
             total -= size
             removed_bytes += size
             removed_entries += 1
-        self._write_usage_locked(total)
-        return removed_bytes, removed_entries, total
+        remaining = total + reserved_bytes
+        self._write_usage_locked(remaining)
+        return removed_bytes, removed_entries, remaining
 
     @property
     def root(self) -> Path:
@@ -357,14 +388,18 @@ class CoordStore:
         # depending on NumPy's private header-size implementation.
         projected_bytes = data_bytes + 4096
         path = self.entry_path(kind, region, z, x, y, tile_size, pad)
+        reservation = self._reservation_path(path)
         tmp: Path | None = None
         try:
-            with self._budget_lock():
-                if path.exists():
-                    return False
-                self._remove_orphan_tmps_locked()
-                usage = self._read_usage_locked()
-                if self._budget_bytes:
+            if self._budget_bytes:
+                with self._budget_lock():
+                    if path.exists() or reservation.exists():
+                        return False
+                    self._remove_orphan_tmps_locked(stale_only=True)
+                    reserved_bytes = self._reservation_bytes_locked(
+                        clean_stale=True,
+                    )
+                    usage = self._read_usage_locked()
                     if projected_bytes > self._budget_bytes:
                         logger.warning(
                             "coord_store: entry %s (%d bytes) exceeds %d-byte budget",
@@ -378,36 +413,62 @@ class CoordStore:
                     )
                     if usage + projected_bytes > self._budget_bytes:
                         _removed_b, _removed_n, usage = self._prune_entries_locked(
-                            target,
+                            target, reserved_bytes,
                         )
-                    # Reserve the conservative on-disk size before the file
-                    # becomes visible. A crash can only leave an over-count,
-                    # never an unaccounted entry that permits overshoot.
+                    reservation.parent.mkdir(parents=True, exist_ok=True)
+                    reservation.write_text(str(projected_bytes))
                     self._write_usage_locked(usage + projected_bytes)
+            elif path.exists():
+                return False
 
-                path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = path.with_name(
-                    f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-                )
-                mm = np.lib.format.open_memmap(
-                    tmp, mode="w+", dtype=dtype, shape=shape,
-                )
-                try:
-                    if parts is None:
-                        mm[:] = data
-                    else:
-                        for index, part in enumerate(parts):
-                            mm[index] = part
-                    mm.flush()
-                finally:
-                    del mm
-                actual_bytes = tmp.stat().st_size
-                if self._budget_bytes and usage + actual_bytes > self._budget_bytes:
+            # The expensive allocation/copy/flush is outside the capacity
+            # lock. Different cold coordinates can therefore publish in
+            # parallel while their conservative reservations keep the hard
+            # byte limit intact.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(
+                f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            mm = np.lib.format.open_memmap(
+                tmp, mode="w+", dtype=dtype, shape=shape,
+            )
+            try:
+                if parts is None:
+                    mm[:] = data
+                else:
+                    for index, part in enumerate(parts):
+                        mm[index] = part
+                mm.flush()
+            finally:
+                del mm
+            actual_bytes = tmp.stat().st_size
+
+            if self._budget_bytes:
+                with self._budget_lock():
+                    usage = self._read_usage_locked()
+                    if usage - projected_bytes + actual_bytes > self._budget_bytes:
+                        # Defensive only: projected_bytes includes a 4 KiB
+                        # header allowance, so normal .npy output cannot land
+                        # here.
+                        tmp.unlink(missing_ok=True)
+                        reservation.unlink(missing_ok=True)
+                        self._write_usage_locked(max(0, usage - projected_bytes))
+                        return False
+                    if path.exists():
+                        tmp.unlink(missing_ok=True)
+                        reservation.unlink(missing_ok=True)
+                        self._write_usage_locked(max(0, usage - projected_bytes))
+                        return False
+                    os.replace(tmp, path)
+                    reservation.unlink(missing_ok=True)
+                    self._write_usage_locked(
+                        max(0, usage - projected_bytes + actual_bytes),
+                    )
+            else:
+                if path.exists():
                     tmp.unlink(missing_ok=True)
-                    self._write_usage_locked(usage)
                     return False
                 os.replace(tmp, path)
-                self._write_usage_locked(usage + actual_bytes)
         except Exception:
             logger.warning("coord_store: failed to publish %s", path, exc_info=True)
             if tmp is not None:
@@ -418,8 +479,8 @@ class CoordStore:
             if self._budget_bytes:
                 try:
                     with self._budget_lock():
-                        entries = self._scan_entries()
-                        self._write_usage_locked(sum(item[1] for item in entries))
+                        reservation.unlink(missing_ok=True)
+                        self._write_usage_locked(self._reconciled_usage_locked())
                 except OSError:
                     pass
             return False
@@ -444,12 +505,13 @@ class CoordStore:
             removed_bytes, removed_entries = self._remove_orphan_tmps_locked(
                 stale_only=True,
             )
+            reserved_bytes = self._reservation_bytes_locked(clean_stale=True)
             entries = self._scan_entries()
-            total = sum(size for _path, size, _mtime in entries)
+            total = sum(size for _path, size, _mtime in entries) + reserved_bytes
             if total > budget_bytes:
                 target = int(budget_bytes * _PRUNE_TARGET_FRACTION)
                 pruned_bytes, pruned_entries, total = self._prune_entries_locked(
-                    target,
+                    target, reserved_bytes,
                 )
                 removed_bytes += pruned_bytes
                 removed_entries += pruned_entries

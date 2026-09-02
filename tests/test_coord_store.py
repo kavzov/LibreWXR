@@ -269,6 +269,26 @@ def test_publish_skips_entry_larger_than_budget(tmp_path):
     assert list(store.root.rglob("*.npy")) == []
 
 
+def test_concurrent_reserved_publishes_stay_within_budget(tmp_path):
+    """Parallel writers reserve capacity without serializing array flushes."""
+    data = _data(tile_size=64)
+    budget = data.nbytes * 4 + 16 * 1024
+    stores = [CoordStore(tmp_path, _ENABLED, budget) for _ in range(8)]
+
+    def _publish(index: int) -> bool:
+        return stores[index].publish(
+            KIND_INDICES, "USCOMP", 6, index, 10, 64, 0, data,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_publish, range(8)))
+
+    stats = stores[0].stats()
+    assert 0 < stats["entries"] <= 4
+    assert stats["bytes"] <= budget
+    assert list((stores[0].root / ".reservations").glob("*.reserve")) == []
+
+
 def test_stats_counters(tmp_path):
     """hits/misses/publishes tracked per instance; entries/bytes scanned."""
     store = _store(tmp_path)
