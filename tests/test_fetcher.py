@@ -132,6 +132,23 @@ class TestTileCache:
         assert cache.get((200, 4, 3, 5)) == b"c"
         assert cache.total_bytes == 1
 
+    def test_nwp_invalidation_keeps_timestamp_index_consistent(self):
+        cache = TileCache(max_mb=10)
+        old_key = (100, 4, 3, 5)
+        new_key = (100, 4, 3, 6)
+        cache.put(old_key, b"old")
+        cache.put(("weather", 100, 4, 3, 5), b"weather")
+        cache.put(("sat", 100, 4, 3, 5), b"satellite")
+
+        assert cache.invalidate_nwp_dependent() == 2
+        assert cache._by_ts == {}
+        assert cache.get(("sat", 100, 4, 3, 5)) == b"satellite"
+
+        cache.put(new_key, b"new")
+        cache.invalidate_timestamp(100)
+        assert cache.get(new_key) is None
+        assert cache.total_bytes == len(b"satellite")
+
     def test_evict_half(self):
         cache = TileCache(max_mb=10)
         cache.put((1,), b"aaa")

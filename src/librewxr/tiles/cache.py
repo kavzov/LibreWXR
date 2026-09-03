@@ -98,8 +98,9 @@ class TileCache:
             if keys is None:
                 return
             for k in keys:
-                self._total_bytes -= _size_of(self._cache[k])
-                del self._cache[k]
+                value = self._cache.pop(k, None)
+                if value is not None:
+                    self._total_bytes -= _size_of(value)
 
     def invalidate_nwp_dependent(self) -> int:
         """Remove radar/weather renders affected by an NWP publication.
@@ -118,6 +119,7 @@ class TileCache:
             for key in keys:
                 self._total_bytes -= _size_of(self._cache[key])
                 del self._cache[key]
+                self._unindex_ts(key)
             return len(keys)
 
     def clear(self) -> None:
