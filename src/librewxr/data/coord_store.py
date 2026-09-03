@@ -31,6 +31,8 @@ import logging
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from pathlib import Path
 from contextlib import contextmanager
 from collections.abc import Sequence
@@ -115,7 +117,11 @@ class CoordStore:
         self._hits = 0
         self._misses = 0
         self._publishes = 0
+        self._async_skipped = 0
         self._manifest_written = False
+        self._async_executor: ThreadPoolExecutor | None = None
+        self._async_pending: set[Path] = set()
+        self._async_lock = Lock()
         # Cached (entries, bytes) from a recursive on-disk scan; TTL below.
         self._scan: tuple[int, int] | None = None
         self._scan_cached_at: float | None = None
@@ -493,6 +499,60 @@ class CoordStore:
             self.write_manifest()
         return True
 
+    def publish_async(
+        self, kind: str, region: str | None, z: int, x: int, y: int,
+        tile_size: int, pad: int,
+        data: np.ndarray | Sequence[np.ndarray],
+        *, max_pending: int = 8,
+    ) -> bool:
+        """Schedule an atomic publish without delaying the render request.
+
+        At most ``max_pending`` distinct entries are retained by the single
+        writer thread in each process.  A full queue simply skips the shared
+        publish: the caller still owns the freshly computed arrays in its
+        in-process LRU, so correctness never depends on this optimisation.
+        Duplicate keys in the same process are coalesced here; inter-process
+        races still converge atomically in :meth:`publish`.
+        """
+        path = self.entry_path(kind, region, z, x, y, tile_size, pad)
+        with self._async_lock:
+            if path.exists() or path in self._async_pending:
+                return False
+            if len(self._async_pending) >= max(1, int(max_pending)):
+                self._async_skipped += 1
+                return False
+            if self._async_executor is None:
+                self._async_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="coord-store-writer",
+                )
+            self._async_pending.add(path)
+            executor = self._async_executor
+
+        def _write() -> None:
+            try:
+                self.publish(kind, region, z, x, y, tile_size, pad, data)
+            finally:
+                with self._async_lock:
+                    self._async_pending.discard(path)
+
+        try:
+            executor.submit(_write)
+        except RuntimeError:
+            with self._async_lock:
+                self._async_pending.discard(path)
+                self._async_skipped += 1
+            return False
+        return True
+
+    def close(self) -> None:
+        """Finish queued asynchronous publishes and stop the writer."""
+        with self._async_lock:
+            executor = self._async_executor
+            self._async_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
     def prune(self, budget_bytes: int) -> tuple[int, int]:
         """Evict entries until the remainder fits ``budget_bytes``.
 
@@ -557,6 +617,8 @@ class CoordStore:
             "hits": self._hits,
             "misses": self._misses,
             "publishes": self._publishes,
+            "async_pending": len(self._async_pending),
+            "async_skipped": self._async_skipped,
             "entries": self._scan[0],
             "bytes": self._scan[1],
             "budget_bytes": self._budget_bytes,

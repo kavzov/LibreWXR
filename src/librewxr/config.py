@@ -93,6 +93,11 @@ class Settings(BaseSettings):
     # store failure falls back to the in-process compute path.
     coord_store_enabled: bool = True  # Kill switch; False bypasses the store entirely
     coord_store_mb: int = 0  # Coord-store size cap in MB; 0 = mode default (single 1024, multi 8192)
+    # Move atomic coordinate-store writes off the cold-render critical path.
+    # The bounded per-process queue may skip persistence under a write burst;
+    # computed arrays remain valid in the worker's in-process LRU.
+    coord_store_async_publish: bool = False
+    coord_store_async_queue_size: int = Field(default=8, ge=1)
     # Shared on-disk encoded-tile store (see tiles/shared_tile_store.py).
     # Multi-mode only: render workers publish / read encoded tile bytes on
     # the shared cache volume so one worker's encode serves all workers.

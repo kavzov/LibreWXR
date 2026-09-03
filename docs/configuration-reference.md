@@ -565,6 +565,32 @@ The default tracks `LIBREWXR_MODE`: 1024 in single mode, 8192 in multi mode. In 
 | **Type** | integer |
 | **Unit** | megabytes |
 
+### `LIBREWXR_COORD_STORE_ASYNC_PUBLISH`
+
+Moves atomic coordinate-store writes to one bounded background writer per
+render process. This removes file allocation, copying, and flushes from a cold
+tile request. When the queue is full, persistence is skipped while the freshly
+computed arrays remain available in the worker's in-process LRU; rendered
+output and cache correctness are unchanged. This is most useful in multi-mode
+renderer pools. Keep it disabled if every first caller must immediately return
+file-backed memmaps.
+
+| | |
+|---|---|
+| **Default** | `false` |
+| **Type** | boolean |
+
+### `LIBREWXR_COORD_STORE_ASYNC_QUEUE_SIZE`
+
+Maximum number of distinct coordinate entries retained by each process's
+single background writer. A small bound prevents cold bursts from turning
+into unbounded memory and disk-I/O queues.
+
+| | |
+|---|---|
+| **Default** | `8` |
+| **Type** | integer, at least 1 |
+
 ### `LIBREWXR_WARMER_THREADS`
 
 Thread pool size for background tile cache warming, **single mode only** — in multi mode no `TileWarmer` is instantiated in render workers, and the 4-thread multi default sizes the request-executor pool used to compute tile geometry, not a warming pool. When a tile is requested, the warmer pre-computes the geometry for that same tile position at all other timestamps in the background, so animation playback is smooth without waiting for each frame to render on demand. Warming covers all color schemes and output formats automatically because the cache stores pre-presentation geometry, not encoded bytes.

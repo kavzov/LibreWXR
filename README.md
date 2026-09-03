@@ -687,6 +687,8 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | **Tile rendering** | | |
 | `LIBREWXR_TILE_CACHE_MB` | `200` (128 in multi mode) | Max tile cache size in MB per worker (byte-capped) |
 | `LIBREWXR_COORD_CACHE_SIZE` | `2048` (512 in multi mode) | Coordinate cache entries per cache (lower = less RAM) |
+| `LIBREWXR_COORD_STORE_ASYNC_PUBLISH` | `false` | Move shared coordinate writes off cold requests via a bounded background writer |
+| `LIBREWXR_COORD_STORE_ASYNC_QUEUE_SIZE` | `8` | Maximum queued coordinate writes per process |
 | `LIBREWXR_SMOOTH_RADIUS` | `1.0` | Gaussian blur radius (0 = disabled) |
 | `LIBREWXR_NOISE_FLOOR_DBZ` | `10.0` | Min dBZ to display (-32 = disabled) |
 | `LIBREWXR_DESPECKLE_MIN_NEIGHBORS` | `3` | Speckle filter strength (0 = disabled) |

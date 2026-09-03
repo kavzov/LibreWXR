@@ -37,6 +37,7 @@ def coord_store_env(monkeypatch, tmp_path):
     """
     monkeypatch.setattr(settings, "cache_dir", str(tmp_path))
     monkeypatch.setattr(settings, "coord_store_enabled", True)
+    monkeypatch.setattr(settings, "coord_store_async_publish", False)
 
     def _clear():
         for fn in ALL_CACHES:
@@ -364,6 +365,25 @@ class TestCoordStoreBacked:
         assert not second[0].flags.writeable
         assert not second[1].flags.writeable
         assert coord._STORE.stats()["hits"] > hits_before
+
+    def test_async_publish_keeps_first_call_off_disk_path(
+        self, coord_store_env, monkeypatch,
+    ):
+        """Async mode returns heap arrays immediately, then shares the entry."""
+        monkeypatch.setattr(settings, "coord_store_async_publish", True)
+        region = REGIONS[self._REGION]
+        z, x, y, ts = 4, 3, 5, 256
+
+        first = coord.region_pixel_indices(region, z, x, y, ts)
+        assert not isinstance(first[0].base, np.memmap)
+        assert coord._STORE is not None
+        coord._STORE.close()
+        coord.region_pixel_indices.cache_clear()
+
+        second = coord.region_pixel_indices(region, z, x, y, ts)
+        np.testing.assert_array_equal(second[0], first[0])
+        np.testing.assert_array_equal(second[1], first[1])
+        assert isinstance(second[0].base, np.memmap)
 
     def test_warm_request_key_agreement(self, coord_store_env):
         """Warming publishes exactly the keys the render path later reads."""

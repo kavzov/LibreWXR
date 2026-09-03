@@ -84,6 +84,23 @@ def test_open_miss_returns_none(tmp_path):
     assert not store.root.exists()
 
 
+def test_async_publish_roundtrip_and_close(tmp_path):
+    """The background writer publishes complete atomic entries before close."""
+    store = _store(tmp_path)
+    data = _data(tile_size=16)
+    assert store.publish_async(
+        KIND_INDICES, "USCOMP", 3, 2, 1, 16, 0, data,
+    ) is True
+    store.close()
+
+    out = store.open(
+        KIND_INDICES, "USCOMP", 3, 2, 1, 16, 0, data.shape, data.dtype,
+    )
+    assert out is not None
+    np.testing.assert_array_equal(out, data)
+    assert store.stats()["async_pending"] == 0
+
+
 def test_publish_skip_if_exists_preserves_bytes(tmp_path):
     """Second publish of an existing key is a no-op keeping original bytes."""
     store = _store(tmp_path)

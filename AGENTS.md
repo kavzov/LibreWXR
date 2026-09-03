@@ -190,6 +190,8 @@ All config via `LIBREWXR_*` env vars or `.env` file. Settings defined in `src/li
 - `LIBREWXR_TILE_TRACKING_ENABLED`: hot-tile counters surfaced in `/health` diagnostics (default true; adaptive warming policy not currently shipping)
 - `LIBREWXR_COORD_STORE_ENABLED`: shared on-disk coordinate store (default true; false reverts to per-worker in-process caches; requires `LIBREWXR_CACHE_DIR`)
 - `LIBREWXR_COORD_STORE_MB`: shared coord-store size cap (0 = mode default: 1024 single / 8192 multi; soft cap, pruned once per fetch cycle; multi budget shared by all render workers)
+- `LIBREWXR_COORD_STORE_ASYNC_PUBLISH`: optionally move atomic coordinate-store writes off cold render requests (default false)
+- `LIBREWXR_COORD_STORE_ASYNC_QUEUE_SIZE`: bounded pending coordinate writes per process (default 8)
 - `LIBREWXR_LOG_LEVEL`: root log level (DEBUG/INFO/WARNING/ERROR/CRITICAL, default INFO; case-insensitive; per-cycle noise logs at DEBUG)
 - `LIBREWXR_LOG_FILE`: rotating WARNING+ log file (default logs/librewxr.log; empty = disabled; compose bind-mounts ./logs so it lands in the clone directory)
 

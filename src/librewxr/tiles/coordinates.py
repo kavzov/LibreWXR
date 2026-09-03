@@ -79,6 +79,8 @@ def _get_store() -> CoordStore | None:
 def _reset_coord_store() -> None:
     """Test hook: reset the store singleton and the disabled flag."""
     global _STORE, _STORE_DISABLED
+    if _STORE is not None:
+        _STORE.close()
     _STORE = None
     _STORE_DISABLED = False
 
@@ -164,7 +166,13 @@ def _try_publish(
 ) -> None:
     """Store write wrapped in try/except (best-effort, never raises)."""
     try:
-        store.publish(kind, region_name, z, x, y, tile_size, pad, data)
+        if settings.coord_store_async_publish:
+            store.publish_async(
+                kind, region_name, z, x, y, tile_size, pad, data,
+                max_pending=settings.coord_store_async_queue_size,
+            )
+        else:
+            store.publish(kind, region_name, z, x, y, tile_size, pad, data)
     except Exception:
         logger.warning(
             "coord_store: publish(%s, %s, %d, %d, %d, %d, %d) failed",
