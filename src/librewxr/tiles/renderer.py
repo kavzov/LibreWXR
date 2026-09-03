@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 
 from librewxr.colors.schemes import get_lut
 from librewxr.config import settings
@@ -49,6 +49,24 @@ def _stage_finish(
 ) -> None:
     if timings is not None:
         timings[name] = timings.get(name, 0) + time.perf_counter_ns() - started_ns
+
+
+def _blur_rgba(rgba: np.ndarray, radius: float) -> np.ndarray:
+    """Gaussian-blur all RGBA channels using OpenCV's native kernel.
+
+    Pillow's GaussianBlur split/merged four channel images around two
+    separate filters and dominated the presentation stage for 512px tiles.
+    OpenCV applies the same independent-channel operation in one native call.
+    The geometry is padded before this step, so the border mode only affects
+    the already-discarded outer fringe in normal render paths.
+    """
+    return cv2.GaussianBlur(
+        rgba,
+        (0, 0),
+        sigmaX=radius,
+        sigmaY=radius,
+        borderType=cv2.BORDER_REPLICATE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -439,22 +457,18 @@ def present_tile(
     )
     _stage_finish(stage_timings, "colorize", stage_started)
 
-    img = Image.fromarray(rgba, "RGBA")
-
     if geom.blur_radius >= 0.5:
         stage_started = _stage_start(stage_timings)
-        r, g, b, a = img.split()
-        rgb = Image.merge("RGB", (r, g, b))
-        rgb = rgb.filter(ImageFilter.GaussianBlur(radius=geom.blur_radius))
-        a = a.filter(ImageFilter.GaussianBlur(radius=geom.blur_radius))
-        r, g, b = rgb.split()
-        img = Image.merge("RGBA", (r, g, b, a))
-
+        rgba = _blur_rgba(rgba, geom.blur_radius)
         if geom.pad > 0:
-            img = img.crop(
-                (geom.pad, geom.pad, geom.pad + geom.tile_size, geom.pad + geom.tile_size)
-            )
+            rgba = rgba[
+                geom.pad:geom.pad + geom.tile_size,
+                geom.pad:geom.pad + geom.tile_size,
+            ]
+        img = Image.fromarray(np.ascontiguousarray(rgba), "RGBA")
         _stage_finish(stage_timings, "blur", stage_started)
+    else:
+        img = Image.fromarray(rgba, "RGBA")
 
     if arrow_style and (flow_regions or nwp_flow is not None):
         regions = overlapping_regions(z, x, y, enabled_regions)

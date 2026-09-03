@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageFilter
 
 pytestmark = pytest.mark.tiles
 
@@ -23,6 +23,7 @@ from librewxr.native_weather import sample_radar_bilinear
 from librewxr.tiles.png_palette import _PALETTE_MIN_COLORS, encode_png
 from librewxr.tiles.renderer import (
     TileGeometry,
+    _blur_rgba,
     _compute_nwp_only_geometry,
     _sample_region,
     compute_tile_geometry,
@@ -140,11 +141,38 @@ class TestTileGeometryCache:
             smooth=True,
             stage_timings=timings,
         )
-        present_tile(
+        tile = present_tile(
             geom, color_scheme=2, fmt="png", stage_timings=timings,
         )
-        assert timings.keys() >= {"coordinates", "sampling", "colorize", "encode"}
+        assert Image.open(io.BytesIO(tile)).size == (256, 256)
+        assert timings.keys() >= {
+            "coordinates", "sampling", "colorize", "blur", "encode",
+        }
         assert all(value > 0 for value in timings.values())
+
+    def test_opencv_blur_matches_previous_pillow_quality(self):
+        """The native fast path stays visually equivalent to Pillow blur."""
+        rgba = np.zeros((70, 70, 4), dtype=np.uint8)
+        rgba[10:55, 12:58] = [0, 180, 230, 170]
+        rgba[25:42, 28:47] = [250, 220, 0, 255]
+        original = rgba.copy()
+
+        img = Image.fromarray(rgba, "RGBA")
+        r, g, b, a = img.split()
+        rgb = Image.merge("RGB", (r, g, b)).filter(
+            ImageFilter.GaussianBlur(radius=1.3),
+        )
+        alpha = a.filter(ImageFilter.GaussianBlur(radius=1.3))
+        r, g, b = rgb.split()
+        expected = np.asarray(Image.merge("RGBA", (r, g, b, alpha)))
+
+        actual = _blur_rgba(rgba, 1.3)
+        diff = np.abs(actual.astype(np.int16) - expected.astype(np.int16))
+
+        np.testing.assert_array_equal(rgba, original)
+        assert diff.mean() < 1.0
+        assert np.percentile(diff, 99) <= 4
+        assert diff.max() <= 20
 
     def test_single_region_masked_sampler_matches_legacy_border(
         self, sample_frame_data,
