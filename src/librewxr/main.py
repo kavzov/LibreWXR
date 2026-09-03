@@ -110,7 +110,8 @@ async def _worker_pulse_loop(stop: asyncio.Event, cache_dir: Path) -> None:
 
     Every PULSE_INTERVAL_S seconds (jittered like ``_poll_state`` so the
     16 render workers don't write in lockstep) this worker writes its
-    compact /health payload to ``<cache_dir>/workers/worker_<pid>.json``
+    compact /health payload to
+    ``<cache_dir>/workers/worker_<hostname>-<pid>.json``
     via ``asyncio.to_thread`` (``write_worker_pulse`` never raises, and
     ``collect_worker_pulse`` is guarded, so the loop survives transient
     store/cache hiccups).  Other workers aggregate these files for the

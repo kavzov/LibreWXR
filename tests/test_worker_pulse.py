@@ -18,6 +18,7 @@ from librewxr.data.worker_pulse import (
     PULSE_MAX_AGE_S,
     PULSE_STALE_S,
     read_worker_pulses,
+    worker_identity,
     write_worker_pulse,
 )
 
@@ -34,9 +35,9 @@ def test_write_read_round_trip(tmp_path: Path) -> None:
     write_worker_pulse(cache_dir, payload)
     pulses = read_worker_pulses(cache_dir)
     assert pulses == [payload]
-    # The file is published at the pid-suffixed path (the writer's own
-    # pid, not the payload's) and the tmp file is gone.
-    assert (_workers_dir(cache_dir) / f"worker_{os.getpid()}.json").exists()
+    # The file is published at the container+pid-suffixed path (the writer's
+    # identity, not the payload's) and the tmp file is gone.
+    assert (_workers_dir(cache_dir) / f"worker_{worker_identity()}.json").exists()
     assert list(_workers_dir(cache_dir).glob("*.tmp")) == []
 
 
@@ -44,6 +45,21 @@ def test_read_returns_empty_when_no_pulses(tmp_path: Path) -> None:
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     assert read_worker_pulses(cache_dir) == []
+
+
+def test_worker_ids_prevent_cross_container_pid_collisions(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "cache"
+    write_worker_pulse(cache_dir, {
+        "worker_id": "container-a-17", "pid": 17, "rss_bytes": 1,
+    })
+    write_worker_pulse(cache_dir, {
+        "worker_id": "container-b-17", "pid": 17, "rss_bytes": 2,
+    })
+
+    pulses = read_worker_pulses(cache_dir)
+    assert {pulse["worker_id"] for pulse in pulses} == {
+        "container-a-17", "container-b-17",
+    }
 
 
 def test_read_on_missing_dir_returns_empty(tmp_path: Path) -> None:
@@ -58,7 +74,7 @@ def test_freshness_filter_excludes_old_mtime(tmp_path: Path) -> None:
 
     # Age the real pulse beyond max_age (but below the stale sweep) — it
     # must be excluded from the read while staying on disk.
-    real = _workers_dir(cache_dir) / f"worker_{os.getpid()}.json"
+    real = _workers_dir(cache_dir) / f"worker_{worker_identity()}.json"
     st = real.stat()
     old_mtime = time.time() - PULSE_MAX_AGE_S - 30
     os.utime(real, (st.st_atime, old_mtime))
@@ -88,7 +104,7 @@ def test_stale_files_unlinked_during_read(tmp_path: Path) -> None:
     assert all(p["pid"] != 999999 for p in pulses)
     # Dead worker's file is swept from disk; the live one stays.
     assert not stale.exists()
-    assert (workers_dir / f"worker_{os.getpid()}.json").exists()
+    assert (workers_dir / f"worker_{worker_identity()}.json").exists()
 
 
 def test_corrupt_json_skipped_without_failing_others(tmp_path: Path) -> None:

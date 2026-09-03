@@ -2,11 +2,11 @@
 # Copyright (C) 2026 Joshua Kimsey
 """Cluster-wide worker pulse files for the /health aggregation.
 
-Multi-worker deployments run N uvicorn worker processes in one renderer
-container that share a listen socket, so individual workers can't be
-polled over HTTP.  They DO share the cache volume, so each worker
-periodically writes a tiny pid-unique JSON pulse under
-``<cache_dir>/workers/worker_<pid>.json``; any worker's ``/health``
+Multi-worker deployments run N uvicorn worker processes in one or more
+renderer containers that share a listen socket, so individual workers can't
+be polled over HTTP.  They DO share the cache volume, so each worker
+periodically writes a tiny container+pid-unique JSON pulse under
+``<cache_dir>/workers/worker_<hostname>-<pid>.json``; any worker's ``/health``
 handler scans those files (mtime-filtered) to aggregate the whole
 cluster.
 
@@ -19,6 +19,8 @@ doesn't, and a torn write is impossible because the rename is atomic.
 import json
 import logging
 import os
+import re
+import socket
 import time
 import uuid
 from pathlib import Path
@@ -38,10 +40,17 @@ PULSE_STALE_S = 600.0
 _WORKERS_SUBDIR = "workers"
 
 
+def worker_identity() -> str:
+    """Stable worker id that remains unique across PID namespaces."""
+    raw = f"{socket.gethostname()}-{os.getpid()}"
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", raw)
+
+
 def write_worker_pulse(cache_dir: Path, payload: dict) -> None:
     """Atomically publish ``payload`` as this process's pulse file.
 
-    Writes ``<cache_dir>/workers/worker_<pid>.json`` via a pid+uuid tmp
+    Writes ``<cache_dir>/workers/worker_<hostname>-<pid>.json`` via a
+    worker-id+uuid tmp
     file and ``os.replace`` (concurrent readers see either the previous
     file or the new one — never a partial write).  Best-effort and never
     raises: a broken cache dir just costs this worker its pulse.
@@ -49,9 +58,9 @@ def write_worker_pulse(cache_dir: Path, payload: dict) -> None:
     try:
         workers_dir = Path(cache_dir) / _WORKERS_SUBDIR
         workers_dir.mkdir(parents=True, exist_ok=True)
-        pid = os.getpid()
-        final = workers_dir / f"worker_{pid}.json"
-        tmp = workers_dir / f"worker_{pid}.{uuid.uuid4().hex}.tmp"
+        identity = payload.get("worker_id") or worker_identity()
+        final = workers_dir / f"worker_{identity}.json"
+        tmp = workers_dir / f"worker_{identity}.{uuid.uuid4().hex}.tmp"
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(tmp, final)
     except Exception:

@@ -47,7 +47,7 @@ from librewxr.data.pagecache import coord_pagecache_prime_stats
 from librewxr.data.point_nowcast import build_point_nowcast
 from librewxr.data.store import FrameStore
 from librewxr.data.weather_fields import WeatherField, field_spec
-from librewxr.data.worker_pulse import read_worker_pulses
+from librewxr.data.worker_pulse import read_worker_pulses, worker_identity
 from librewxr.mcp.discovery import build_ai_catalog
 from librewxr.memory import detect_memory_limit_mb
 from librewxr.tiles import window
@@ -266,6 +266,7 @@ def collect_worker_pulse() -> dict:
     files stays cheap.
     """
     payload = {
+        "worker_id": worker_identity(),
         "pid": os.getpid(),
         "written_at": int(time.time()),
         "rss_bytes": psutil.Process().memory_info().rss,
@@ -362,14 +363,18 @@ def _cluster_health_section() -> dict:
         pathlib.Path(settings.cache_dir) if settings.cache_dir else None
     )
     pulses = read_worker_pulses(cache_dir) if cache_dir is not None else []
-    by_pid: dict[int, dict] = {}
+    by_worker: dict[str, dict] = {}
     for pulse in pulses:
-        if isinstance(pulse, dict) and isinstance(pulse.get("pid"), int):
-            by_pid[pulse["pid"]] = pulse
+        if not isinstance(pulse, dict) or not isinstance(pulse.get("pid"), int):
+            continue
+        identity = pulse.get("worker_id")
+        key = identity if isinstance(identity, str) else f"legacy-pid-{pulse['pid']}"
+        by_worker[key] = pulse
     # The live payload is strictly fresher than any on-disk file this
     # process left behind, so it wins the pid-keyed union.
-    by_pid[os.getpid()] = collect_worker_pulse()
-    pulses = list(by_pid.values())
+    live_pulse = collect_worker_pulse()
+    by_worker[live_pulse["worker_id"]] = live_pulse
+    pulses = list(by_worker.values())
 
     rss_values = [
         pulse["rss_bytes"] for pulse in pulses if pulse.get("rss_bytes")
