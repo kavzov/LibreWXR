@@ -648,6 +648,7 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_JMA_ENABLED` | `true` | JMA HRPN Japanese national radar composite |
 | `LIBREWXR_FETCH_INTERVAL` | `600` | Seconds between radar data fetches (10 min, clock-aligned) |
 | `LIBREWXR_MAX_FRAMES` | `12` | Radar frames in memory (2h at default 10-min cadence) |
+| `LIBREWXR_FRAME_GRACE_FRAMES` | `3` | Older renderable frames hidden from metadata (rollover grace window) |
 | **Regional NWP chain** | | |
 | `LIBREWXR_REGIONAL_NWP_ENABLED` | `true` | Master switch for every regional NWP source (false collapses the chain to IFS) |
 | `LIBREWXR_NA_NWP_SOURCE` | `ifs` | `hrrr` to enable NOAA HRRR (CONUS + Alaska) |

@@ -470,7 +470,11 @@ async def _render_only_lifespan(app: FastAPI):
     # present in the snapshot.  Sources disabled by config produce no
     # contribution and so won't be loaded even if the snapshot includes
     # them — keep settings in sync between pipeline and render workers.
-    store = FrameStore(max_frames=settings.max_frames, cache_dir=cache_dir)
+    store = FrameStore(
+        max_frames=settings.max_frames,
+        cache_dir=cache_dir,
+        grace_frames=settings.frame_grace_frames,
+    )
     cache = TileCache(max_mb=settings.tile_cache_mb)
     # Shared on-disk encoded-tile store: one worker's encode serves all
     # workers (plain past-frame tiles only; see routes.radar_tile).  The
@@ -877,7 +881,10 @@ async def lifespan(app: FastAPI):
             yield
         return
 
-    store = FrameStore(max_frames=settings.max_frames)
+    store = FrameStore(
+        max_frames=settings.max_frames,
+        grace_frames=settings.frame_grace_frames,
+    )
     cache = TileCache(max_mb=settings.tile_cache_mb)
     from pathlib import Path
     nwp_cache_dir = Path(settings.cache_dir) if settings.cache_dir else None

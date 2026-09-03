@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     ssl_keyfile: str | None = None
     fetch_interval: int = 600  # seconds between fetches (10 min = radar frame cadence)
     max_frames: int = 12
+    # Additional past frames kept renderable but omitted from public metadata.
+    # This lets clients finish requests from a catalog fetched immediately
+    # before a generation rollover without extending the visible animation.
+    frame_grace_frames: int = Field(default=3, ge=0)
     max_zoom: int = 12
     # Root log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
     # (case-insensitive; normalized to uppercase by the validator).

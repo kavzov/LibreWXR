@@ -95,7 +95,11 @@ async def run_pipeline() -> None:
 
     # All persistent stores share the same cache_dir so render workers can
     # memmap the same files and __setstate__ from a single state.json.
-    store = FrameStore(max_frames=settings.max_frames, cache_dir=cache_dir)
+    store = FrameStore(
+        max_frames=settings.max_frames,
+        cache_dir=cache_dir,
+        grace_frames=settings.frame_grace_frames,
+    )
     tile_cache = TileCache(max_mb=1)  # noop-effect (see module docstring)
 
     # Walk the auto-discovered NWP providers under ``librewxr.sources``;

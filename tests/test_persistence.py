@@ -43,6 +43,50 @@ def _roundtrip(state: dict) -> dict:
 
 class TestFrameStorePersistence:
     @pytest.mark.asyncio
+    async def test_grace_frames_are_renderable_but_not_advertised(
+        self, tmp_path: Path,
+    ) -> None:
+        cache = tmp_path / "cache"
+        store = FrameStore(max_frames=2, grace_frames=1, cache_dir=cache)
+        arr = np.zeros((4, 4), dtype=np.uint8)
+
+        for timestamp in (1700000000, 1700000600, 1700001200):
+            await store.add_frame(
+                RadarFrame(timestamp=timestamp, regions={"A": arr})
+            )
+
+        assert await store.get_timestamps() == [1700000600, 1700001200]
+        assert await store.frame_count() == 2
+        assert await store.retained_frame_count() == 3
+        assert await store.get_frame(1700000000) is not None
+        assert store.frame_version(1700000000) == 1
+
+        await store.add_frame(
+            RadarFrame(timestamp=1700001800, regions={"A": arr})
+        )
+        assert await store.get_frame(1700000000) is None
+        assert await store.get_frame(1700000600) is not None
+
+    @pytest.mark.asyncio
+    async def test_grace_frames_survive_snapshot_roundtrip(
+        self, tmp_path: Path,
+    ) -> None:
+        cache = tmp_path / "cache"
+        producer = FrameStore(max_frames=2, grace_frames=1, cache_dir=cache)
+        arr = np.zeros((4, 4), dtype=np.uint8)
+        for timestamp in (1700000000, 1700000600, 1700001200):
+            await producer.add_frame(
+                RadarFrame(timestamp=timestamp, regions={"A": arr})
+            )
+
+        consumer = FrameStore(max_frames=1)
+        consumer.__setstate__(_roundtrip(producer.__getstate__()))
+
+        assert await consumer.get_timestamps() == [1700000600, 1700001200]
+        assert await consumer.retained_frame_count() == 3
+        assert await consumer.get_frame(1700000000) is not None
+
+    @pytest.mark.asyncio
     async def test_roundtrip_preserves_frames(self, tmp_path: Path) -> None:
         cache = tmp_path / "cache"
         producer = FrameStore(max_frames=4, cache_dir=cache)

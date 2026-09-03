@@ -191,6 +191,22 @@ More frames = longer animation history = more RAM usage.
 | **Default** | `12` |
 | **Type** | integer |
 
+### `LIBREWXR_FRAME_GRACE_FRAMES`
+
+Number of older radar frames kept renderable after they leave the public
+metadata window. This prevents a client that fetched metadata immediately
+before a generation rollover from receiving `404 Frame not found` while it
+finishes loading that animation. Grace frames are not advertised, do not
+lengthen the visible animation, and are retained in multi-worker snapshots.
+
+At a 5-minute fetch interval, the default three frames provide 15 minutes of
+grace. Set to `0` to restore strict immediate eviction.
+
+| | |
+|---|---|
+| **Default** | `3` |
+| **Type** | integer |
+
 ### `LIBREWXR_NA_SOURCE`
 
 US-side radar data source — applies to USCOMP, AKCOMP, HICOMP, PRCOMP, and GUCOMP only. **Canada (CACOMP) is controlled independently** by `LIBREWXR_CA_SOURCE`. Three modes:

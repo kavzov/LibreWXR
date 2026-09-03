@@ -33,8 +33,20 @@ class FrameStore:
     cache — the foundation of the multi-worker tile-server split.
     """
 
-    def __init__(self, max_frames: int = 12, cache_dir: Path | None = None):
+    def __init__(
+        self,
+        max_frames: int = 12,
+        cache_dir: Path | None = None,
+        grace_frames: int = 0,
+    ):
         self._max_frames = max_frames
+        # Grace frames stay addressable by timestamp after leaving the public
+        # metadata window.  This closes the race where a client reads metadata
+        # immediately before a fetch cycle and then requests an uncached tile
+        # from the just-evicted oldest frame.  They are deliberately hidden by
+        # get_timestamps()/frame_count()/get_region_keys(), so animation length
+        # and all fetch/nowcast consumers retain the max_frames contract.
+        self._grace_frames = max(0, grace_frames)
         self._frames: list[RadarFrame] = []
         # O(1) timestamp -> frame index, kept in sync with ``_frames`` on
         # every append / merge / eviction / reload / cleanup.
@@ -128,7 +140,7 @@ class FrameStore:
                     return None, True
 
             evicted_ts = None
-            if len(self._frames) >= self._max_frames:
+            if len(self._frames) >= self._max_frames + self._grace_frames:
                 evicted = self._frames.pop(0)
                 evicted_ts = evicted.timestamp
                 self._cleanup_timestamp(evicted_ts)
@@ -164,7 +176,7 @@ class FrameStore:
 
     async def get_timestamps(self) -> list[int]:
         async with self._lock:
-            return [f.timestamp for f in self._frames]
+            return [f.timestamp for f in self._frames[-self._max_frames:]]
 
     async def get_frame_versions(self) -> dict[int, int]:
         """Return stable per-timestamp content versions for HTTP cache keys."""
@@ -174,9 +186,17 @@ class FrameStore:
     async def get_region_keys(self) -> dict[int, set[str]]:
         """Return a mapping of timestamp -> set of region names present."""
         async with self._lock:
-            return {f.timestamp: set(f.regions.keys()) for f in self._frames}
+            return {
+                f.timestamp: set(f.regions.keys())
+                for f in self._frames[-self._max_frames:]
+            }
 
     async def frame_count(self) -> int:
+        async with self._lock:
+            return min(len(self._frames), self._max_frames)
+
+    async def retained_frame_count(self) -> int:
+        """Total current + hidden grace frames available to tile routes."""
         async with self._lock:
             return len(self._frames)
 
@@ -201,6 +221,7 @@ class FrameStore:
         """
         return {
             "max_frames": self._max_frames,
+            "grace_frames": self._grace_frames,
             "memmap_dir": str(self._memmap_dir),
             "frames": [
                 {
@@ -247,6 +268,7 @@ class FrameStore:
         before reuse; anything that fails the check is re-opened fresh.
         """
         max_frames = state["max_frames"]
+        grace_frames = state.get("grace_frames", 0)
         memmap_dir = Path(state["memmap_dir"])
         # JSON coerces int keys to strings; convert back.  The .get(..., {})
         # default handles snapshots written before this field existed.
@@ -292,6 +314,7 @@ class FrameStore:
         # Apply atomically — if this object is being updated in place,
         # readers see either the old list or the new list, never partial.
         self._max_frames = max_frames
+        self._grace_frames = grace_frames
         self._memmap_dir = memmap_dir
         self._frames = new_frames
         # Rebuild the O(1) timestamp index alongside the frame list so

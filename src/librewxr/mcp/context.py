@@ -117,7 +117,11 @@ async def build_stdio_lifespan(mcp_instance):
     await _wait_for_state(cache_dir, settings.state_wait_timeout)
 
     # ---- Build empty stores ----------------------------------------------
-    store = FrameStore(max_frames=settings.max_frames, cache_dir=cache_dir)
+    store = FrameStore(
+        max_frames=settings.max_frames,
+        cache_dir=cache_dir,
+        grace_frames=settings.frame_grace_frames,
+    )
     nwp_contribs = collect_nwp_contributions(settings, cache_dir)
     nwp_grids_by_slug: dict[str, object] = {
         nwp_grid_slug(c): c.instance for c in nwp_contribs

@@ -562,6 +562,7 @@ async def health():
     rss_mb = rss_bytes / (1024 * 1024)
     ram_usage = round(rss_mb / mem_limit_mb * 100, 1)
     frame_count = await frame_store.frame_count()
+    retained_frame_count = await frame_store.retained_frame_count()
     timestamps = await frame_store.get_timestamps()
     latest_ts = max(timestamps) if timestamps else None
     oldest_ts = min(timestamps) if timestamps else None
@@ -682,6 +683,8 @@ async def health():
         "frames": {
             "count": frame_count,
             "max": settings.max_frames,
+            "retained_count": retained_frame_count,
+            "grace_max": settings.frame_grace_frames,
             "latest": latest_ts,
             "oldest": oldest_ts,
             "latest_age_seconds": now - latest_ts if latest_ts else None,
