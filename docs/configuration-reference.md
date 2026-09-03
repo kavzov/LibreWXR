@@ -560,6 +560,20 @@ Thread pool size for background tile cache warming, **single mode only** — in 
 
 The empty-tile fast path (see `tile_requests.fast_path` in `/health`) and per-worker LRU caches cover the cold-render case in multi mode.
 
+### `LIBREWXR_RENDER_QUEUE_DEPTH`
+
+Maximum number of geometry-compute jobs allowed to wait inside each render
+worker process's `ThreadPoolExecutor`. Excess requests remain as lightweight
+async coroutines until an executor slot becomes available, preventing an
+unbounded cold burst from filling the executor queue and inflating memory.
+`compute_queue` latency includes this admission wait. `/health` exposes both
+the per-process `render_queue` and the cluster-wide aggregate.
+
+| | |
+|---|---|
+| **Default** | `0` (auto = one queued job per render thread) |
+| **Type** | non-negative integer |
+
 ### `LIBREWXR_PRESENT_THREADS`
 
 Per-render-worker thread pool for colorization and image encoding. `0` derives

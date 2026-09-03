@@ -75,6 +75,7 @@ from librewxr.tiles.motion_renderer import (
     render_motion_tile,
 )
 from librewxr.tiles.request_tracker import RENDER_STAGE_NAMES, TileRequestTracker
+from librewxr.tiles.render_queue import BoundedRenderQueue
 from librewxr.tiles.satellite_renderer import (
     render_gmgsi_composite_tile,
     render_gmgsi_tile,
@@ -132,6 +133,11 @@ present_executor = None  # ThreadPoolExecutor | None
 # this None and the shared-store call sites fall back to
 # ``asyncio.to_thread`` (the loop default executor).
 io_executor = None  # ThreadPoolExecutor | None
+
+# Multi-mode admission control in front of the compute executor.  The
+# executor itself has an unbounded work queue; this object limits submitted
+# jobs while excess request coroutines wait cheaply on the event loop.
+render_queue: BoundedRenderQueue | None = None
 
 # Shared on-disk encoded-tile store - set by main.py in multi mode only.
 # A ``radar_tile`` hit skips frame fetch + geometry compute + present
@@ -310,6 +316,9 @@ def collect_worker_pulse() -> dict:
                 "cache_misses": tracker_stats["cache"]["misses"],
             }
     payload["requests"] = requests
+
+    if render_queue is not None:
+        payload["render_queue"] = render_queue.snapshot()
 
     # Tile-latency accumulators, additive across workers: ns totals and
     # stage counts.  Old pulses that predate these fields are tolerated
@@ -498,6 +507,16 @@ def _cluster_health_section() -> dict:
         },
     }
 
+    queue_keys = (
+        "worker_slots", "queue_slots", "capacity", "inflight",
+        "executor_queued", "waiting", "peak_waiting", "admitted_total",
+    )
+    render_queue_block = {key: 0 for key in queue_keys}
+    for pulse in pulses:
+        queue = pulse.get("render_queue") or {}
+        for key in queue_keys:
+            render_queue_block[key] += queue.get(key, 0)
+
     return {
         "workers_reporting": len(pulses),
         "memory": memory_block,
@@ -505,6 +524,7 @@ def _cluster_health_section() -> dict:
         "coord": coord_block,
         "requests": requests_block,
         "tile_latency": tile_latency_block,
+        "render_queue": render_queue_block,
     }
 
 
@@ -733,6 +753,7 @@ async def health():
             coord_pagecache_prime_stats(settings.cache_dir)
             if settings.cache_dir else None
         ),
+        "render_queue": render_queue.snapshot() if render_queue is not None else None,
         "tile_requests": (
             {"enabled": True, **tile_request_tracker.stats()}
             if tile_request_tracker is not None
@@ -1851,7 +1872,11 @@ async def radar_tile(
                                 stage_timings=local_timings,
                             )
 
-                        computed = await asyncio.to_thread(_run_compute)
+                        if render_queue is not None:
+                            async with render_queue:
+                                computed = await asyncio.to_thread(_run_compute)
+                        else:
+                            computed = await asyncio.to_thread(_run_compute)
                         elapsed_ns = time.perf_counter_ns() - compute_start
                         tile_cache.put(geom_key, computed)
                         return computed, elapsed_ns, local_timings

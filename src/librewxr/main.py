@@ -64,6 +64,7 @@ from librewxr.tiles.coordinates import (
     warm_coordinate_caches,
 )
 from librewxr.tiles.request_tracker import TileRequestTracker
+from librewxr.tiles.render_queue import BoundedRenderQueue
 from librewxr.tiles.shared_tile_store import SharedTileStore
 from librewxr.tiles.warmer import TileWarmer
 
@@ -607,6 +608,8 @@ async def _render_only_lifespan(app: FastAPI):
     cv2.setNumThreads(settings.opencv_threads)
     pool_size = settings.warmer_threads or max((os.cpu_count() or 4) - 1, 1)
     request_executor = ThreadPoolExecutor(max_workers=pool_size)
+    render_queue_depth = settings.render_queue_depth or pool_size
+    render_queue = BoundedRenderQueue(pool_size, render_queue_depth)
     # Separate present pool: the cheap ``present_tile`` tail (colorize,
     # encode) runs here so it never queues behind long geometry computes
     # on the shared default executor during a cold-tile burst.  Half the
@@ -622,6 +625,7 @@ async def _render_only_lifespan(app: FastAPI):
     asyncio.get_running_loop().set_default_executor(request_executor)
     routes.present_executor = present_executor
     routes.io_executor = io_executor
+    routes.render_queue = render_queue
 
     mem_limit = detect_memory_limit_mb(settings.memory_limit_mb)
     monitor = MemoryMonitor(
@@ -848,6 +852,7 @@ async def _render_only_lifespan(app: FastAPI):
         # can never be scheduled against (single mode always keeps None).
         routes.present_executor = None
         routes.io_executor = None
+        routes.render_queue = None
         cache.clear()
         store.cleanup()
         if nowcast_store is not None:

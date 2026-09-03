@@ -118,6 +118,7 @@ class Settings(BaseSettings):
     native_render: Literal["auto", "on", "off"] = "auto"
     workers: int = 0  # Number of uvicorn worker processes; 0 = mode default
     warmer_threads: int = 0  # Render thread pool size; 0 = mode default (auto in single, 4 in multi) (sizes the request-executor pool in multi mode; the warmer itself is single-mode only)
+    render_queue_depth: int = Field(0, ge=0)  # Multi-mode queued compute submissions per worker process; 0 = render thread count
     present_threads: int = Field(0, ge=0)  # Encode/colorize pool per render worker; 0 = max(2, render_threads / 2)
     io_threads: int = Field(2, ge=1)  # Shared-store/state I/O pool per render worker
     opencv_threads: int = Field(2, ge=1)  # OpenCV threads inside each render worker
