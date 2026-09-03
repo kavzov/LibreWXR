@@ -54,6 +54,8 @@ KIND_INDICES = "indices"                # region_pixel_indices
 KIND_INDICES_PAD = "indices_pad"        # region_pixel_indices_padded
 KIND_FRACTIONAL = "fractional"          # region_pixel_indices_fractional
 KIND_FRACTIONAL_PAD = "fractional_pad"  # region_pixel_indices_fractional_padded
+KIND_FRACTIONAL_MASKED = "fractional_masked"
+KIND_FRACTIONAL_MASKED_PAD = "fractional_masked_pad"
 KIND_LATLON = "latlon"                  # tile_pixel_latlons
 KIND_LATLON_PAD = "latlon_pad"          # tile_pixel_latlons_padded
 

@@ -379,16 +379,22 @@ fn sample_radar_bilinear_u8<'py>(
         .allow_threads(|| {
             let mut output = Vec::with_capacity(row.len());
             for (&row_f, &col_f) in row.iter().zip(col) {
-                if !row_f.is_finite()
-                    || !col_f.is_finite()
-                    || row_f < 0.0
+                if !row_f.is_finite() || !col_f.is_finite() {
+                    return Err(format!(
+                        "radar sample coordinate ({row_f}, {col_f}) must be finite"
+                    ));
+                }
+                // Masked coordinate plans encode pixels outside the source
+                // grid as -1 in both planes.  Emit a transparent radar value
+                // directly instead of requiring a second full-size integer
+                // index pair solely to zero those pixels after sampling.
+                if row_f < 0.0
                     || col_f < 0.0
                     || row_f > (height - 1) as f32
                     || col_f > (width - 1) as f32
                 {
-                    return Err(format!(
-                        "radar sample coordinate ({row_f}, {col_f}) is outside frame shape ({height}, {width})"
-                    ));
+                    output.push(0);
+                    continue;
                 }
                 let r0 = row_f.floor() as usize;
                 let c0 = col_f.floor() as usize;

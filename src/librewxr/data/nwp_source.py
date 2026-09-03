@@ -496,6 +496,44 @@ class NWPChain:
         timestamp: int | None = None,
         bilinear: bool = False,
     ) -> np.ndarray:
+        # The common production profile currently has IFS as the sole active
+        # precipitation source.  Running that global uint8 result through the
+        # generic feather compositor allocated out/remaining/weight/relevant/
+        # contribution rasters only to reproduce the same bytes.  Bypass the
+        # compositor when exactly one global catch-all participates; regional
+        # chains retain the existing feathered path below.
+        participants = [
+            src
+            for src in self._sources
+            if (
+                src.has_data_at(timestamp)
+                if timestamp is not None else src.has_data()
+            )
+        ]
+        if (
+            len(participants) == 1
+            and getattr(participants[0], "global_catch_all", False)
+            and lat.shape == lon.shape
+            and np.isfinite(lat).all()
+            and np.isfinite(lon).all()
+            and (lat >= -90.0).all()
+            and (lat <= 90.0).all()
+        ):
+            sampled = np.asarray(
+                participants[0].sample(lat, lon, timestamp, bilinear),
+            )
+            if sampled.shape != lat.shape:
+                raise ValueError(
+                    f"{participants[0].name} returned shape {sampled.shape}, "
+                    f"expected {lat.shape}"
+                )
+            if sampled.dtype == np.uint8:
+                return sampled
+            with np.errstate(invalid="ignore"):
+                return np.clip(sampled.astype(np.float32) + 0.5, 0, 255).astype(
+                    np.uint8
+                )
+
         out = np.zeros(lat.shape, dtype=np.float32)
         remaining = np.ones(lat.shape, dtype=np.float32)
         for src in self._sources:

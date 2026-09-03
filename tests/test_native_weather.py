@@ -222,11 +222,17 @@ def test_native_radar_bilinear_matches_numpy(require_native):
     col = np.ascontiguousarray(
         rng.uniform(0, frame.shape[1] - 1, (37, 43)).astype(np.float32)
     )
+    row[0, 0] = -1.0
+    col[0, 0] = -1.0
+    row[0, 1] = frame.shape[0]
+    col[0, 1] = frame.shape[1]
 
     python = sample_radar_bilinear(frame, row, col, implementation="python")
     rust = sample_radar_bilinear(frame, row, col, implementation="rust")
 
     np.testing.assert_array_equal(rust, python)
+    assert rust[0, 0] == 0
+    assert rust[0, 1] == 0
 
 
 def test_native_radar_nowcast_blend_matches_numpy(require_native):

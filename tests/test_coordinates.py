@@ -289,6 +289,36 @@ class TestCoordStoreBacked:
         assert np.any(row == -1) and np.any(col == -1)
         assert np.any(row >= 0) and np.any(col >= 0)
 
+    def test_masked_fractional_matches_legacy_validity(self, coord_store_env):
+        """One fractional pair carries the old integer-pair OOB mask."""
+        region = REGIONS[self._REGION]
+        z, x, y, ts, pad = self._Z, self._X, self._Y, 256, 8
+        for row_i, col_i, row_f, col_f, masked_row, masked_col in (
+            (
+                *coord.region_pixel_indices(region, z, x, y, ts),
+                *coord.region_pixel_indices_fractional(region, z, x, y, ts),
+                *coord.region_pixel_indices_fractional_masked(
+                    region, z, x, y, ts,
+                ),
+            ),
+            (
+                *coord.region_pixel_indices_padded(region, z, x, y, ts, pad),
+                *coord.region_pixel_indices_fractional_padded(
+                    region, z, x, y, ts, pad,
+                ),
+                *coord.region_pixel_indices_fractional_masked_padded(
+                    region, z, x, y, ts, pad,
+                ),
+            ),
+        ):
+            valid = (row_i >= 0) & (col_i >= 0)
+            np.testing.assert_array_equal(masked_row[valid], row_f[valid])
+            np.testing.assert_array_equal(masked_col[valid], col_f[valid])
+            assert np.all(masked_row[~valid] == -1.0)
+            assert np.all(masked_col[~valid] == -1.0)
+            assert not masked_row.flags.writeable
+            assert not masked_col.flags.writeable
+
     def test_first_call_pins_file_backed_pages(self, coord_store_env):
         """Fresh store (guaranteed miss -> publish) -> the first call re-opens
         the published entry and returns the shared read-only memmap views, so
@@ -357,10 +387,14 @@ class TestCoordStoreBacked:
         # The same calls the render path makes for that pad.
         coord.region_pixel_indices(region, z, x, y, ts)
         coord.region_pixel_indices_fractional(region, z, x, y, ts)
+        coord.region_pixel_indices_fractional_masked(region, z, x, y, ts)
         coord.tile_pixel_latlons(z, x, y, ts)
         if pad > 0:
             coord.region_pixel_indices_padded(region, z, x, y, ts, pad)
             coord.region_pixel_indices_fractional_padded(region, z, x, y, ts, pad)
+            coord.region_pixel_indices_fractional_masked_padded(
+                region, z, x, y, ts, pad,
+            )
             coord.tile_pixel_latlons_padded(z, x, y, ts, pad)
 
         stats = coord._STORE.stats()

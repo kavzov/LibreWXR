@@ -381,9 +381,11 @@ def sample_radar_bilinear(
 ) -> np.ndarray:
     """Sample an encoded uint8 radar grid with zero-aware interpolation.
 
-    A zero corner makes the result fall back to the nearest value. This keeps
-    the native path pixel-identical to the historical NumPy renderer and
-    avoids interpolating precipitation across nodata / clear-sky boundaries.
+    A zero corner makes the result fall back to the nearest value. Coordinates
+    outside the source grid produce zero; masked tile-coordinate plans use
+    ``-1`` for those pixels. This keeps the native path pixel-identical to the
+    historical NumPy renderer while avoiding a second integer coordinate pair
+    solely for its out-of-bounds mask.
     """
 
     frame = np.asarray(frame)
@@ -402,12 +404,22 @@ def sample_radar_bilinear(
     if active_implementation(implementation) == "rust":
         return _native.sample_radar_bilinear_u8(frame, row, col)
 
-    r0 = np.floor(row).astype(np.int32)
-    c0 = np.floor(col).astype(np.int32)
+    if not np.isfinite(row).all() or not np.isfinite(col).all():
+        raise ValueError("row and col coordinates must be finite")
+    valid = (
+        (row >= 0)
+        & (col >= 0)
+        & (row <= frame.shape[0] - 1)
+        & (col <= frame.shape[1] - 1)
+    )
+    safe_row = np.clip(row, 0, frame.shape[0] - 1)
+    safe_col = np.clip(col, 0, frame.shape[1] - 1)
+    r0 = np.floor(safe_row).astype(np.int32)
+    c0 = np.floor(safe_col).astype(np.int32)
     r1 = np.minimum(r0 + 1, frame.shape[0] - 1)
     c1 = np.minimum(c0 + 1, frame.shape[1] - 1)
-    dr = (row - r0).astype(np.float32)
-    dc = (col - c0).astype(np.float32)
+    dr = (safe_row - r0).astype(np.float32)
+    dc = (safe_col - c0).astype(np.float32)
     v00 = frame[r0, c0].astype(np.float32)
     v01 = frame[r0, c1].astype(np.float32)
     v10 = frame[r1, c0].astype(np.float32)
@@ -419,9 +431,11 @@ def sample_radar_bilinear(
         + v10 * dr * (1 - dc)
         + v11 * dr * dc
     )
-    return np.clip(np.where(any_zero, v00, interpolated) + 0.5, 0, 255).astype(
-        np.uint8
-    )
+    result = np.clip(
+        np.where(any_zero, v00, interpolated) + 0.5, 0, 255,
+    ).astype(np.uint8)
+    result[~valid] = 0
+    return result
 
 
 def blend_radar_nowcast(

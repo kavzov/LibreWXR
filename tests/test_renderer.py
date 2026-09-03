@@ -16,11 +16,15 @@ from librewxr.tiles.coordinates import (
     COMPOSITE_HEIGHT,
     COMPOSITE_WIDTH,
     compute_blur_radius,
+    region_pixel_indices_fractional_padded,
+    region_pixel_indices_padded,
 )
+from librewxr.native_weather import sample_radar_bilinear
 from librewxr.tiles.png_palette import _PALETTE_MIN_COLORS, encode_png
 from librewxr.tiles.renderer import (
     TileGeometry,
     _compute_nwp_only_geometry,
+    _sample_region,
     compute_tile_geometry,
     present_tile,
     render_coverage_tile,
@@ -141,6 +145,32 @@ class TestTileGeometryCache:
         )
         assert timings.keys() >= {"coordinates", "sampling", "colorize", "encode"}
         assert all(value > 0 for value in timings.values())
+
+    def test_single_region_masked_sampler_matches_legacy_border(
+        self, sample_frame_data,
+    ):
+        """The one-plan smooth path preserves the old padded OOB zeros."""
+        sample_frame_data.fill(120)
+        region = REGIONS["USCOMP"]
+        z, x, y, tile_size = 3, 1, 3, 256
+        radius = compute_blur_radius(region, z, x, y, tile_size)
+        pad = int(radius * 3) if radius >= 0.5 else 0
+        assert pad > 0
+
+        row_i, col_i = region_pixel_indices_padded(
+            region, z, x, y, tile_size, pad,
+        )
+        row_f, col_f = region_pixel_indices_fractional_padded(
+            region, z, x, y, tile_size, pad,
+        )
+        expected = sample_radar_bilinear(sample_frame_data, row_f, col_f)
+        expected[(row_i == -1) | (col_i == -1)] = 0
+
+        actual = _sample_region(
+            sample_frame_data, region, z, x, y, tile_size,
+            smooth=True, use_blur=True, pad=pad,
+        )
+        np.testing.assert_array_equal(actual, expected)
 
     def test_transparent_when_no_data(self):
         """Tiles with no radar AND no NWP return the transparent sentinel."""
@@ -785,6 +815,29 @@ class TestRegionsWithDataGating:
         chain.has_data.return_value = True
         chain.sample.return_value = model_arr
         return chain
+
+    def test_nowcast_feather_union_is_reused(self, monkeypatch):
+        """All animation frames for one tile share static feather geometry."""
+        from librewxr.tiles import renderer as renderer_mod
+
+        renderer_mod.clear_tile_feather_cache()
+        sampler = MagicMock(
+            side_effect=lambda name, lat, lon: np.full(
+                lat.shape,
+                0.25 if name == "USCOMP" else 0.75,
+                dtype=np.float32,
+            )
+        )
+        monkeypatch.setattr(renderer_mod, "sample_feather", sampler)
+        args = (("USCOMP", "CACOMP"), self._Z, self._X, self._Y, self._TILE, 0)
+        first = renderer_mod._tile_feather_union(*args)
+        second = renderer_mod._tile_feather_union(*args)
+
+        assert first is second
+        assert sampler.call_count == 2
+        assert np.all(first == 0.75)
+        assert not first.flags.writeable
+        renderer_mod.clear_tile_feather_cache()
 
     @pytest.fixture(autouse=True)
     def _pin_noise_floor(self, monkeypatch):

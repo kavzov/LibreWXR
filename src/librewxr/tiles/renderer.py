@@ -4,6 +4,7 @@ import io
 import math
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import cv2
@@ -19,6 +20,8 @@ from librewxr.tiles.coordinates import (
     overlapping_regions,
     region_pixel_indices,
     region_pixel_indices_fractional,
+    region_pixel_indices_fractional_masked,
+    region_pixel_indices_fractional_masked_padded,
     region_pixel_indices_fractional_padded,
     region_pixel_indices_padded,
     tile_bounds,
@@ -206,10 +209,20 @@ def compute_tile_geometry(
     # Uses the highest-priority (finest) region's Jacobian so that mixed
     # coarse + fine tiles size their blur to the resolution that's
     # actually visible at the center.
+    single_fractional_coordinates = None
     stage_started = _stage_start(stage_timings)
-    blur_radius = compute_blur_radius(
-        regions_with_data[0], z, x, y, tile_size,
-    ) if smooth else 0.0
+    if smooth and len(regions_with_data) == 1:
+        single_fractional_coordinates = region_pixel_indices_fractional_masked(
+            regions_with_data[0], z, x, y, tile_size,
+        )
+        blur_radius = compute_blur_radius(
+            regions_with_data[0], z, x, y, tile_size,
+            fractional_coordinates=single_fractional_coordinates,
+        )
+    else:
+        blur_radius = compute_blur_radius(
+            regions_with_data[0], z, x, y, tile_size,
+        ) if smooth else 0.0
     _stage_finish(stage_timings, "coordinates", stage_started)
 
     use_blur = blur_radius >= 0.5
@@ -221,6 +234,7 @@ def compute_tile_geometry(
         values = _sample_region(
             frame_regions[region.name], region, z, x, y, tile_size,
             smooth, use_blur, pad, stage_timings,
+            fractional_coordinates=single_fractional_coordinates,
         )
     else:
         values = _composite_regions(
@@ -582,40 +596,40 @@ def _sample_region(
     use_blur: bool,
     pad: int,
     stage_timings: dict[str, int] | None = None,
+    fractional_coordinates: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> np.ndarray:
     """Sample pixel values from a single region."""
+    if smooth:
+        stage_started = _stage_start(stage_timings)
+        if pad > 0:
+            row_f, col_f = region_pixel_indices_fractional_masked_padded(
+                region, z, x, y, tile_size, pad,
+            )
+        elif fractional_coordinates is not None:
+            row_f, col_f = fractional_coordinates
+        else:
+            row_f, col_f = region_pixel_indices_fractional_masked(
+                region, z, x, y, tile_size,
+            )
+        _stage_finish(stage_timings, "coordinates", stage_started)
+        stage_started = _stage_start(stage_timings)
+        values = sample_radar_bilinear(frame_data, row_f, col_f)
+        _stage_finish(stage_timings, "sampling", stage_started)
+        return values
+
     if pad > 0:
         stage_started = _stage_start(stage_timings)
         row_idx, col_idx = region_pixel_indices_padded(
-            region, z, x, y, tile_size, pad
+            region, z, x, y, tile_size, pad,
         )
         _stage_finish(stage_timings, "coordinates", stage_started)
-        if smooth:
-            values = _bilinear_sample(
-                frame_data, region, z, x, y, tile_size, pad=pad,
-                stage_timings=stage_timings,
-            )
-            oob = (row_idx == -1) | (col_idx == -1)
-            values[oob] = 0
-        else:
-            stage_started = _stage_start(stage_timings)
-            values = _gather_clipped(frame_data, row_idx, col_idx)
-            _stage_finish(stage_timings, "sampling", stage_started)
     else:
         stage_started = _stage_start(stage_timings)
         row_idx, col_idx = region_pixel_indices(region, z, x, y, tile_size)
         _stage_finish(stage_timings, "coordinates", stage_started)
-        if smooth:
-            values = _bilinear_sample(
-                frame_data, region, z, x, y, tile_size,
-                stage_timings=stage_timings,
-            )
-            oob = (row_idx == -1) | (col_idx == -1)
-            values[oob] = 0
-        else:
-            stage_started = _stage_start(stage_timings)
-            values = _gather_clipped(frame_data, row_idx, col_idx)
-            _stage_finish(stage_timings, "sampling", stage_started)
+    stage_started = _stage_start(stage_timings)
+    values = _gather_clipped(frame_data, row_idx, col_idx)
+    _stage_finish(stage_timings, "sampling", stage_started)
     return values
 
 
@@ -845,10 +859,14 @@ def _blend_nowcast(
     ksize = 3 if tile_size <= 256 else 5
     model_f = cv2.GaussianBlur(model_f, (ksize, ksize), 0)
 
-    # Build the spatial feather weight: union across all overlapping regions
-    feather = np.zeros(lat_grid.shape, dtype=np.float32)
-    for region in regions_with_data:
-        feather = np.maximum(feather, sample_feather(region.name, lat_grid, lon_grid))
+    # Static per-tile geometry: every animation timestamp for this XYZ tile
+    # uses the same region coverage feather.  Cache the union independently
+    # of frame time so the first nowcast frame pays the sampling cost and the
+    # remaining animation frames reuse the same read-only array.
+    feather = _tile_feather_union(
+        tuple(region.name for region in regions_with_data),
+        z, x, y, tile_size, pad,
+    )
 
     # Pixels where the model is dry must not drag real radar echoes
     # below the display noise floor.  Model pixel value 0 encodes
@@ -882,6 +900,58 @@ def _blend_nowcast(
         blend_weight,
         pixel_threshold,
     )
+
+
+@lru_cache(maxsize=64)
+def _cached_tile_feather_union(
+    sampler,
+    region_names: tuple[str, ...],
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    pad: int,
+) -> np.ndarray:
+    """Return one static radar-feather union for a tile.
+
+    ``sampler`` keeps monkeypatched/test samplers from sharing stale
+    entries while production uses one stable function for the worker life.
+    The 64-entry cap costs about 68 MiB at the largest current 512px padded
+    shape and covers more than a typical visible viewport.
+    """
+    if pad > 0:
+        lat_grid, lon_grid = tile_pixel_latlons_padded(
+            z, x, y, tile_size, pad,
+        )
+    else:
+        lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
+    feather = np.zeros(lat_grid.shape, dtype=np.float32)
+    for region_name in region_names:
+        np.maximum(
+            feather,
+            sampler(region_name, lat_grid, lon_grid),
+            out=feather,
+        )
+    feather.flags.writeable = False
+    return feather
+
+
+def _tile_feather_union(
+    region_names: tuple[str, ...],
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    pad: int,
+) -> np.ndarray:
+    return _cached_tile_feather_union(
+        sample_feather, region_names, z, x, y, tile_size, pad,
+    )
+
+
+def clear_tile_feather_cache() -> None:
+    """Release cached static nowcast feather arrays under memory pressure."""
+    _cached_tile_feather_union.cache_clear()
 
 
 def _bilinear_sample(

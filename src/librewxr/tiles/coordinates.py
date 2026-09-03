@@ -11,6 +11,8 @@ from librewxr.config import settings
 from librewxr.data.coord_store import (
     CoordStore,
     KIND_FRACTIONAL,
+    KIND_FRACTIONAL_MASKED,
+    KIND_FRACTIONAL_MASKED_PAD,
     KIND_FRACTIONAL_PAD,
     KIND_INDICES,
     KIND_INDICES_PAD,
@@ -598,6 +600,155 @@ def region_pixel_indices_fractional_padded(
     )
 
 
+def _compute_region_pixel_indices_fractional_masked(
+    region: RegionDef,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = 256,
+    pad: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build clipped fractional coordinates with an OOB sentinel.
+
+    The historical smooth path computed the same projection twice: once as
+    rounded integer indices solely to discover out-of-bounds pixels, then
+    again as fractional coordinates for bilinear sampling.  This variant
+    derives the legacy rounded-index validity mask from the un-clipped
+    fractional grids and stores invalid pixels as ``-1.0`` in both arrays.
+    The masked bilinear sampler can therefore preserve the exact zero-border
+    semantics without retaining a second pair of full-size integer arrays.
+    """
+    n = 2**z
+    cx = np.arange(-pad, tile_size + pad, dtype=np.float64) + 0.5
+    cy = np.arange(-pad, tile_size + pad, dtype=np.float64) + 0.5
+
+    lon = (x + cx / tile_size) / n * 360.0 - 180.0
+    lat_rad = np.arctan(
+        np.sinh(math.pi * (1 - 2 * (y + cy / tile_size) / n))
+    )
+    lat = np.degrees(lat_rad)
+
+    if region.proj == "laea":
+        col_grid, row_grid = _laea_pixel_coords(lon, lat, region)
+        row_nearest = np.rint(row_grid)
+        col_nearest = np.rint(col_grid)
+        valid = (
+            (row_nearest >= 0)
+            & (row_nearest < region.height)
+            & (col_nearest >= 0)
+            & (col_nearest < region.width)
+        )
+        row_grid = np.clip(row_grid, 0, region.height - 1).astype(np.float32)
+        col_grid = np.clip(col_grid, 0, region.width - 1).astype(np.float32)
+    elif region.proj == "tmerc":
+        col_grid, row_grid = _tmerc_pixel_coords(lon, lat, region)
+        row_nearest = np.rint(row_grid)
+        col_nearest = np.rint(col_grid)
+        valid = (
+            (row_nearest >= 0)
+            & (row_nearest < region.height)
+            & (col_nearest >= 0)
+            & (col_nearest < region.width)
+        )
+        row_grid = np.clip(row_grid, 0, region.height - 1).astype(np.float32)
+        col_grid = np.clip(col_grid, 0, region.width - 1).astype(np.float32)
+    else:
+        col_f = (lon - region.west) / region.pixel_size
+        row_f = (region.north - lat) / region._ps_y
+        row_nearest = np.rint(row_f)
+        col_nearest = np.rint(col_f)
+        valid = (
+            ((row_nearest >= 0) & (row_nearest < region.height))[:, None]
+            & ((col_nearest >= 0) & (col_nearest < region.width))[None, :]
+        )
+        col_grid, row_grid = np.meshgrid(
+            np.clip(col_f, 0, region.width - 1).astype(np.float32),
+            np.clip(row_f, 0, region.height - 1).astype(np.float32),
+        )
+
+    # Match _compute_region_pixel_indices exactly: a pixel is outside when
+    # its nearest integer sample (np.rint, including ties-to-even) falls
+    # beyond the source grid.  Keep this check in float64 before the final
+    # float32 conversion so edge decisions remain byte-identical.
+    row_grid[~valid] = -1.0
+    col_grid[~valid] = -1.0
+    row_grid.flags.writeable = False
+    col_grid.flags.writeable = False
+    return row_grid, col_grid
+
+
+@lru_cache(maxsize=settings.coord_cache_size)
+def region_pixel_indices_fractional_masked(
+    region: RegionDef, z: int, x: int, y: int, tile_size: int = 256,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fractional coordinates whose ``-1`` entries render as transparent."""
+    store = _get_store()
+    if store is not None:
+        arr = _try_open(
+            store, KIND_FRACTIONAL_MASKED, region.name, z, x, y, tile_size, 0,
+            expected_shape=(2, tile_size, tile_size), dtype=np.float32,
+        )
+        if arr is not None:
+            return arr[0], arr[1]
+        row_grid, col_grid = _compute_region_pixel_indices_fractional_masked(
+            region, z, x, y, tile_size,
+        )
+        _try_publish(
+            store, KIND_FRACTIONAL_MASKED, region.name, z, x, y, tile_size, 0,
+            (row_grid, col_grid),
+        )
+        arr = _try_open(
+            store, KIND_FRACTIONAL_MASKED, region.name, z, x, y, tile_size, 0,
+            expected_shape=(2, tile_size, tile_size), dtype=np.float32,
+        )
+        if arr is not None:
+            return arr[0], arr[1]
+        return row_grid, col_grid
+    return _compute_region_pixel_indices_fractional_masked(
+        region, z, x, y, tile_size,
+    )
+
+
+@lru_cache(maxsize=settings.coord_cache_size)
+def region_pixel_indices_fractional_masked_padded(
+    region: RegionDef,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int = 256,
+    pad: int = 8,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Padded form of :func:`region_pixel_indices_fractional_masked`."""
+    out_size = tile_size + 2 * pad
+    store = _get_store()
+    if store is not None:
+        arr = _try_open(
+            store, KIND_FRACTIONAL_MASKED_PAD, region.name,
+            z, x, y, tile_size, pad,
+            expected_shape=(2, out_size, out_size), dtype=np.float32,
+        )
+        if arr is not None:
+            return arr[0], arr[1]
+        row_grid, col_grid = _compute_region_pixel_indices_fractional_masked(
+            region, z, x, y, tile_size, pad,
+        )
+        _try_publish(
+            store, KIND_FRACTIONAL_MASKED_PAD, region.name,
+            z, x, y, tile_size, pad, (row_grid, col_grid),
+        )
+        arr = _try_open(
+            store, KIND_FRACTIONAL_MASKED_PAD, region.name,
+            z, x, y, tile_size, pad,
+            expected_shape=(2, out_size, out_size), dtype=np.float32,
+        )
+        if arr is not None:
+            return arr[0], arr[1]
+        return row_grid, col_grid
+    return _compute_region_pixel_indices_fractional_masked(
+        region, z, x, y, tile_size, pad,
+    )
+
+
 def tile_overlaps_region(region: RegionDef, z: int, x: int, y: int) -> bool:
     """Check if a tile has any overlap with a region's coverage area."""
     tw, ts, te, tn = tile_bounds(z, x, y)
@@ -850,7 +1001,13 @@ def window_origin(
 
 
 def compute_blur_radius(
-    region: RegionDef, z: int, x: int, y: int, tile_size: int
+    region: RegionDef,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    *,
+    fractional_coordinates: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> float:
     """Pick a Gaussian blur radius matched to the visible region pixel size.
 
@@ -868,8 +1025,23 @@ def compute_blur_radius(
     base = settings.smooth_radius
     if base <= 0:
         return 0.0
-    row_f, col_f = region_pixel_indices_fractional(region, z, x, y, tile_size)
+    if fractional_coordinates is None:
+        row_f, col_f = region_pixel_indices_fractional(
+            region, z, x, y, tile_size,
+        )
+    else:
+        row_f, col_f = fractional_coordinates
     cy = cx = tile_size // 2
+    # Masked coordinates use -1 at the source-grid boundary.  The legacy
+    # clipped grid produced a zero derivative there and therefore returned
+    # the base radius; preserve that decision when any stencil point is OOB.
+    if (
+        row_f[cy - 1, cx] < 0
+        or row_f[cy + 1, cx] < 0
+        or col_f[cy, cx - 1] < 0
+        or col_f[cy, cx + 1] < 0
+    ):
+        return base
     drow = abs(float(row_f[cy + 1, cx] - row_f[cy - 1, cx])) / 2.0
     dcol = abs(float(col_f[cy, cx + 1] - col_f[cy, cx - 1])) / 2.0
     if drow < 1e-6 or dcol < 1e-6:
@@ -914,6 +1086,9 @@ def warm_coordinate_caches(
                 for region in regions:
                     region_pixel_indices(region, z, x, y, tile_size)
                     region_pixel_indices_fractional(region, z, x, y, tile_size)
+                    region_pixel_indices_fractional_masked(
+                        region, z, x, y, tile_size,
+                    )
                     warmed += 1
                 # Derive the pad exactly like the render path (smooth=True
                 # default) from the finest overlapping region, then warm the
@@ -925,6 +1100,9 @@ def warm_coordinate_caches(
                     for region in regions:
                         region_pixel_indices_padded(region, z, x, y, tile_size, pad)
                         region_pixel_indices_fractional_padded(region, z, x, y, tile_size, pad)
+                        region_pixel_indices_fractional_masked_padded(
+                            region, z, x, y, tile_size, pad,
+                        )
     return warmed
 
 
@@ -937,6 +1115,8 @@ ALL_CACHES = [
     region_pixel_indices_padded,
     region_pixel_indices_fractional,
     region_pixel_indices_fractional_padded,
+    region_pixel_indices_fractional_masked,
+    region_pixel_indices_fractional_masked_padded,
     tile_pixel_latlons,
     tile_pixel_latlons_padded,
 ]
@@ -953,6 +1133,9 @@ _CACHE_ENTRY_BYTES = {
     region_pixel_indices_fractional: 2 * 4 * 256 * 256,
     # region_pixel_indices_fractional_padded: 2 × float32 × 272 × 272
     region_pixel_indices_fractional_padded: 2 * 4 * 272 * 272,
+    # Masked fractional coordinates use the same two float32 planes.
+    region_pixel_indices_fractional_masked: 2 * 4 * 256 * 256,
+    region_pixel_indices_fractional_masked_padded: 2 * 4 * 272 * 272,
     # tile_pixel_latlons: 2 × float32 × 256 × 256
     tile_pixel_latlons: 2 * 4 * 256 * 256,
     # tile_pixel_latlons_padded: 2 × float32 × 272 × 272

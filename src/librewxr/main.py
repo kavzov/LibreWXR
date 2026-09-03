@@ -99,10 +99,14 @@ def _hold_mask_save_task(app: FastAPI, task: asyncio.Task) -> None:
 
 
 def _clear_coord_caches() -> None:
-    """Clear all coordinate LRU caches."""
+    """Clear all static per-tile geometry LRU caches."""
     for fn in ALL_CACHES:
         fn.cache_clear()
-    logger.info("Coordinate caches cleared by memory monitor")
+    # Imported lazily to keep main -> routes -> renderer initialization free
+    # of a new module-level cycle.
+    from librewxr.tiles.renderer import clear_tile_feather_cache
+    clear_tile_feather_cache()
+    logger.info("Coordinate/feather caches cleared by memory monitor")
 
 
 async def _worker_pulse_loop(stop: asyncio.Event, cache_dir: Path) -> None:

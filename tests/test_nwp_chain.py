@@ -225,3 +225,21 @@ class TestNWPChain:
 
         sampled = NWPChain([regional, global_fallback]).sample(lat, lon)
         np.testing.assert_array_equal(sampled, np.array([100, 175, 200], dtype=np.uint8))
+
+    def test_single_global_precipitation_bypasses_feather_compositor(self):
+        lat = np.zeros((3, 4), dtype=np.float32)
+        lon = np.ones((3, 4), dtype=np.float32)
+        source = FakeFieldSource(
+            "global",
+            {WeatherField.PRECIPITATION},
+            {WeatherField.PRECIPITATION: 42.0},
+            legacy_value=137,
+        )
+        source.global_catch_all = True
+        source.feather_mask = lambda *_args: (_ for _ in ()).throw(
+            AssertionError("global fast path must not allocate a feather mask")
+        )
+
+        sampled = NWPChain([source]).sample(lat, lon, timestamp=1700000000)
+
+        np.testing.assert_array_equal(sampled, np.full(lat.shape, 137, dtype=np.uint8))
