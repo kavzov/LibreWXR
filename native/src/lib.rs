@@ -278,6 +278,74 @@ sample_function!(sample_u16, u16);
 temporal_function!(sample_temporal_i16, i16);
 temporal_function!(sample_temporal_u16, u16);
 
+#[pyfunction]
+#[pyo3(signature = (frame, r0, r1, c0, c1, dr, dc, valid, bilinear=true))]
+#[allow(clippy::too_many_arguments)]
+fn sample_precipitation_u8<'py>(
+    py: Python<'py>,
+    frame: PyReadonlyArray2<'py, u8>,
+    r0: PyReadonlyArray2<'py, i32>,
+    r1: PyReadonlyArray2<'py, i32>,
+    c0: PyReadonlyArray2<'py, i32>,
+    c1: PyReadonlyArray2<'py, i32>,
+    dr: PyReadonlyArray2<'py, f32>,
+    dc: PyReadonlyArray2<'py, f32>,
+    valid: PyReadonlyArray2<'py, bool>,
+    bilinear: bool,
+) -> PyResult<Bound<'py, PyArray2<u8>>> {
+    let (frame, height, width) = frame_slice(&frame, "frame")?;
+    let plan = plan_from_arrays(&r0, &r1, &c0, &c1, &dr, &dc, &valid)?;
+    let result = py
+        .allow_threads(|| {
+            let mut output = Vec::with_capacity(plan.valid.len());
+            for index in 0..plan.valid.len() {
+                if !plan.valid[index] {
+                    output.push(0);
+                    continue;
+                }
+                let indexes = [
+                    checked_index(plan.r0[index], plan.c0[index], height, width)?,
+                    checked_index(plan.r0[index], plan.c1[index], height, width)?,
+                    checked_index(plan.r1[index], plan.c0[index], height, width)?,
+                    checked_index(plan.r1[index], plan.c1[index], height, width)?,
+                ];
+                let v00 = frame[indexes[0]];
+                if !bilinear {
+                    output.push(v00);
+                    continue;
+                }
+                let v01 = frame[indexes[1]];
+                let v10 = frame[indexes[2]];
+                let v11 = frame[indexes[3]];
+                if v00 == 0 || v01 == 0 || v10 == 0 || v11 == 0 {
+                    output.push(v00);
+                    continue;
+                }
+                let row_weight = plan.dr[index];
+                let col_weight = plan.dc[index];
+                if !row_weight.is_finite()
+                    || !col_weight.is_finite()
+                    || !(0.0..=1.0).contains(&row_weight)
+                    || !(0.0..=1.0).contains(&col_weight)
+                {
+                    return Err(format!(
+                        "sampling weights at output index {index} must be finite and within [0, 1]"
+                    ));
+                }
+                let interpolated = v00 as f32 * (1.0 - row_weight) * (1.0 - col_weight)
+                    + v01 as f32 * (1.0 - row_weight) * col_weight
+                    + v10 as f32 * row_weight * (1.0 - col_weight)
+                    + v11 as f32 * row_weight * col_weight;
+                output.push((interpolated + 0.5).clamp(0.0, 255.0) as u8);
+            }
+            Ok(output)
+        })
+        .map_err(PyIndexError::new_err)?;
+    let array = Array2::from_shape_vec((plan.rows, plan.cols), result)
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    Ok(array.into_pyarray(py))
+}
+
 fn pair_shape<'a>(
     left: &'a PyReadonlyArray2<'a, f32>,
     right: &'a PyReadonlyArray2<'a, f32>,
@@ -616,6 +684,7 @@ fn _librewxr_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sample_u16, module)?)?;
     module.add_function(wrap_pyfunction!(sample_temporal_i16, module)?)?;
     module.add_function(wrap_pyfunction!(sample_temporal_u16, module)?)?;
+    module.add_function(wrap_pyfunction!(sample_precipitation_u8, module)?)?;
     module.add_function(wrap_pyfunction!(sample_derived_humidity, module)?)?;
     module.add_function(wrap_pyfunction!(sample_wind_speed, module)?)?;
     module.add_function(wrap_pyfunction!(sample_radar_bilinear_u8, module)?)?;

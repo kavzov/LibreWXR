@@ -82,6 +82,25 @@ class TestECMWFGrid:
         assert result.shape == (256, 256)
         assert (result == 80).all()
 
+    @pytest.mark.parametrize("bilinear", [False, True])
+    @pytest.mark.parametrize("tile", [(4, 0, 5), (4, 9, 5), (4, 15, 5)])
+    def test_sample_tile_matches_coordinate_sampling(self, bilinear, tile):
+        grid = ECMWFGrid()
+        rng = np.random.default_rng(20260903)
+        precipitation = rng.integers(
+            0, 256, (GRID_HEIGHT, GRID_WIDTH), dtype=np.uint8
+        )
+        precipitation[precipitation < 24] = 0
+        _inject_timestep(grid, precipitation)
+        from librewxr.data.weather_sampling import web_mercator_tile_latlons
+
+        z, x, y = tile
+        lat, lon = web_mercator_tile_latlons(z, x, y, 64, 2)
+        expected = grid.sample(lat, lon, 1000000, bilinear)
+        actual = grid.sample_tile(z, x, y, 1000000, 64, 2, bilinear)
+
+        np.testing.assert_array_equal(actual, expected)
+
     def test_sample_clamps_coordinates(self):
         """Coordinates outside -90/90 or -180/180 should clamp, not crash."""
         grid = ECMWFGrid()

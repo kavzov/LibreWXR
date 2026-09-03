@@ -51,6 +51,30 @@ def _stage_finish(
         timings[name] = timings.get(name, 0) + time.perf_counter_ns() - started_ns
 
 
+def _sample_nwp_tile(
+    nwp_chain,
+    z: int,
+    x: int,
+    y: int,
+    tile_size: int,
+    pad: int,
+    timestamp: int | None,
+    bilinear: bool,
+) -> np.ndarray:
+    """Use reusable tile sampling plans with a compatibility fallback."""
+
+    tile_sampler = getattr(type(nwp_chain), "sample_tile", None)
+    if tile_sampler is not None:
+        return tile_sampler(
+            nwp_chain, z, x, y, timestamp, tile_size, pad, bilinear,
+        )
+    if pad > 0:
+        lat_grid, lon_grid = tile_pixel_latlons_padded(z, x, y, tile_size, pad)
+    else:
+        lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
+    return nwp_chain.sample(lat_grid, lon_grid, timestamp, bilinear=bilinear)
+
+
 def _blur_rgba(rgba: np.ndarray, radius: float) -> np.ndarray:
     """Gaussian-blur all RGBA channels using OpenCV's native kernel.
 
@@ -359,11 +383,8 @@ def _compute_nwp_only_geometry(
         return TileGeometry.transparent(tile_size, fast_path="tier2_mask_nwp_only")
 
     stage_started = _stage_start(stage_timings)
-    lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
-    _stage_finish(stage_timings, "coordinates", stage_started)
-    stage_started = _stage_start(stage_timings)
-    values = nwp_chain.sample(
-        lat_grid, lon_grid, frame_timestamp, bilinear=smooth,
+    values = _sample_nwp_tile(
+        nwp_chain, z, x, y, tile_size, 0, frame_timestamp, smooth,
     )
     _stage_finish(stage_timings, "sampling", stage_started)
 
@@ -380,6 +401,9 @@ def _compute_nwp_only_geometry(
 
     snow_mask = None
     if snow:
+        stage_started = _stage_start(stage_timings)
+        lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
+        _stage_finish(stage_timings, "coordinates", stage_started)
         stage_started = _stage_start(stage_timings)
         snow_mask = nwp_chain.get_snow_mask(lat_grid, lon_grid, frame_timestamp)
         _stage_finish(stage_timings, "snow", stage_started)
@@ -814,8 +838,8 @@ def _fill_ecmwf_fallback(
     if not uncovered.any():
         return values
 
-    nwp_values = nwp_chain.sample(
-        lat_grid, lon_grid, frame_timestamp, bilinear=smooth,
+    nwp_values = _sample_nwp_tile(
+        nwp_chain, z, x, y, tile_size, pad, frame_timestamp, smooth,
     )
 
     result = values.copy()
@@ -851,14 +875,9 @@ def _blend_nowcast(
     the radar weight decays instead of being diluted away, and the
     scaled intensity gradient survives (issue #24).
     """
-    if pad > 0:
-        lat_grid, lon_grid = tile_pixel_latlons_padded(z, x, y, tile_size, pad)
-    else:
-        lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
-
     # Sample NWP for ALL pixels (not just uncovered)
-    model_values = nwp_chain.sample(
-        lat_grid, lon_grid, frame_timestamp, bilinear=smooth,
+    model_values = _sample_nwp_tile(
+        nwp_chain, z, x, y, tile_size, pad, frame_timestamp, smooth,
     )
 
     # Soften the model values before blending to reduce spatial mismatch

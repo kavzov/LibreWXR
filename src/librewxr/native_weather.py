@@ -336,6 +336,58 @@ def sample_temporal_bilinear(
     return result.reshape(plan.shape)
 
 
+def sample_precipitation_regular_grid(
+    frame: np.ndarray,
+    plan: SamplingPlan,
+    *,
+    bilinear: bool = True,
+    implementation: Implementation | None = None,
+) -> np.ndarray:
+    """Sample encoded precipitation with the legacy zero-aware semantics.
+
+    Unlike generic continuous fields, an encoded zero means both the bottom of
+    the reflectivity scale and a dry/missing neighbour. Historical LibreWXR
+    rendering falls back to the north-west sample when any bilinear corner is
+    zero; retaining that rule keeps the tile-aware path pixel-identical.
+    """
+
+    frame = np.asarray(frame)
+    if frame.ndim != 2 or frame.dtype != np.uint8:
+        raise TypeError("frame must be a two-dimensional uint8 array")
+    if not frame.flags.c_contiguous:
+        raise ValueError("frame must be C-contiguous")
+    _validate_plan(plan)
+    _validate_bounds(frame, plan)
+    if active_implementation(implementation) == "rust":
+        return _native.sample_precipitation_u8(
+            frame,
+            *_native_arguments(plan),
+            bilinear,
+        ).reshape(plan.shape)
+
+    v00 = frame[plan.r0, plan.c0]
+    if not bilinear:
+        result = v00.copy()
+        result[~plan.valid] = 0
+        return result
+    v01 = frame[plan.r0, plan.c1]
+    v10 = frame[plan.r1, plan.c0]
+    v11 = frame[plan.r1, plan.c1]
+    any_zero = (v00 == 0) | (v01 == 0) | (v10 == 0) | (v11 == 0)
+    row_weight = plan.dr
+    col_weight = plan.dc
+    interpolated = (
+        v00.astype(np.float32) * (1.0 - row_weight) * (1.0 - col_weight)
+        + v01.astype(np.float32) * (1.0 - row_weight) * col_weight
+        + v10.astype(np.float32) * row_weight * (1.0 - col_weight)
+        + v11.astype(np.float32) * row_weight * col_weight
+    )
+    result = np.where(any_zero, v00, interpolated + 0.5)
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    result[~plan.valid] = 0
+    return result
+
+
 def sample_derived_humidity(
     temperature: np.ndarray,
     dewpoint: np.ndarray,

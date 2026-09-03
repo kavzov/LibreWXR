@@ -39,6 +39,7 @@ from librewxr.native_weather import (
     ensure_native_render_available,
     sample_bilinear_regular_grid,
     sample_derived_humidity,
+    sample_precipitation_regular_grid,
     sample_temporal_bilinear,
     sample_wind_speed,
 )
@@ -1256,6 +1257,40 @@ class ECMWFGrid:
             True,
         )
 
+    def precipitation_sampling_plan(
+        self,
+        z: int,
+        x: int,
+        y: int,
+        tile_size: int = 256,
+        padding: int = 0,
+    ) -> SamplingPlan:
+        """Return legacy-compatible precipitation geometry for one XYZ tile.
+
+        The historical precipitation sampler clamps at the eastern grid edge;
+        generic continuous fields wrap there. Keep those cache entries distinct
+        so the optimized path remains pixel-identical at the antimeridian.
+        """
+
+        return cached_regular_tile_sampling_plan(
+            self.sampling_grid_identity,
+            self._grid_version,
+            z,
+            x,
+            y,
+            tile_size,
+            padding,
+            "regular_latlon",
+            WEST,
+            NORTH,
+            PIXEL_SIZE,
+            PIXEL_SIZE,
+            GRID_WIDTH,
+            GRID_HEIGHT,
+            False,
+            True,
+        )
+
     def _sample_physical_frame(
         self,
         frame: WeatherFrame,
@@ -1365,17 +1400,49 @@ class ECMWFGrid:
         """Sample one tile without materialising an interpolated global frame."""
 
         normalized = WeatherField(field)
-        plan = self.sampling_plan(z, x, y, tile_size, padding)
         if normalized is WeatherField.PRECIPITATION:
-            # Precipitation retains its legacy nearest-time semantics. Generic
-            # continuous weather layers use the optimized plan path above.
-            lat, lon = web_mercator_tile_latlons(z, x, y, tile_size, padding)
+            plan = self.precipitation_sampling_plan(
+                z, x, y, tile_size, padding
+            )
             return decode_field(
                 normalized,
-                self.sample(lat, lon, timestamp, bilinear),
+                self.sample_tile(
+                    z, x, y, timestamp, tile_size, padding, bilinear,
+                    plan=plan,
+                ),
             )
+        plan = self.sampling_plan(z, x, y, tile_size, padding)
         return self._sample_field_with_plan(
             normalized, plan, timestamp, bilinear
+        )
+
+    def sample_tile(
+        self,
+        z: int,
+        x: int,
+        y: int,
+        timestamp: int | None = None,
+        tile_size: int = 256,
+        padding: int = 0,
+        bilinear: bool = False,
+        *,
+        plan: SamplingPlan | None = None,
+    ) -> np.ndarray:
+        """Return encoded precipitation using reusable XYZ sampling geometry."""
+
+        frames = self._timesteps
+        ts = self._nearest_from(self._precip_timestamps(frames), timestamp)
+        shape = (tile_size + 2 * padding, tile_size + 2 * padding)
+        if ts is None:
+            return np.zeros(shape, dtype=np.uint8)
+        if plan is None:
+            plan = self.precipitation_sampling_plan(
+                z, x, y, tile_size, padding
+            )
+        return sample_precipitation_regular_grid(
+            frames[ts].field(WeatherField.PRECIPITATION),
+            plan,
+            bilinear=bilinear,
         )
 
     def sample(

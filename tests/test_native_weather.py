@@ -22,6 +22,7 @@ from librewxr.native_weather import (
     encode_radar_png,
     sample_radar_bilinear,
     sample_bilinear_regular_grid,
+    sample_precipitation_regular_grid,
     sample_derived_humidity,
     sample_temporal_bilinear,
     sample_wind_speed,
@@ -233,6 +234,30 @@ def test_native_radar_bilinear_matches_numpy(require_native):
     np.testing.assert_array_equal(rust, python)
     assert rust[0, 0] == 0
     assert rust[0, 1] == 0
+
+
+@pytest.mark.parametrize("bilinear", [False, True])
+def test_native_precipitation_plan_matches_numpy(require_native, bilinear):
+    if not hasattr(native_weather._native, "sample_precipitation_u8"):
+        pytest.skip("installed native extension predates precipitation sampler")
+    rng = np.random.default_rng(424242)
+    frame = rng.integers(0, 256, (37, 72), dtype=np.uint8)
+    frame[frame < 32] = 0
+    latitude = np.linspace(84.0, -84.0, 31, dtype=np.float64)[:, None]
+    longitude = np.linspace(-179.0, 179.0, 43, dtype=np.float64)[None, :]
+    plan = _plan(
+        np.broadcast_to(latitude, (31, 43)),
+        np.broadcast_to(longitude, (31, 43)),
+    )
+
+    python = sample_precipitation_regular_grid(
+        frame, plan, bilinear=bilinear, implementation="python"
+    )
+    rust = sample_precipitation_regular_grid(
+        frame, plan, bilinear=bilinear, implementation="rust"
+    )
+
+    np.testing.assert_array_equal(rust, python)
 
 
 def test_native_radar_nowcast_blend_matches_numpy(require_native):

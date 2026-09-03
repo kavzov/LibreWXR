@@ -562,6 +562,48 @@ class NWPChain:
         with np.errstate(invalid="ignore"):
             return np.clip(out + 0.5, 0, 255).astype(np.uint8)
 
+    def sample_tile(
+        self,
+        z: int,
+        x: int,
+        y: int,
+        timestamp: int | None = None,
+        tile_size: int = 256,
+        padding: int = 0,
+        bilinear: bool = False,
+    ) -> np.ndarray:
+        """Sample encoded precipitation, reusing source tile geometry when safe."""
+
+        participants = [
+            source
+            for source in self._sources
+            if (
+                source.has_data_at(timestamp)
+                if timestamp is not None else source.has_data()
+            )
+        ]
+        if len(participants) == 1 and getattr(
+            participants[0], "global_catch_all", False
+        ):
+            tile_sampler = getattr(participants[0], "sample_tile", None)
+            if tile_sampler is not None:
+                sampled = np.asarray(
+                    tile_sampler(
+                        z, x, y, timestamp, tile_size, padding, bilinear,
+                    ),
+                )
+                expected = (tile_size + 2 * padding, tile_size + 2 * padding)
+                if sampled.shape != expected or sampled.dtype != np.uint8:
+                    raise ValueError(
+                        f"{participants[0].name} returned tile layout "
+                        f"{sampled.shape}/{sampled.dtype}, expected "
+                        f"{expected}/uint8"
+                    )
+                return sampled
+
+        lat, lon = web_mercator_tile_latlons(z, x, y, tile_size, padding)
+        return self.sample(lat, lon, timestamp, bilinear)
+
     def get_snow_mask(
         self,
         lat: np.ndarray,

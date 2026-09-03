@@ -167,6 +167,7 @@ def cached_regular_tile_sampling_plan(
     width: int,
     height: int,
     wrap_longitude: bool = True,
+    clamp_to_grid: bool = False,
 ) -> SamplingPlan:
     """Return a cached plan keyed by source, geometry, tile, and projection."""
 
@@ -177,7 +178,17 @@ def cached_regular_tile_sampling_plan(
     if projection != "regular_latlon":
         raise ValueError(f"unsupported sampling projection: {projection}")
     lat, lon = web_mercator_tile_latlons(z, x, y, tile_size, padding)
-    return build_regular_sampling_plan(
+    north_overflow = south_overflow = west_overflow = east_overflow = None
+    if clamp_to_grid:
+        south = north - pixel_size_y * (height - 1)
+        east = west + pixel_size_x * (width - 1)
+        north_overflow = lat > north
+        south_overflow = lat < south
+        west_overflow = lon < west
+        east_overflow = lon > east
+        lat = np.clip(lat, south, north)
+        lon = np.clip(lon, west, east)
+    plan = build_regular_sampling_plan(
         lat,
         lon,
         west=west,
@@ -187,6 +198,34 @@ def cached_regular_tile_sampling_plan(
         width=width,
         height=height,
         wrap_longitude=wrap_longitude,
+    )
+    if not clamp_to_grid:
+        return plan
+
+    # Legacy precipitation coordinate sampling clips both neighbours to the
+    # edge when padded pixels extend beyond the global grid. Reproduce that
+    # detail as well as the sampled value: a zero in an otherwise zero-weight
+    # off-edge neighbour changes the historical zero-aware interpolation.
+    r0 = plan.r0.copy()
+    r1 = plan.r1.copy()
+    c0 = plan.c0.copy()
+    c1 = plan.c1.copy()
+    r0[north_overflow] = 0
+    r1[north_overflow] = 0
+    r0[south_overflow] = height - 1
+    r1[south_overflow] = height - 1
+    c0[west_overflow] = 0
+    c1[west_overflow] = 0
+    c0[east_overflow] = width - 1
+    c1[east_overflow] = width - 1
+    return SamplingPlan(
+        r0=r0,
+        r1=r1,
+        c0=c0,
+        c1=c1,
+        dr=plan.dr,
+        dc=plan.dc,
+        valid=plan.valid,
     )
 
 
