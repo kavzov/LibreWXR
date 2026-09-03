@@ -134,6 +134,7 @@ versus the old NWP-source form is roughly the nowcast half.  Factor 4
 | `LIBREWXR_TILE_CACHE_MB` | Tile cache per worker; the 128 MB multi-mode default is fine for these tiers. |
 | `LIBREWXR_NWP_FETCH_CONCURRENCY` | Parallel NWP grid decodes in the pipeline; drives decode-time RAM bursts. |
 | `LIBREWXR_COORD_STORE_MB` | Disk budget for the shared coordinate store (not RAM). |
+| `LIBREWXR_POOL_RENDER_MEMORY_RESERVATION` | Optional soft/cgroup `memory.low` protection per renderer container; `0` leaves it disabled. |
 | `LIBREWXR_CACHE_DIR` | Shared cache directory - required for multi mode. Put it on SSD. |
 | `LIBREWXR_MEMORY` | Memory limit for the single-mode container; `compose default`. |
 | `LIBREWXR_PIPELINE_MEMORY` | Memory limit for the pipeline sidecar (multi mode); `12G` compose default. |

@@ -31,6 +31,11 @@ x-pool-renderer: &pool-renderer
       limits:
         memory: ${LIBREWXR_POOL_RENDER_MEMORY:-6G}
         cpus: "${LIBREWXR_POOL_RENDER_CPUS:-4.5}"
+      # Optional cgroup-v2 memory.low protection for latency-sensitive
+      # renderer pages during pipeline I/O bursts. Keep zero by default so
+      # operators explicitly divide protected RAM across their host.
+      reservations:
+        memory: ${LIBREWXR_POOL_RENDER_MEMORY_RESERVATION:-0}
   ulimits:
     nofile:
       soft: 65536
