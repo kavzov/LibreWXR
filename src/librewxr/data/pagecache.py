@@ -14,11 +14,119 @@ any worker touches them.
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _RECORD_NAME = "primed_memmaps.json"
+_COORD_RECORD_NAME = "coord_pagecache_prime.json"
+_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def _boot_id() -> str:
+    """Best-effort host boot identifier used to invalidate stale records."""
+    try:
+        return _BOOT_ID_PATH.read_text().strip()
+    except OSError:
+        return "unknown"
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    """Best-effort atomic JSON write for tiny page-cache state files."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def coord_pagecache_prime_stats(cache_dir: str | Path) -> dict | None:
+    """Return the last coordinate-store priming record, if available."""
+    try:
+        payload = json.loads((Path(cache_dir) / _COORD_RECORD_NAME).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload["current_boot"] = payload.get("boot_id") == _boot_id()
+    return payload
+
+
+def prime_coord_store(
+    cache_dir: str | Path,
+    min_interval_seconds: float = 1800.0,
+) -> dict:
+    """Advise the kernel to retain shared coordinate arrays in page cache.
+
+    Unlike frame memmaps, coordinate entries are long-lived and may keep the
+    same mtime across process and host restarts.  The persistent record is
+    therefore keyed by the host boot id and expires periodically: a reboot or
+    an elapsed interval re-advises every current ``coord/**/*.npy`` entry.
+    ``posix_fadvise(WILLNEED)`` is non-blocking best-effort I/O; failures are
+    counted and never break a pipeline cycle.
+    """
+    root = Path(cache_dir)
+    record_path = root / _COORD_RECORD_NAME
+    now = time.time()
+    boot_id = _boot_id()
+    try:
+        previous = json.loads(record_path.read_text())
+    except (OSError, ValueError):
+        previous = {}
+    if not isinstance(previous, dict):
+        previous = {}
+
+    last_run = previous.get("completed_at")
+    if (
+        previous.get("boot_id") == boot_id
+        and isinstance(last_run, (int, float))
+        and now - float(last_run) < max(0.0, min_interval_seconds)
+    ):
+        return {**previous, "skipped": "interval"}
+
+    started = time.monotonic()
+    files = 0
+    bytes_ = 0
+    errors = 0
+    supported = hasattr(os, "posix_fadvise")
+    coord_root = root / "coord"
+    paths = coord_root.rglob("*.npy") if coord_root.is_dir() else ()
+    for path in paths:
+        try:
+            st = path.stat()
+            if not supported:
+                continue
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(
+                    fd,
+                    0,
+                    0,
+                    getattr(os, "POSIX_FADV_WILLNEED", 3),
+                )
+            finally:
+                os.close(fd)
+            files += 1
+            bytes_ += st.st_size
+        except OSError:
+            errors += 1
+
+    payload = {
+        "status": "ok" if supported and errors == 0 else (
+            "partial" if supported else "unsupported"
+        ),
+        "boot_id": boot_id,
+        "completed_at": now,
+        "files": files,
+        "bytes": bytes_,
+        "errors": errors,
+        "duration_ms": round((time.monotonic() - started) * 1000, 1),
+    }
+    _write_json_atomic(record_path, payload)
+    return payload
 
 
 def _collect_memmap_files(store_payload: dict) -> set[Path]:

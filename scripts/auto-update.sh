@@ -87,6 +87,24 @@ pick_compose() {
         log "error: neither 'docker compose' nor 'docker-compose' is available"
         exit 1
     fi
+
+    # The renderer pool is an explicit optional overlay. Read the flag from
+    # the process environment first, then from .env without sourcing it. The
+    # host override stays last so loopback ports and network aliases win.
+    local pool_enabled="${LIBREWXR_RENDER_POOL_ENABLED:-}"
+    if [[ -z "${pool_enabled}" && -f .env ]]; then
+        pool_enabled=$(awk -F= '
+            /^LIBREWXR_RENDER_POOL_ENABLED=/ {
+                sub(/^[^=]*=/, ""); gsub(/[[:space:]]/, ""); print; exit
+            }
+        ' .env)
+    fi
+    if [[ "${pool_enabled}" == "1" || "${pool_enabled}" == "true" ]]; then
+        COMPOSE+=(-f docker-compose.yml -f docker-compose.pool.yml)
+        if [[ -f docker-compose.override.yml ]]; then
+            COMPOSE+=(-f docker-compose.override.yml)
+        fi
+    fi
 }
 
 # Append any LIBREWXR_* variables that exist in .env.example but are

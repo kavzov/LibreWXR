@@ -15,10 +15,12 @@ from collections import Counter
 from threading import Lock
 
 RENDER_STAGE_NAMES = (
+    "compute_queue",
     "coordinates",
     "sampling",
     "nwp_blend",
     "snow",
+    "present_queue",
     "colorize",
     "blur",
     "encode",

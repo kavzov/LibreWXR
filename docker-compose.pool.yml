@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Optional multi-mode renderer pool. Use together with docker-compose.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.pool.yml up -d
+
+x-pool-renderer: &pool-renderer
+  profiles: ["multi"]
+  build: .
+  command: ["python", "-m", "librewxr.main"]
+  env_file:
+    - .env
+  environment: &pool-renderer-environment
+    LIBREWXR_CACHE_DIR: /data/cache
+    LIBREWXR_MEMORY_LIMIT_MB: ${LIBREWXR_POOL_RENDER_MEMORY_LIMIT_MB:-5120}
+    LIBREWXR_RENDER_ONLY: "1"
+    LIBREWXR_WORKERS: ${LIBREWXR_POOL_WORKERS:-3}
+    LIBREWXR_LOG_FILE: /logs/librewxr.log
+  volumes:
+    - librewxr-cache:/data/cache
+    - ./logs:/logs
+  depends_on:
+    - pipeline
+  restart: unless-stopped
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  deploy:
+    resources:
+      limits:
+        memory: ${LIBREWXR_POOL_RENDER_MEMORY:-6G}
+        cpus: "${LIBREWXR_POOL_RENDER_CPUS:-4.5}"
+  ulimits:
+    nofile:
+      soft: 65536
+      hard: 65536
+
+services:
+  renderer:
+    ports: !reset []
+    environment:
+      <<: *pool-renderer-environment
+      LIBREWXR_LOG_FILE: /logs/librewxr-primary.log
+    deploy:
+      resources:
+        limits:
+          memory: ${LIBREWXR_POOL_RENDER_MEMORY:-6G}
+          cpus: "${LIBREWXR_POOL_RENDER_CPUS:-4.5}"
+
+  renderer-secondary:
+    <<: *pool-renderer
+    environment:
+      <<: *pool-renderer-environment
+      LIBREWXR_LOG_FILE: /logs/librewxr-secondary.log
+
+  renderer-router:
+    profiles: ["multi"]
+    image: ${LIBREWXR_NGINX_IMAGE:-docker.io/library/nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de}
+    command: ["nginx", "-g", "daemon off;"]
+    ports:
+      - "${LIBREWXR_PORT:-8080}:8080"
+    volumes:
+      - ./deploy/renderer-pool.nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - renderer
+      - renderer-secondary
+    restart: unless-stopped
+    stop_grace_period: 15s
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/pool-healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.50"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

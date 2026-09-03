@@ -693,6 +693,14 @@ The compose file caps each container using these env vars (not LIBREWXR_* settin
 | `LIBREWXR_PIPELINE_MEMORY` | `12G` | `multi` (the pipeline container) |
 | `LIBREWXR_RENDER_MEMORY` | `18G` | `multi` (the renderer container) |
 
+The optional `docker-compose.pool.yml` overlay replaces the single renderer
+endpoint with two renderer containers and a `least_conn` router. Its limits
+are per instance: `LIBREWXR_POOL_WORKERS` (default `3`),
+`LIBREWXR_POOL_RENDER_MEMORY` (`6G`), `LIBREWXR_POOL_RENDER_CPUS` (`4.5`),
+and `LIBREWXR_POOL_RENDER_MEMORY_LIMIT_MB` (`5120`). Set
+`LIBREWXR_RENDER_POOL_ENABLED=true` so `scripts/auto-update.sh` preserves the
+overlay during automatic rebuilds.
+
 Production observation on an 80-core / 32 GB rack in multi mode (32 render workers): ~16 GB total RSS settled across both containers under continuous traffic.
 
 ---
@@ -769,12 +777,23 @@ Seconds uvicorn's master process waits for a worker healthcheck ping before kill
 
 ### `LIBREWXR_PAGECACHE_PRIME_ENABLED`
 
-When `true` (default), the data pipeline primes freshly written memmap frame files (radar, NWP, satellite, nowcast, precip-mask) into the host page cache after each fetch cycle via `posix_fadvise(WILLNEED)`. The host page cache is shared between the pipeline and renderer containers, so render workers serve those frames without cold page faults on slow backing disks. Consumed only by the multi-mode pipeline process; single mode never runs it.
+When `true` (default), the data pipeline primes freshly written memmap frame files (radar, NWP, satellite, nowcast, precip-mask) and periodically re-advises the shared coordinate store into the host page cache via `posix_fadvise(WILLNEED)`. The host page cache is shared between the pipeline and renderer containers, so render workers serve those arrays without cold page faults on slow backing disks. Consumed only by the multi-mode pipeline process; single mode never runs it.
 
 | | |
 |---|---|
 | **Default** | `true` |
 | **Type** | boolean |
+
+### `LIBREWXR_COORD_PAGECACHE_PRIME_INTERVAL`
+
+Minimum seconds between full coordinate-store `WILLNEED` advisory passes. Coordinate entries are long-lived and normally keep the same mtime, so the freshly-written-frame deduplication cannot recover them after page-cache eviction. The persisted record includes the host boot id; a reboot always triggers a new pass regardless of this interval. Set `0` to run after every fetch cycle. The last pass is exposed as `coord_pagecache_prime` in `/health`.
+
+| | |
+|---|---|
+| **Default** | `1800` |
+| **Type** | integer |
+| **Minimum** | `0` |
+| **Unit** | seconds |
 
 ---
 

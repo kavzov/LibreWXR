@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Joshua Kimsey
 import asyncio
-import functools
 import json
 import logging
 import math
@@ -44,6 +43,7 @@ from librewxr.colors.weather_palettes import (
     palettes_for_field,
 )
 from librewxr.config import settings
+from librewxr.data.pagecache import coord_pagecache_prime_stats
 from librewxr.data.point_nowcast import build_point_nowcast
 from librewxr.data.store import FrameStore
 from librewxr.data.weather_fields import WeatherField, field_spec
@@ -729,6 +729,10 @@ async def health():
             else {"enabled": False}
         ),
         "coord_caches": coord_cache_stats(),
+        "coord_pagecache_prime": (
+            coord_pagecache_prime_stats(settings.cache_dir)
+            if settings.cache_dir else None
+        ),
         "tile_requests": (
             {"enabled": True, **tile_request_tracker.stats()}
             if tile_request_tracker is not None
@@ -1372,13 +1376,19 @@ async def _present_tile_async(geom, **kwargs) -> tuple[bytes, str]:
     mode leaves ``present_executor`` None and falls back to
     ``asyncio.to_thread`` - byte-identical to the pre-split behaviour.
     """
+    submitted_ns = time.perf_counter_ns()
+
+    def _run_present() -> tuple[bytes, str]:
+        started_ns = time.perf_counter_ns()
+        stage_timings = kwargs.get("stage_timings")
+        if stage_timings is not None:
+            stage_timings["present_queue"] = max(0, started_ns - submitted_ns)
+        return _present_and_hash(geom, **kwargs)
+
     if present_executor is not None:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            present_executor,
-            functools.partial(_present_and_hash, geom, **kwargs),
-        )
-    return await asyncio.to_thread(_present_and_hash, geom, **kwargs)
+        return await loop.run_in_executor(present_executor, _run_present)
+    return await asyncio.to_thread(_run_present)
 
 
 async def _radar_window(
@@ -1822,20 +1832,26 @@ async def radar_tile(
                     async def _compute_once():
                         local_timings: dict[str, int] = {}
                         compute_start = time.perf_counter_ns()
-                        computed = await asyncio.to_thread(
-                            compute_tile_geometry,
-                            frame_regions=frame.regions,
-                            z=z, x=xi, y=yi,
-                            tile_size=tile_size,
-                            smooth=smooth,
-                            snow=snow,
-                            nwp_chain=nwp_chain,
-                            enabled_regions=enabled_regions,
-                            frame_timestamp=timestamp,
-                            nowcast_blend=nowcast_blend,
-                            precip_mask=precip_mask,
-                            stage_timings=local_timings,
-                        )
+                        def _run_compute():
+                            started_ns = time.perf_counter_ns()
+                            local_timings["compute_queue"] = max(
+                                0, started_ns - compute_start,
+                            )
+                            return compute_tile_geometry(
+                                frame_regions=frame.regions,
+                                z=z, x=xi, y=yi,
+                                tile_size=tile_size,
+                                smooth=smooth,
+                                snow=snow,
+                                nwp_chain=nwp_chain,
+                                enabled_regions=enabled_regions,
+                                frame_timestamp=timestamp,
+                                nowcast_blend=nowcast_blend,
+                                precip_mask=precip_mask,
+                                stage_timings=local_timings,
+                            )
+
+                        computed = await asyncio.to_thread(_run_compute)
                         elapsed_ns = time.perf_counter_ns() - compute_start
                         tile_cache.put(geom_key, computed)
                         return computed, elapsed_ns, local_timings

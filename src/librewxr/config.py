@@ -561,6 +561,12 @@ class Settings(BaseSettings):
     # disks (the host page cache is shared between the pipeline and
     # renderer containers).
     pagecache_prime_enabled: bool = True
+    # Pipeline-only: periodically re-advise the long-lived shared coordinate
+    # arrays.  Their mtimes normally never change, so the frame-memmap
+    # mtime-dedupe above is insufficient after page-cache eviction/reboot.
+    # 0 runs on every fetch cycle; positive values bound directory scans and
+    # advisory I/O.  The boot id always invalidates the persisted interval.
+    coord_pagecache_prime_interval: int = Field(default=1800, ge=0)
 
     # WMO CAP Weather Alerts
     alerts_enabled: bool = True

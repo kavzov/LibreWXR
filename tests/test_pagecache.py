@@ -175,3 +175,52 @@ def test_prime_fresh_memmaps_without_stores(tmp_path, monkeypatch):
     )
     assert pagecache.prime_fresh_memmaps({"version": 1, "written_at": 0}, tmp_path) == 0
     assert advised == []
+
+
+def test_prime_coord_store_repeats_after_interval_or_reboot(tmp_path, monkeypatch):
+    coord_dir = tmp_path / "coord" / "ab"
+    coord_dir.mkdir(parents=True)
+    first = coord_dir / "first.npy"
+    second = coord_dir / "second.npy"
+    first.write_bytes(b"x" * 16)
+    second.write_bytes(b"y" * 32)
+
+    opened: list[str] = []
+    next_fd = iter(range(200, 300))
+    monkeypatch.setattr(pagecache, "_boot_id", lambda: "boot-a")
+    monkeypatch.setattr(pagecache.os, "open", lambda path, flags: (
+        opened.append(str(path)) or next(next_fd)
+    ))
+    monkeypatch.setattr(pagecache.os, "close", lambda fd: None)
+    monkeypatch.setattr(pagecache.os, "posix_fadvise", lambda *args: None, raising=False)
+    times = iter([1000.0, 10.0, 10.025, 1010.0, 1020.0, 20.0, 20.010])
+    monkeypatch.setattr(pagecache.time, "time", lambda: next(times))
+    monkeypatch.setattr(pagecache.time, "monotonic", lambda: next(times))
+
+    first_run = pagecache.prime_coord_store(tmp_path, min_interval_seconds=30)
+    assert first_run["files"] == 2
+    assert first_run["bytes"] == 48
+    assert first_run["errors"] == 0
+    assert len(opened) == 2
+
+    skipped = pagecache.prime_coord_store(tmp_path, min_interval_seconds=30)
+    assert skipped["skipped"] == "interval"
+    assert len(opened) == 2
+
+    monkeypatch.setattr(pagecache, "_boot_id", lambda: "boot-b")
+    rebooted = pagecache.prime_coord_store(tmp_path, min_interval_seconds=30)
+    assert rebooted["files"] == 2
+    assert len(opened) == 4
+    stats = pagecache.coord_pagecache_prime_stats(tmp_path)
+    assert stats["current_boot"] is True
+    assert stats["boot_id"] == "boot-b"
+
+
+def test_prime_coord_store_tolerates_missing_store(tmp_path, monkeypatch):
+    monkeypatch.setattr(pagecache, "_boot_id", lambda: "boot-a")
+    monkeypatch.setattr(pagecache.os, "posix_fadvise", lambda *args: None, raising=False)
+    result = pagecache.prime_coord_store(tmp_path, min_interval_seconds=0)
+    assert result["status"] == "ok"
+    assert result["files"] == 0
+    assert result["bytes"] == 0
+    assert pagecache.coord_pagecache_prime_stats(tmp_path)["current_boot"] is True

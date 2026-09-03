@@ -41,7 +41,7 @@ from librewxr.data.master_state import snapshot_state, write_state_snapshot
 from librewxr.data.nowcast import NowcastGenerator, NowcastStore
 from librewxr.data.storm_cells import StormCellGenerator, StormCellStore
 from librewxr.data.nwp_source import NWPChain
-from librewxr.data.pagecache import prime_fresh_memmaps
+from librewxr.data.pagecache import prime_coord_store, prime_fresh_memmaps
 from librewxr.data.precip_mask import PrecipMaskStore
 from librewxr.data.radar_cache import RadarFrameCache
 from librewxr.data.regions import REGIONS
@@ -267,6 +267,28 @@ async def run_pipeline() -> None:
         # enabled/cache_dir and the helper never raises.  The directory
         # scans run in a worker thread so they never block the loop.
         await asyncio.to_thread(prune_shared_coord_store)
+        # Coordinate arrays are long-lived and retain the same mtime across
+        # renderer restarts, so periodically re-advise the current store after
+        # pruning.  This keeps first-touch page faults out of the render queue
+        # without rendering or preselecting any city tiles.
+        if settings.pagecache_prime_enabled:
+            try:
+                coord_prime = await asyncio.to_thread(
+                    prime_coord_store,
+                    cache_dir,
+                    settings.coord_pagecache_prime_interval,
+                )
+                if "skipped" not in coord_prime:
+                    logger.info(
+                        "Coordinate page-cache prime: files=%d bytes=%d "
+                        "errors=%d duration_ms=%.1f",
+                        coord_prime["files"],
+                        coord_prime["bytes"],
+                        coord_prime["errors"],
+                        coord_prime["duration_ms"],
+                    )
+            except Exception:
+                logger.exception("Failed to prime coordinate page cache")
         # The pipeline is the sole pruner of the shared tile store (render
         # workers only invalidate by timestamp / sweep on a full clear);
         # prune full-scans the shard tree so it stays off the event loop.

@@ -213,6 +213,19 @@ pipeline cap, 18 GB render cap). Tune `LIBREWXR_WORKERS` and the
 `LIBREWXR_PIPELINE_MEMORY` / `LIBREWXR_RENDER_MEMORY` env vars in
 `.env` for smaller hardware.
 
+For bursty cold-tile traffic, the optional pool overlay runs two renderer
+containers behind a small `least_conn` router while retaining one shared
+pipeline and cache volume. Its defaults total 9 CPU and 12 GiB across two
+3-worker instances:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.pool.yml up -d
+```
+
+Set `LIBREWXR_RENDER_POOL_ENABLED=true` when using `scripts/auto-update.sh`;
+the helper then includes the pool overlay automatically. Host-specific
+`docker-compose.override.yml` remains last in the merge order.
+
 ### Manual
 
 Requires Python 3.11+.
@@ -678,6 +691,7 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_DESPECKLE_MIN_NEIGHBORS` | `3` | Speckle filter strength (0 = disabled) |
 | `LIBREWXR_WEBP_QUALITY` | `100` | WebP quality (100 = lossless default, 1-99 = lossy) |
 | `LIBREWXR_WARMER_THREADS` | *mode* | Background tile warming pool size (single: 0 = CPU count - 1; multi: 4 sizes the request-executor pool, not warming — warming is single-mode only) |
+| `LIBREWXR_COORD_PAGECACHE_PRIME_INTERVAL` | `1800` | Multi-mode interval in seconds for re-advising existing shared coordinate arrays into the host page cache (0 = every fetch cycle; reboot always re-primes) |
 | `LIBREWXR_WARM_COORD_ZOOM` | *mode* | Background pre-warm of coordinate caches up to this zoom at startup (single: 6; multi: no eager warm; 0 = mode default, negative = disabled, positive = force that zoom) |
 | `LIBREWXR_WARM_OVERVIEW_ZOOM` | `4` | Pre-render overview tiles up to this zoom after each fetch (single mode only; -1 = disable) |
 | **Deployment mode + workers** | | |
@@ -686,6 +700,11 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_WORKERS` | *mode* | Uvicorn worker processes (single: 1; multi: 16) |
 | `LIBREWXR_MEMORY_LIMIT_MB` | `0` | Memory limit in MB (0 = auto-detect from Docker/cgroup) |
 | `LIBREWXR_CACHE_DIR` | *(empty)* | Persistent cache directory. **Required** in multi mode. Empty = in-memory only |
+| `LIBREWXR_RENDER_POOL_ENABLED` | `false` | Make `scripts/auto-update.sh` include the optional two-instance `docker-compose.pool.yml` overlay |
+| `LIBREWXR_POOL_WORKERS` | `3` | Uvicorn workers per renderer instance in pool mode |
+| `LIBREWXR_POOL_RENDER_MEMORY` | `6G` | Memory limit per renderer instance in pool mode |
+| `LIBREWXR_POOL_RENDER_CPUS` | `4.5` | CPU limit per renderer instance in pool mode |
+| `LIBREWXR_POOL_RENDER_MEMORY_LIMIT_MB` | `5120` | Internal pressure threshold per renderer instance |
 | **Multi-mode tile-server split** (set automatically by compose) | | |
 | `LIBREWXR_RENDER_ONLY` | `false` | When `1`, skip fetcher / NWP / satellite init and only render tiles from the snapshot |
 | `LIBREWXR_STATE_POLL_INTERVAL` | `1.0` | Seconds between state.json mtime polls in render-only mode |
