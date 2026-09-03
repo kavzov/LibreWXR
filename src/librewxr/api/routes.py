@@ -298,6 +298,8 @@ def collect_worker_pulse() -> dict:
                 "hits": store_stats["hits"],
                 "misses": store_stats["misses"],
                 "publishes": store_stats["publishes"],
+                "async_pending": store_stats.get("async_pending", 0),
+                "async_skipped": store_stats.get("async_skipped", 0),
             }
     payload["coord"] = coord
 
@@ -424,13 +426,18 @@ def _cluster_health_section() -> dict:
     # across workers, but entries/bytes are a scan of the ONE global on-disk
     # store — every worker sees the same values, so summing would over-count.
     # They come from this worker's live stats instead.
-    store_sums = {"hits": 0, "misses": 0, "publishes": 0}
+    store_sums = {
+        "hits": 0,
+        "misses": 0,
+        "publishes": 0,
+        "async_pending": 0,
+        "async_skipped": 0,
+    }
     for pulse in pulses:
         store_stats = pulse.get("coord", {}).get("store")
         if store_stats:
-            store_sums["hits"] += store_stats["hits"]
-            store_sums["misses"] += store_stats["misses"]
-            store_sums["publishes"] += store_stats["publishes"]
+            for key in store_sums:
+                store_sums[key] += store_stats.get(key, 0)
     try:
         live_store = coord_cache_stats().get("store")
     except Exception:

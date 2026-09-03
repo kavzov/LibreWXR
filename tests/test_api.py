@@ -668,7 +668,7 @@ class TestHealthCluster:
         if coord["store"] is not None:
             assert set(coord["store"]) == {
                 "hits", "misses", "publishes", "entries", "bytes",
-                "budget_bytes", "over_budget",
+                "async_pending", "async_skipped", "budget_bytes", "over_budget",
             }
 
         requests = cluster["requests"]
@@ -717,6 +717,7 @@ class TestHealthCluster:
                 "caches": {},
                 "store": {
                     "hits": 0, "misses": 0, "publishes": 0,
+                    "async_pending": 0, "async_skipped": 0,
                     "entries": 9, "bytes": 9 * 1024 * 1024,
                     "budget_bytes": 16 * 1024 * 1024,
                     "over_budget": False,
@@ -736,7 +737,10 @@ class TestHealthCluster:
                     "caches": {
                         "region_pixel_indices": {"entries": 4, "hits": 10, "misses": 2},
                     },
-                    "store": {"hits": 5, "misses": 1, "publishes": 3},
+                    "store": {
+                        "hits": 5, "misses": 1, "publishes": 3,
+                        "async_pending": 2, "async_skipped": 4,
+                    },
                 },
                 "requests": {
                     "enabled": True,
@@ -779,6 +783,8 @@ class TestHealthCluster:
             assert store["hits"] == 5
             assert store["misses"] == 1
             assert store["publishes"] == 3
+            assert store["async_pending"] == 2
+            assert store["async_skipped"] == 4
             assert store["entries"] == 9
             assert store["bytes"] == 9 * 1024 * 1024
             assert store["budget_bytes"] == 16 * 1024 * 1024
