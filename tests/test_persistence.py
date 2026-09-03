@@ -56,6 +56,9 @@ class TestFrameStorePersistence:
             )
 
         assert await store.get_timestamps() == [1700000600, 1700001200]
+        assert await store.get_retained_timestamps() == [
+            1700000000, 1700000600, 1700001200,
+        ]
         assert await store.frame_count() == 2
         assert await store.retained_frame_count() == 3
         assert await store.get_frame(1700000000) is not None

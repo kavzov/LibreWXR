@@ -272,6 +272,33 @@ class TestFetcherRadarCacheWiring:
         assert (tmp_path / "radar" / "radar_3000_TESTREG.dat").exists()
 
     @pytest.mark.asyncio
+    async def test_persistent_cleanup_keeps_hidden_grace_frame_files(
+        self, tmp_path, small_region
+    ):
+        """Radar cache cleanup must not unlink snapshot grace memmaps."""
+        store = FrameStore(
+            max_frames=2, grace_frames=1, cache_dir=tmp_path,
+        )
+        tile_cache = TileCache(max_mb=1)
+        radar_cache = RadarFrameCache(tmp_path)
+        fetcher, _source = _build_fetcher(
+            store, tile_cache, radar_cache, small_region,
+        )
+
+        for timestamp in (1000, 2000, 3000):
+            await fetcher._fetch_timestamps([(timestamp, "live", 0)])
+
+        assert await store.get_timestamps() == [2000, 3000]
+        assert await store.get_retained_timestamps() == [1000, 2000, 3000]
+        grace_path = tmp_path / "radar" / "1000_TESTREG.dat"
+        assert grace_path.exists()
+        assert store.__getstate__()["frames"][0]["timestamp"] == 1000
+
+        await fetcher._fetch_timestamps([(4000, "live", 0)])
+        assert not grace_path.exists()
+        assert await store.get_retained_timestamps() == [2000, 3000, 4000]
+
+    @pytest.mark.asyncio
     async def test_fetcher_without_radar_cache_does_not_crash(
         self, tmp_path, small_region
     ):

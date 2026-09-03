@@ -942,10 +942,15 @@ class RadarFetcher:
 
         if self._radar_cache is not None and frames_by_ts:
             try:
-                active_ts = await self._store.get_timestamps()
-                self._radar_cache.cleanup(active_ts)
+                # Grace frames are hidden from get_timestamps() so they do not
+                # lengthen public animation/nowcast history, but their memmaps
+                # must survive until the grace window itself evicts them.
+                # Cleaning against only the advertised timestamps unlinks the
+                # files before state snapshot publication can hardlink them.
+                retained_ts = await self._store.get_retained_timestamps()
+                self._radar_cache.cleanup(retained_ts)
                 regions_by_name = {r.name: r for r in self._enabled_regions}
-                self._radar_cache.save_metadata(regions_by_name, active_ts)
+                self._radar_cache.save_metadata(regions_by_name, retained_ts)
             except Exception:
                 logger.exception("Failed to update radar cache metadata")
 

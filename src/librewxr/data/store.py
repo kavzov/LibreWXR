@@ -178,6 +178,11 @@ class FrameStore:
         async with self._lock:
             return [f.timestamp for f in self._frames[-self._max_frames:]]
 
+    async def get_retained_timestamps(self) -> list[int]:
+        """All timestamps whose backing files must remain addressable."""
+        async with self._lock:
+            return [f.timestamp for f in self._frames]
+
     async def get_frame_versions(self) -> dict[int, int]:
         """Return stable per-timestamp content versions for HTTP cache keys."""
         async with self._lock:
