@@ -52,6 +52,8 @@ services:
         limits:
           memory: ${LIBREWXR_POOL_RENDER_MEMORY:-6G}
           cpus: "${LIBREWXR_POOL_RENDER_CPUS:-4.5}"
+        reservations:
+          memory: ${LIBREWXR_POOL_RENDER_MEMORY_RESERVATION:-0}
 
   renderer-secondary:
     <<: *pool-renderer
