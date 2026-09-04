@@ -135,10 +135,13 @@ versus the old NWP-source form is roughly the nowcast half.  Factor 4
 | `LIBREWXR_NWP_FETCH_CONCURRENCY` | Parallel NWP grid decodes in the pipeline; drives decode-time RAM bursts. |
 | `LIBREWXR_COORD_STORE_MB` | Disk budget for the shared coordinate store (not RAM). |
 | `LIBREWXR_POOL_RENDER_MEMORY_RESERVATION` | Optional soft/cgroup `memory.low` protection per renderer container; `0` leaves it disabled. |
+| `LIBREWXR_POOL_RENDER_MEMSWAP_LIMIT` | Optional combined RAM + swap limit per pool renderer; `-1` is unlimited. Set this one allowance above `LIBREWXR_POOL_RENDER_MEMORY` to cap swap. |
 | `LIBREWXR_CACHE_DIR` | Shared cache directory - required for multi mode. Put it on SSD. |
 | `LIBREWXR_MEMORY` | Memory limit for the single-mode container; `compose default`. |
 | `LIBREWXR_PIPELINE_MEMORY` | Memory limit for the pipeline sidecar (multi mode); `12G` compose default. |
+| `LIBREWXR_PIPELINE_MEMSWAP_LIMIT` | Optional combined RAM + swap limit for the pipeline; `-1` is unlimited. |
 | `LIBREWXR_RENDER_MEMORY` | Memory limit for render workers (multi mode); `18G` compose default. |
+| `LIBREWXR_RENDER_MEMSWAP_LIMIT` | Optional combined RAM + swap limit for the non-pool renderer; `-1` is unlimited. |
 
 The compose defaults sum to ~30 GiB of limits in multi mode (12G pipeline + 18G renderers) - scale these down via the three LIBREWXR_*_MEMORY vars on smaller hosts; the 16 GiB minimum tier assumes they have been reduced.
 

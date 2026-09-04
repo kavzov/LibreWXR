@@ -749,11 +749,21 @@ The compose file caps each container using these env vars (not LIBREWXR_* settin
 | `LIBREWXR_PIPELINE_MEMORY` | `12G` | `multi` (the pipeline container) |
 | `LIBREWXR_RENDER_MEMORY` | `18G` | `multi` (the renderer container) |
 
+`LIBREWXR_PIPELINE_MEMSWAP_LIMIT` and
+`LIBREWXR_RENDER_MEMSWAP_LIMIT` optionally cap RAM plus swap for those
+multi-mode containers; `-1` (the default) leaves swap unlimited. Docker's
+value is a combined limit, not a swap-only size: with a `15G` pipeline RAM
+limit, `16G` permits at most `1G` of swap. The pool overlay uses
+`LIBREWXR_POOL_RENDER_MEMSWAP_LIMIT` with the same semantics. A small bounded
+swap allowance prevents stale anonymous pages from gradually filling the host
+swap while still leaving headroom for short allocation bursts.
+
 The optional `docker-compose.pool.yml` overlay replaces the single renderer
 endpoint with two renderer containers and a `least_conn` router. Its limits
 are per instance: `LIBREWXR_POOL_WORKERS` (default `3`),
 `LIBREWXR_POOL_RENDER_MEMORY` (`6G`), `LIBREWXR_POOL_RENDER_CPUS` (`4.5`),
-and `LIBREWXR_POOL_RENDER_MEMORY_LIMIT_MB` (`5120`). Set
+`LIBREWXR_POOL_RENDER_MEMORY_LIMIT_MB` (`5120`), and
+`LIBREWXR_POOL_RENDER_MEMSWAP_LIMIT` (`-1`, unlimited). Set
 `LIBREWXR_RENDER_POOL_ENABLED=true` so `scripts/auto-update.sh` preserves the
 overlay during automatic rebuilds.
 

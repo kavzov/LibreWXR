@@ -706,6 +706,7 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_RENDER_POOL_ENABLED` | `false` | Make `scripts/auto-update.sh` include the optional two-instance `docker-compose.pool.yml` overlay |
 | `LIBREWXR_POOL_WORKERS` | `3` | Uvicorn workers per renderer instance in pool mode |
 | `LIBREWXR_POOL_RENDER_MEMORY` | `6G` | Memory limit per renderer instance in pool mode |
+| `LIBREWXR_POOL_RENDER_MEMSWAP_LIMIT` | `-1` | Combined RAM + swap limit per pool renderer (`8G` with `7G` RAM allows 1G swap) |
 | `LIBREWXR_POOL_RENDER_CPUS` | `4.5` | CPU limit per renderer instance in pool mode |
 | `LIBREWXR_POOL_RENDER_MEMORY_LIMIT_MB` | `5120` | Internal pressure threshold per renderer instance |
 | **Multi-mode tile-server split** (set automatically by compose) | | |

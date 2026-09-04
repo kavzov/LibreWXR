@@ -20,6 +20,7 @@ x-pool-renderer: &pool-renderer
   depends_on:
     - pipeline
   restart: unless-stopped
+  memswap_limit: ${LIBREWXR_POOL_RENDER_MEMSWAP_LIMIT:--1}
   stop_grace_period: 30s
   logging:
     driver: json-file
@@ -44,6 +45,7 @@ x-pool-renderer: &pool-renderer
 services:
   renderer:
     ports: !reset []
+    memswap_limit: ${LIBREWXR_POOL_RENDER_MEMSWAP_LIMIT:--1}
     environment:
       <<: *pool-renderer-environment
       LIBREWXR_LOG_FILE: /logs/librewxr-primary.log
