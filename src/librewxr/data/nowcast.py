@@ -1037,22 +1037,6 @@ class NowcastGenerator:
         if not forecast_regions:
             return [], {}
 
-        # Precompute the float32 mgrid coordinate grids ONCE per region
-        # instead of rebuilding them for every forecast step — xs/ys are
-        # identical across all steps (only map_x/map_y, which are
-        # steps·flow away from them, vary per step).  Built up-front for
-        # every region that has both a warp flow and data so the
-        # parallel Phase B tasks below only read them (the old lazy
-        # per-step build mutated a shared dict, which the pool forbids).
-        coord_grids: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        for region_name in forecast_regions:
-            flow = warp_flows.get(region_name)
-            data = latest_regions.get(region_name)
-            if flow is not None and data is not None:
-                h, w = data.shape
-                ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-                coord_grids[region_name] = (ys, xs)
-
         # Generate extrapolated frames for each step.  Phase B submits
         # one task per (step, region) pair over the nowcast pool and
         # assembles the final frames strictly in step order 1..n_steps
@@ -1106,7 +1090,7 @@ class NowcastGenerator:
                 lambda r: _extrapolate_region_step(
                     r, nowcast_ts, step,
                     external_by_region.get(r),
-                    warp_flows, latest_regions, coord_grids, flow_clamps,
+                    warp_flows, latest_regions, flow_clamps,
                     coarsen_sigma_km=coarsen_sigma_km,
                 ),
                 sorted(forecast_regions),
@@ -1572,10 +1556,12 @@ def _extrapolate_forward(
     warp time (``_upscale_flow`` — the same resize math the old code
     applied at storage time, so results are numerically identical).
     Full-resolution flows (small regions, tests) pass through
-    untouched.  ``xs``/``ys`` are optional precomputed float32
-    coordinate grids — ``_generate_sync`` builds them once per region
-    and reuses them across forecast steps (they are identical for every
-    step); when omitted they are built here (direct-call / test path).
+    untouched.  ``xs``/``ys`` are optional precomputed float32 coordinate
+    grids for callers that need the absolute-map fallback.  On OpenCV
+    versions with ``WARP_RELATIVE_MAP``, ordinary non-wrapping regions pass
+    displacement maps directly and allocate no full-frame coordinate grids.
+    Retaining two float32 grids for every radar region used several transient
+    GiB and caused host-wide swap bursts on pipeline fetch cycles.
 
     ``max_px`` optionally applies ``_clamp_flow`` to the upscaled field
     right here — the old pipeline clamped the full-res field once after
@@ -1611,15 +1597,21 @@ def _extrapolate_forward(
         # already — the crop back below restores the unwrapped view).  The
         # row axis never wraps.
         ys, xs = np.mgrid[0:h, 0 : w + 2 * pad].astype(np.float32)
-    elif xs is None or ys is None:
-        ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-
-    map_x = xs - steps * flow[..., 0]
-    map_y = ys - steps * flow[..., 1]
+    relative_map = getattr(cv2, "WARP_RELATIVE_MAP", 0)
+    if not wrap and relative_map:
+        map_x = -steps * flow[..., 0]
+        map_y = -steps * flow[..., 1]
+        interpolation = cv2.INTER_LINEAR | relative_map
+    else:
+        if xs is None or ys is None:
+            ys, xs = np.mgrid[0:h, 0:frame.shape[1]].astype(np.float32)
+        map_x = xs - steps * flow[..., 0]
+        map_y = ys - steps * flow[..., 1]
+        interpolation = cv2.INTER_LINEAR
 
     warped = cv2.remap(
         frame, map_x, map_y,
-        interpolation=cv2.INTER_LINEAR,
+        interpolation=interpolation,
         borderMode=(
             cv2.BORDER_WRAP if wrap else cv2.BORDER_CONSTANT
         ),
@@ -1644,7 +1636,6 @@ def _extrapolate_region_step(
     external: dict[int, np.ndarray] | None,
     warp_flows: dict[str, np.ndarray],
     latest_regions: dict[str, np.ndarray],
-    coord_grids: dict[str, tuple[np.ndarray, np.ndarray]],
     flow_clamps: dict[str, float],
     coarsen_sigma_km: float = 0.0,
 ) -> tuple[str, np.ndarray] | None:
@@ -1652,10 +1643,10 @@ def _extrapolate_region_step(
 
     External ``NowcastContribution`` frames take precedence for the
     validtime and are returned as-is; otherwise the latest radar is
-    inverse-warped forward along the precomputed flow using the
-    prebuilt coordinate grids.  ``coarsen_sigma_km`` (default 0.0 =
-    off) Gaussian-smooths the internal extrapolation with a lead-time-
-    ramped sigma (km) so late frames lose the high-frequency warping
+    inverse-warped forward along the precomputed flow.  OpenCV relative maps
+    avoid materialising full-frame coordinate grids.  ``coarsen_sigma_km``
+    (default 0.0 = off) Gaussian-smooths the internal extrapolation with a
+    lead-time-ramped sigma (km) so late frames lose the high-frequency warping
     artifacts of long extrapolation; external frames pass through
     unsmoothed.  Returns ``None`` when neither applies — the no-region
     marker; the renderer falls back to NWP fill, which is the correct
@@ -1675,7 +1666,6 @@ def _extrapolate_region_step(
     flow = warp_flows.get(region_name)
     data = latest_regions.get(region_name)
     if flow is not None and data is not None:
-        ys, xs = coord_grids[region_name]
         # Full-longitude regions wrap at the ±180° seam — the warp pads
         # the column axis periodically so seam-crossing advection
         # re-enters on the other side instead of zeroing.
@@ -1683,7 +1673,7 @@ def _extrapolate_region_step(
         region_def = _ALL_REGIONS.get(region_name)
         wrap = bool(region_def is not None and region_def.is_global)
         warped = _extrapolate_forward(
-            data, flow, step, xs=xs, ys=ys,
+            data, flow, step,
             max_px=flow_clamps.get(region_name),
             wrap=wrap,
         )

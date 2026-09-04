@@ -6,6 +6,7 @@ import os
 import re
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
@@ -388,6 +389,27 @@ class TestExtrapolateForward:
         com1 = np.average(np.arange(W), weights=result1.sum(axis=0).astype(float) + 1e-9)
         com2 = np.average(np.arange(W), weights=result2.sum(axis=0).astype(float) + 1e-9)
         assert com2 > com1
+
+    def test_relative_map_matches_absolute_coordinate_grid(self):
+        """The allocation-free OpenCV path must preserve rendered pixels."""
+        frame = _make_blob(60, 80, radius=15, value=150)
+        flow = np.zeros((H, W, 2), dtype=np.float32)
+        flow[..., 0] = np.linspace(-2.0, 3.0, W, dtype=np.float32)
+        flow[..., 1] = np.linspace(-1.0, 2.0, H, dtype=np.float32)[:, None]
+        steps = 2
+        ys, xs = np.mgrid[0:H, 0:W].astype(np.float32)
+        expected = cv2.remap(
+            frame,
+            xs - steps * flow[..., 0],
+            ys - steps * flow[..., 1],
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+        result = _extrapolate_forward(frame, flow, steps=steps)
+
+        np.testing.assert_array_equal(result, expected)
 
 
 # ---------------------------------------------------------------------------
