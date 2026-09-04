@@ -20,6 +20,7 @@ from librewxr.sources.world.ifs.grid import (
     REQUIRED_WEATHER_FIELDS,
     ECMWFGrid,
 )
+from librewxr.sources.world.ifs.models import WeatherFrame
 
 pytestmark = pytest.mark.ecmwf
 
@@ -276,6 +277,39 @@ def test_unchanged_run_refetches_only_timestep_with_missing_memmap(loaded_grid):
     assert grid._fetch_sync()
     assert fs.object_opens == opens + 1
     assert missing.exists()
+
+
+def test_existing_weather_frame_fetches_only_missing_precipitation(loaded_grid):
+    """A future weather frame must not be downloaded and regridded twice."""
+    grid, fs, base, regrid_calls = loaded_grid
+    timestamp = int((base + timedelta(hours=1)).timestamp())
+    original = grid._timesteps[timestamp]
+    precipitation = original.field(WeatherField.PRECIPITATION)
+    snow = original.snow_mask
+    assert snow is not None
+    Path(precipitation.filename).unlink()
+    Path(snow.filename).unlink()
+    grid._timesteps[timestamp] = WeatherFrame(
+        timestamp,
+        {
+            field: original.field(field)
+            for field in REQUIRED_WEATHER_FIELDS
+        },
+        None,
+    )
+    opens = fs.object_opens
+    downloads = fs.object_downloads
+    calls = len(regrid_calls)
+
+    assert grid._fetch_sync()
+
+    refreshed = grid._timesteps[timestamp]
+    assert fs.object_opens == opens + 1
+    assert fs.object_downloads == downloads
+    assert len(regrid_calls) == calls + 2
+    assert REQUIRED_WEATHER_FIELDS <= refreshed.fields.keys()
+    assert refreshed.has_field(WeatherField.PRECIPITATION)
+    assert refreshed.snow_mask is not None
 
 
 def test_incomplete_new_run_is_not_published_and_old_files_survive(loaded_grid):

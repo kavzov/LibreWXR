@@ -263,6 +263,30 @@ class TestECMWFGrid:
             "2026-04-05T08:00Z",
         ]
 
+    def test_select_valid_times_nowcast_is_stable_after_hour_boundary(self):
+        """The upper interpolation bracket must not advance again at :05."""
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+
+        vt_list = [f"2026-04-05T{h:02d}:00Z" for h in range(1, 13)]
+        selected = []
+        for minute in (0, 5, 55):
+            mock_now = datetime(2026, 4, 5, 6, minute, tzinfo=timezone.utc)
+            with patch("librewxr.sources.world.ifs.grid.datetime") as mock_dt, \
+                 patch("librewxr.sources.world.ifs.grid.settings") as mock_settings:
+                mock_dt.now.return_value = mock_now
+                mock_dt.fromisoformat = datetime.fromisoformat
+                mock_settings.nowcast_enabled = True
+                mock_settings.nowcast_frames = 6
+                mock_settings.fetch_interval = 600
+                selected.append(ECMWFGrid._select_valid_times(vt_list, max_ts=3))
+
+        assert selected == [[
+            "2026-04-05T06:00Z",
+            "2026-04-05T07:00Z",
+            "2026-04-05T08:00Z",
+        ]] * 3
+
     def test_select_valid_times_all_future(self):
         """When all IFS hours are in the future, take the earliest ones."""
         from datetime import datetime, timezone

@@ -724,10 +724,22 @@ class ECMWFGrid:
         if settings.nowcast_enabled:
             anchor_target += settings.nowcast_frames * settings.fetch_interval
         vt_unix = [ECMWFGrid._vt_to_unix(vt) for vt in valid_times]
-        anchor_idx = next(
-            (i for i, value in enumerate(vt_unix) if value >= anchor_target),
-            len(valid_times) - 1,
-        )
+        if settings.nowcast_enabled:
+            # Always retain the native timestep strictly beyond the last
+            # nowcast frame.  At an exact hourly boundary ``>=`` selected the
+            # endpoint itself, then advanced to the following hour on the
+            # next radar cycle.  That caused two full interpolation/publication
+            # passes per hour (for example 17:00 at :00, then 18:00 at :05).
+            # A stable upper bracket is also the correct interpolation window.
+            anchor_idx = next(
+                (i for i, value in enumerate(vt_unix) if value > anchor_target),
+                len(valid_times) - 1,
+            )
+        else:
+            anchor_idx = next(
+                (i for i, value in enumerate(vt_unix) if value >= anchor_target),
+                len(valid_times) - 1,
+            )
         end = anchor_idx + 1
         start = max(end - max_ts, 0)
         end = min(start + max_ts, len(valid_times))
@@ -896,7 +908,14 @@ class ECMWFGrid:
         )
 
         prepared: dict[int, WeatherFrame] = {}
-        missing: list[tuple[str, bool, frozenset[WeatherField]]] = []
+        missing: list[
+            tuple[
+                str,
+                bool,
+                frozenset[WeatherField],
+                WeatherFrame | None,
+            ]
+        ] = []
         for vt in selected_vts:
             ts = self._vt_to_unix(vt)
             required = self._weather_fields if vt in weather_set else frozenset()
@@ -916,7 +935,40 @@ class ECMWFGrid:
             if cached is not None:
                 prepared[ts] = cached
             else:
-                missing.append((vt, need_precip, required))
+                # A timestep can already contain every public weather field
+                # and later enter the short precipitation/nowcast window.  In
+                # that case only precipitation + snow are missing.  Reusing
+                # the valid active arrays avoids downloading the complete OM
+                # object and regridding five unchanged weather fields again.
+                base = None
+                if active is not None:
+                    base_fields = {
+                        field: values
+                        for field, values in active.fields.items()
+                        if self._stored_array_valid(values)
+                    }
+                    base_snow = (
+                        active.snow_mask
+                        if active.snow_mask is not None
+                        and self._stored_array_valid(active.snow_mask)
+                        else None
+                    )
+                    if base_fields or base_snow is not None:
+                        base = WeatherFrame(ts, base_fields, base_snow)
+
+                fetch_fields = frozenset(
+                    field
+                    for field in required
+                    if base is None or field not in base.fields
+                )
+                fetch_precip = (
+                    WeatherField.PRECIPITATION in fetch_fields
+                    or (
+                        need_precip
+                        and (base is None or base.snow_mask is None)
+                    )
+                )
+                missing.append((vt, fetch_precip, fetch_fields, base))
 
         failures: list[str] = []
         if missing:
@@ -931,11 +983,12 @@ class ECMWFGrid:
                         run_prefix,
                         ref_time,
                         vt,
-                        need_precip,
+                        fetch_precip,
                         has_snow,
-                        required,
+                        fetch_fields,
+                        base,
                     ): vt
-                    for vt, need_precip, required in missing
+                    for vt, fetch_precip, fetch_fields, base in missing
                 }
                 for future in as_completed(futures):
                     vt = futures[future]
@@ -999,8 +1052,9 @@ class ECMWFGrid:
         need_precip: bool,
         has_snow: bool,
         required_fields: frozenset[WeatherField],
+        base_frame: WeatherFrame | None = None,
     ) -> WeatherFrame:
-        """Decode and persist inside one worker to bound heap residency."""
+        """Decode, merge, and persist inside one worker to bound residency."""
 
         frame = self._fetch_one_timestep(
             fs,
@@ -1010,6 +1064,11 @@ class ECMWFGrid:
             has_snow,
             required_fields,
         )
+        if base_frame is not None:
+            fields = dict(base_frame.fields)
+            fields.update(frame.fields)
+            snow = frame.snow_mask if need_precip else base_frame.snow_mask
+            frame = WeatherFrame(frame.timestamp, fields, snow)
         self._validate_frame(frame)
         return self._persist_frame(reference_time, frame)
 
