@@ -4,6 +4,7 @@
 import asyncio
 import os
 import re
+import weakref
 from pathlib import Path
 
 import cv2
@@ -207,6 +208,62 @@ def test_animation_generator_backfills_history_incrementally():
         (450, "past"),
     ]
     assert retained_valid == {150, 450}
+
+
+@pytest.mark.parametrize("substeps", [2, 3, 4])
+def test_animation_region_order_preserves_pixels_and_releases_flows(monkeypatch, substeps):
+    import librewxr.data.nowcast as module
+    from librewxr.data.nwp_interpolation import interpolate_pair_at_fraction
+
+    rng = np.random.default_rng(91)
+    regions = {name: rng.integers(0, 256, (40, 48), dtype=np.uint8)
+               for name in ("A", "B", "fallback")}
+    observed = [RadarFrame(timestamp=0, regions=regions),
+                RadarFrame(timestamp=300, regions=regions)]
+    forecast = [NowcastFrame(timestamp=ts, regions=regions, blend_weight=weight)
+                for ts, weight in ((600, 0.8), (900, 0.6))]
+    flows = {name: rng.uniform(-2, 2, (8, 8, 2)).astype(np.float32)
+             for name in ("A", "B")}
+    upscale = module._upscale_flow
+    live_flows = []
+
+    def tracked_upscale(*args):
+        # No full-resolution field from the previous region/phase may survive.
+        assert not any(ref() is not None for ref in live_flows)
+        result = upscale(*args)
+        live_flows.append(weakref.ref(result))
+        return result
+
+    monkeypatch.setattr(module, "_upscale_flow", tracked_upscale)
+    frames, valid = NowcastGenerator._generate_animation_sync(
+        observed, forecast, flows, 300, substeps,
+    )
+    assert len(frames) == 3 * (substeps - 1)
+    assert valid == {frame.timestamp for frame in frames}
+    assert not any(ref() is not None for ref in live_flows)
+    for frame in frames:
+        pair = frame.timestamp // 300
+        fraction = (frame.timestamp % 300) / 300
+        for name, data in regions.items():
+            flow = upscale(flows[name], data.shape) if name in flows else None
+            if pair == 0 or flow is None:
+                expected, _ = interpolate_pair_at_fraction(data, data, fraction, flow=flow)
+            else:
+                expected = _extrapolate_forward(data, flow, pair - 1 + fraction)
+            np.testing.assert_array_equal(frame.regions[name], expected)
+
+
+def test_interpolation_coordinate_grids_own_only_axes():
+    from librewxr.data.nwp_interpolation import _coordinate_grid
+
+    ys, xs = _coordinate_grid(37, 53)
+    expected_y, expected_x = np.mgrid[:37, :53].astype(np.float32)
+    np.testing.assert_array_equal(ys, expected_y)
+    np.testing.assert_array_equal(xs, expected_x)
+    assert ys.base.nbytes == 37 * 4
+    assert xs.base.nbytes == 53 * 4
+    assert not ys.flags.writeable and not xs.flags.writeable
+    assert _coordinate_grid(37, 53)[0] is ys
 
 
 class TestNowcastStoreTmpIsolation:

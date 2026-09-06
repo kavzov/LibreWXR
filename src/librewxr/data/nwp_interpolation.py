@@ -50,12 +50,11 @@ _FARNEBACK = dict(
 )
 
 
-# Coordinate grids are pure functions of their shape, yet the pair/forward
-# helpers rebuild them via np.mgrid on every call.  Cache the built grids
-# keyed by shape — at most a handful of distinct grid shapes exist per
-# process.  Thread-safety: the dict is read-mostly and mutation only adds
-# whole entries (GIL-atomic); the worst-case race is two threads building
-# the same constant twice — harmless, so no lock.
+# Coordinate grids are immutable broadcast views of two 1-D axes.  Keeping
+# dense grids for all radar shapes retained GiB between fetch cycles; these
+# views have identical values and shape but own only 4*(height+width) bytes.
+# Callers subtract/add flow into newly allocated dense remap arrays, so no
+# contiguous copy is needed.  Duplicate construction on a race is harmless.
 _GRID_CACHE: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
 
 
@@ -63,8 +62,10 @@ def _coordinate_grid(h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
     """Return cached float32 (ys, xs) coordinate grids for shape (h, w)."""
     grids = _GRID_CACHE.get((h, w))
     if grids is None:
-        mgrid = np.mgrid[0:h, 0:w].astype(np.float32)
-        grids = (mgrid[0], mgrid[1])
+        grids = (
+            np.broadcast_to(np.arange(h, dtype=np.float32)[:, None], (h, w)),
+            np.broadcast_to(np.arange(w, dtype=np.float32)[None, :], (h, w)),
+        )
         _GRID_CACHE[(h, w)] = grids
     return grids
 
@@ -335,6 +336,7 @@ def _interpolate_precip(
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
+    del map0_x, map0_y  # Reuse their allocation before building the reverse maps.
 
     map1_x = xs + (1 - t) * flow[..., 0]
     map1_y = ys + (1 - t) * flow[..., 1]
@@ -343,6 +345,7 @@ def _interpolate_precip(
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
+    del map1_x, map1_y
 
     blended = (1 - t) * warped0.astype(np.float32) + t * warped1.astype(np.float32)
 
@@ -377,6 +380,7 @@ def _interpolate_snow(
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
+    del map0_x, map0_y
 
     map1_x = xs + (1 - t) * flow[..., 0]
     map1_y = ys + (1 - t) * flow[..., 1]
@@ -385,6 +389,7 @@ def _interpolate_snow(
         interpolation=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
+    del map1_x, map1_y
 
     blended = (1 - t) * warped0 + t * warped1
     # Preserve bool dtype if both inputs were bool, otherwise uint8.

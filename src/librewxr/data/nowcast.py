@@ -1177,37 +1177,34 @@ class NowcastGenerator:
             valid_timestamps.update(target_times)
 
             common_regions = frame0.regions.keys() & frame1.regions.keys()
-            flow_cache: dict[str, np.ndarray] = {}
-            for part, timestamp in enumerate(target_times, start=1):
-                fraction = part / substeps
-                regions: dict[str, np.ndarray] = {}
-                for region_name in common_regions:
-                    data0 = frame0.regions[region_name]
-                    data1 = frame1.regions[region_name]
-                    flow = flow_cache.get(region_name)
-                    if flow is None and pair_index == last_observed_pair:
-                        flow_low = flows.get(region_name)
-                        if flow_low is not None:
-                            flow = _upscale_flow(flow_low, data0.shape)
+            targets = [NowcastFrame(
+                timestamp=timestamp, regions={}, blend_weight=1.0, period="past",
+            ) for timestamp in target_times]
+            for region_name in sorted(common_regions):
+                data0 = frame0.regions[region_name]
+                data1 = frame1.regions[region_name]
+                flow_low = flows.get(region_name)
+                flow = (
+                    _upscale_flow(flow_low, data0.shape)
+                    if flow_low is not None else None
+                )
+                for part, target in enumerate(targets, start=1):
                     interpolated, flow = interpolate_pair_at_fraction(
-                        data0, data1, fraction, flow=flow,
+                        data0, data1, part / substeps, flow=flow,
                     )
-                    flow_cache[region_name] = flow
-                    regions[region_name] = interpolated
-                generated.append(NowcastFrame(
-                    timestamp=timestamp,
-                    regions=regions,
-                    blend_weight=1.0,
-                    period="past",
-                ))
+                    target.regions[region_name] = interpolated
+                del flow
+            generated.extend(targets)
 
         if not observed_frames or not nowcast_frames:
             return generated, valid_timestamps
 
         latest = observed_frames[-1]
-        flow_cache: dict[str, np.ndarray] = {}
-        coord_grids: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        fallback_flows: dict[tuple[int, str], np.ndarray] = {}
+        # Assemble the timeline first, then render one region across it. This
+        # retains only one full-resolution flow instead of every region's flow
+        # and two coordinate grids. OpenCV's relative-map path ignores those
+        # grids entirely; the absolute-map fallback constructs them on demand.
+        forecast_jobs = []
         previous_frame = NowcastFrame(
             timestamp=latest.timestamp,
             regions=latest.regions,
@@ -1225,55 +1222,52 @@ class NowcastGenerator:
                 timestamp = previous_frame.timestamp + round(gap * fraction)
                 valid_timestamps.add(timestamp)
                 total_step = pair_index + fraction
-                regions: dict[str, np.ndarray] = {}
-                region_names = latest.regions.keys() | (
-                    previous_frame.regions.keys() & next_frame.regions.keys()
-                )
-                for region_name in region_names:
-                    data = latest.regions.get(region_name)
-                    flow_low = flows.get(region_name)
-                    if data is not None and flow_low is not None:
-                        flow = flow_cache.get(region_name)
-                        if flow is None:
-                            flow = _upscale_flow(flow_low, data.shape)
-                            flow_cache[region_name] = flow
-                        grids = coord_grids.get(region_name)
-                        if grids is None:
-                            h, w = data.shape
-                            ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-                            grids = (ys, xs)
-                            coord_grids[region_name] = grids
-                        ys, xs = grids
-                        regions[region_name] = _extrapolate_forward(
-                            data, flow, total_step, xs=xs, ys=ys,
-                        )
-                        continue
-
-                    data0 = previous_frame.regions.get(region_name)
-                    data1 = next_frame.regions.get(region_name)
-                    if data0 is None or data1 is None:
-                        continue
-                    key = (pair_index, region_name)
-                    interpolated, fallback_flow = interpolate_pair_at_fraction(
-                        data0,
-                        data1,
-                        fraction,
-                        flow=fallback_flows.get(key),
-                    )
-                    fallback_flows[key] = fallback_flow
-                    regions[region_name] = interpolated
-
                 blend_weight = (
                     (1.0 - fraction) * previous_frame.blend_weight
                     + fraction * next_frame.blend_weight
                 )
                 generated.append(NowcastFrame(
                     timestamp=timestamp,
-                    regions=regions,
+                    regions={},
                     blend_weight=blend_weight,
                     period="forecast",
                 ))
+                forecast_jobs.append((
+                    generated[-1], previous_frame, next_frame,
+                    pair_index, fraction, total_step,
+                ))
             previous_frame = next_frame
+
+        region_names = set(latest.regions)
+        for _, previous, following, _, _, _ in forecast_jobs:
+            region_names.update(previous.regions.keys() & following.regions.keys())
+        for region_name in sorted(region_names):
+            data = latest.regions.get(region_name)
+            flow_low = flows.get(region_name)
+            if data is not None and flow_low is not None:
+                flow = _upscale_flow(flow_low, data.shape)
+                for target, _, _, _, _, total_step in forecast_jobs:
+                    target.regions[region_name] = _extrapolate_forward(
+                        data, flow, total_step,
+                    )
+                del flow
+                continue
+
+            fallback_flow = None
+            fallback_pair = None
+            for target, previous, following, pair_index, fraction, _ in forecast_jobs:
+                data0 = previous.regions.get(region_name)
+                data1 = following.regions.get(region_name)
+                if data0 is None or data1 is None:
+                    continue
+                if fallback_pair != pair_index:
+                    fallback_flow = None
+                    fallback_pair = pair_index
+                interpolated, fallback_flow = interpolate_pair_at_fraction(
+                    data0, data1, fraction, flow=fallback_flow,
+                )
+                target.regions[region_name] = interpolated
+            del fallback_flow
 
         return generated, valid_timestamps
 
