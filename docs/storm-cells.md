@@ -72,7 +72,10 @@ GET /v2/storm-cells?format=json
 Returns detected storm cells from the latest radar frame. The default
 response is a GeoJSON `FeatureCollection` with one `Point` feature per
 cell (centroid coordinates `[lon, lat]`); `format=json` returns a plain
-`{generated_at, cells}` payload instead. Each cell carries `area_km2`,
+`{generated_at, detected_at, cells}` payload instead. Both formats include
+`generated_at` (detection completion time) and `detected_at` (source radar frame
+time), in Unix seconds or null before the first detection. Data and timestamps
+are captured atomically from the same generation. Each cell carries `area_km2`,
 `max_dbz`, `motion_speed_kmh` / `motion_heading_deg` (`null` when no
 motion data) and `region` properties.
 
@@ -88,11 +91,10 @@ Returns `503 Service Unavailable` when storm-cell detection is disabled
 
 ## Limitations
 
-- **Latest-detection only.** The overlay uses the latest detection result
-  regardless of which timestamp the tile URL requests. This is the same
-  approximation the `?arrows=` overlay uses (arrows use the latest flow
-  field regardless of timestamp). Historical cell positions are not
-  reconstructed.
+- **Latest-detection only.** The tile overlay is shown only when the requested
+  timestamp equals the detection frame timestamp. Historical and forecast
+  frames do not receive current cell markers. Historical positions are not
+  reconstructed. REST consumers should enforce the same rule using `detected_at`.
 - **Radar-only.** Storm cells are detected on radar frames, not NWP or
   satellite. Areas without radar coverage show no cells.
 - **Per-region detection.** Cells are detected independently per radar
@@ -144,3 +146,31 @@ and request counters are summed with hit ratios recomputed from the sums.
 If `enabled: true` but `count: 0`, either no cells were detected in the
 latest cycle (clear weather) or the detection failed silently -- check the
 startup log for "Storm-cell detection failed" exceptions.
+
+## Performance verification (2026-09-11)
+
+The maximum-intensity calculation now uses OpenCV's existing bounding box for
+one component, with a label mask inside that box. This avoids a full-region
+scan for every surviving cell while preserving holes, nested cells and cell
+order. Connected-component labelling still scans each region. Overlapping
+bounding boxes can still revisit pixels; the optimization is most effective
+for localized cells and does not claim a strict single-pass algorithm.
+
+An isolated comparison in the existing VPS pipeline container used the same
+read-only radar snapshot, timestamp 1789139700, across all 13 available regions
+(including OPERA 4400×3800 and USCOMP 5400×12200). Three sequential runs per
+version, thresholds 40 dBZ and 25 km², no motion fields in this benchmark:
+
+| Detector | Times (seconds) | Median | Process peak RSS |
+| --- | --- | ---: | ---: |
+| Before | 4.262, 4.269, 4.163 | 4.262 s | 707.5 MiB |
+| Bounding boxes | 0.165, 0.153, 0.157 | 0.157 s | 686.0 MiB |
+
+All fields of all 398 cells matched exactly (including missing motion values).
+This is about 27× faster on this scene. RSS includes imports, mapped input and
+working arrays; it is not the incremental memory of the live pipeline.
+Results vary with cell count and spatial structure. Motion handling is
+unchanged and covered by the existing flow regression tests. Detection runs
+once per fetch cycle (currently 300 seconds on the measured deployment), not
+once per visitor or tile request. The benchmark did not enable production
+detection or change the running services.

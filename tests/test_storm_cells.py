@@ -622,3 +622,65 @@ class TestStormCellGenerator:
             assert cells["SYNTH_REGION"][0]["max_dbz"] == pytest.approx(48.0, abs=0.1)
         finally:
             store.cleanup()
+
+
+@pytest.mark.storm_cells
+def test_nested_cells_keep_independent_intensities(syn_regions):
+    """A bounding box can contain a stronger disconnected cell in a hole."""
+    frame = np.zeros((80, 100), dtype=np.uint8)
+    frame[5:70, 10:90] = 150
+    frame[8:67, 13:87] = 0
+    frame[25:35, 40:50] = 220
+    frame[0, 0] = 255  # Below the minimum area; never affects another cell.
+    result = detect_storm_cells(
+        {"SYNTH_REGION": frame[:, ::-1]}, ["SYNTH_REGION"], None, 40, 2, 600,
+    )["SYNTH_REGION"]
+    assert len(result) == 2
+    assert sorted(result["max_dbz"].tolist()) == [43.0, 78.0]
+
+
+@pytest.mark.storm_cells
+@pytest.mark.parametrize("seed", range(6))
+def test_cell_statistics_match_full_frame_reference(syn_regions, seed):
+    """Compare with full-frame masks, including diagonals and noisy holes."""
+    import cv2
+
+    rng = np.random.default_rng(seed)
+    frame = rng.integers(0, 256, (73, 81), dtype=np.uint8)
+    frame[::4, :] = 0
+    frame[:, ::5] = 0
+    frame = frame.T  # Non-contiguous source grids must also work.
+    flow = rng.normal(size=(*frame.shape, 2)).astype(np.float32)
+    actual = detect_storm_cells(
+        {"SYNTH_REGION": frame}, ["SYNTH_REGION"], {"SYNTH_REGION": flow}, 40, 2, 600,
+    )["SYNTH_REGION"]
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        (frame >= 144).astype(np.uint8), connectivity=8,
+    )
+    expected = []
+    for label in range(1, count):
+        mask = labels == label
+        if mask.sum() * _DEFAULT_PX_TO_KM2 < 2:
+            continue
+        expected.append((centroids[label][1], centroids[label][0], mask.sum(),
+                         frame[mask].max() / 2.0 - 32))
+    assert len(actual) == len(expected)
+    for cell, (row, col, area, maximum) in zip(actual, expected):
+        assert cell["centroid_row"] == pytest.approx(row)
+        assert cell["centroid_col"] == pytest.approx(col)
+        assert cell["area_px"] == area
+        assert cell["max_dbz"] == maximum
+
+
+@pytest.mark.storm_cells
+async def test_snapshot_keeps_cells_counts_and_frame_time_together(tmp_path):
+    store = StormCellStore(tmp_path)
+    first = np.zeros(1, dtype=_CELL_DTYPE)
+    first["max_dbz"] = 42
+    await store.replace_cells({"A": first}, detected_at_timestamp=100)
+    snapshot = await store.snapshot()
+    await store.replace_cells({}, detected_at_timestamp=200)
+    assert snapshot.detected_at_timestamp == 100
+    assert (await snapshot.get_counts()) == {"A": 1}
+    assert (await snapshot.get_cells())["A"][0]["max_dbz"] == 42
+    assert (await store.snapshot()).detected_at_timestamp == 200
