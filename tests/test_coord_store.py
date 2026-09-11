@@ -5,13 +5,12 @@
 Covers the publish/open round trip (read-only memmaps), content addressing
 (skip-if-exists, signature namespacing), corruption self-heal (garbage /
 truncated files unlinked, transient OSErrors preserved), concurrent
-publishers converging on one file, budget pruning (oldest-mtime-first, 90%
-drain target, stale-tmp sweep), stats counters, and the one-shot manifest.
+publishers converging on one file, budget pruning (oldest-mtime-first, exact
+budget target, stale-tmp sweep), stats counters, and the one-shot manifest.
 """
 from __future__ import annotations
 
 import json
-import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -200,7 +199,7 @@ def test_signature_and_paths_depend_on_enabled_regions(tmp_path):
 
 
 def test_prune_evicts_oldest_and_sweeps_stale_tmp(tmp_path):
-    """Budget enforcement is oldest-mtime-first to the 90% drain target;
+    """Budget enforcement is oldest-mtime-first to the exact budget target;
     stale *.tmp swept, fresh *.tmp kept, counts reflect exactly what was
     removed."""
     store = _store(tmp_path)
@@ -232,9 +231,9 @@ def test_prune_evicts_oldest_and_sweeps_stale_tmp(tmp_path):
     # Entry sum as prune computes it (tmps excluded, manifest included).
     total = sum(sizes) + manifest_size
     # Budget that evicts exactly the two oldest entries: after removing
-    # them the remainder fits 0.9*budget, before that it does not.
+    # them the remainder exactly fits the budget, before that it does not.
     after_two = sizes[2] + manifest_size
-    budget = math.ceil(after_two / 0.9)
+    budget = after_two
     assert total > budget  # prune must actually evict
 
     removed_bytes, removed_entries = store.prune(budget)
@@ -247,9 +246,9 @@ def test_prune_evicts_oldest_and_sweeps_stale_tmp(tmp_path):
     assert not stale.exists()
     assert fresh.exists()
     assert (store.root / "manifest.json").exists()
-    # 90% drain target respected for the remaining entries.
+    # Keep the newest entry even though it exceeds 90% of the budget.
     remaining = paths[2].stat().st_size + manifest_size
-    assert remaining <= 0.9 * budget
+    assert remaining == budget
 
 
 def test_prune_noop_when_within_budget(tmp_path):

@@ -555,13 +555,13 @@ Best-effort: any store failure (unwritable cache dir, corrupt files, version mis
 
 ### `LIBREWXR_COORD_STORE_MB`
 
-Hard size cap of the shared on-disk coordinate store, in megabytes. Every publish checks the shared byte ledger under an inter-process lock and evicts oldest entries down to 90% when capacity is needed. The periodic fetch-cycle prune remains as reconciliation for manual file changes and crashed writers.
+Hard size cap of the shared on-disk coordinate store, in megabytes. Every publish checks the shared byte ledger under an inter-process lock and evicts only the oldest entries needed to fit the budget when capacity is needed. The periodic fetch-cycle prune remains as reconciliation for manual file changes and crashed writers.
 
-The default tracks `LIBREWXR_MODE`: 1024 in single mode, 8192 in multi mode. In multi mode the budget is **shared by ALL render workers** — every worker reads the same on-disk store, so the 8192 MB default covers the combined warm set rather than 8192 MB per worker. Settable via `.env` like any knob; a restart applies the change. Requires `LIBREWXR_CACHE_DIR`; the store disables itself when the cache dir is unset.
+The default tracks `LIBREWXR_MODE`: 4096 in single mode, 8192 in multi mode. In multi mode the budget is **shared by ALL render workers** — every worker reads the same on-disk store, so the 8192 MB default covers the combined warm set rather than 8192 MB per worker. Settable via `.env` like any knob; a restart applies the change. Requires `LIBREWXR_CACHE_DIR`; the store disables itself when the cache dir is unset.
 
 | | |
 |---|---|
-| **Default** | `1024` (single) / `8192` (multi) — set 0 or unset to use the mode default |
+| **Default** | `4096` (single) / `8192` (multi) — set 0 or unset to use the mode default |
 | **Type** | integer |
 | **Unit** | megabytes |
 
@@ -638,12 +638,12 @@ Pre-warm coordinate caches up to this zoom level at startup, as a **background t
 
 | | |
 |---|---|
-| **Default** | `0` (mode default: `6` in single / no eager warm in multi) |
+| **Default** | `0` (mode default: `4` in single / no eager warm in multi) |
 | **Type** | integer |
 
 Resolution:
 
-- `0` (or unset) — use the per-mode default: **single** warms up to zoom 6 in the background; **multi** render workers do no eager warm at all, building their coordinate caches lazily on first request.
+- `0` (or unset) — use the per-mode default: **single** warms up to zoom 4 in the background; **multi** render workers do no eager warm at all, building their coordinate caches lazily on first request.
 - Negative (e.g. `-1`) — disable the warm entirely in either mode.
 - Positive — force that zoom in either mode (e.g. `4` in multi re-enables a background warm; `-1` in single turns the warm off).
 

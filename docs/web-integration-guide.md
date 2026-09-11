@@ -15,6 +15,7 @@ A tutorial for adding live weather radar to a website using LibreWXR. No prior e
   - [Coverage Tile Endpoint](#coverage-tile-endpoint)
   - [Widgets and Single-Location Images](#widgets-and-single-location-images)
   - [Alerts Endpoint](#alerts-endpoint)
+  - [Storm Cells Endpoint](#storm-cells-endpoint)
   - [Health Endpoint](#health-endpoint)
 - [Step-by-Step: Leaflet Integration](#step-by-step-leaflet-integration)
   - [1. Basic Map Setup](#1-basic-map-setup)
@@ -139,7 +140,7 @@ This is the starting point for any integration. It returns metadata about all av
 }
 ```
 
-(The real response lists all 14 color schemes in `colorSchemes` — the example above is abbreviated.)
+(The real response lists all 15 color schemes in `colorSchemes` — the example above is abbreviated.)
 
 **Fields:**
 
@@ -270,7 +271,7 @@ This is where the actual tile images come from. Your map library will call this 
 | `z` | Zoom level | `0` to `12` (configurable max) |
 | `x` | Tile column | `0` to `2^z - 1` |
 | `y` | Tile row | `0` to `2^z - 1` |
-| `color` | Color scheme ID | `0` to `13`, or `255` (see [Color Schemes](#color-schemes)) |
+| `color` | Color scheme ID | `0` to `14`, or `255` (see [Color Schemes](#color-schemes)) |
 | `smooth_snow` | Smoothing and snow flags, joined with `_` | `{0 or 1}_{0 or 1}` |
 | `ext` | Image format | `png` or `webp` |
 
@@ -394,6 +395,27 @@ Simplification only affects the geometry in the response — point/bbox filterin
 ```
 
 The `severity` field follows the CAP 1.2 vocabulary (`Extreme` / `Severe` / `Moderate` / `Minor` / `Unknown`), which is convenient for styling — colour polygons by severity and let users filter on it. `time` and `expires` are Unix epochs; `regions` lists the affected area names, and `uri` links to the full alert text.
+
+### Storm Cells Endpoint
+
+```
+GET /v2/storm-cells
+GET /v2/storm-cells?lat={lat}&lon={lon}&radius_km={radius}
+GET /v2/storm-cells?format=json
+```
+
+Returns detected convective storm cells from the latest radar frame. The default response is a GeoJSON `FeatureCollection` of `Point` features at each cell centroid (coordinates `[lon, lat]`); pass `format=json` for a plain `{generated_at, cells}` payload instead.
+
+**Query parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| *(none)* | All detected cells worldwide |
+| `lat`, `lon` | Only cells within `radius_km` of the point — both required together, otherwise `400` |
+| `radius_km` | Search radius in kilometres (default `100`, silently ignored when lat/lon are omitted) |
+| `format` | `geojson` (default) or `json` — anything else is rejected with `422` |
+
+Each GeoJSON feature's `properties` carries `area_km2`, `max_dbz`, `motion_speed_kmh`, `motion_heading_deg` (`null` when no motion data), and `region`; the lat/lon centroid lives in the `geometry`. Returns `503 Service Unavailable` when storm-cell detection is disabled on the server.
 
 ### Health Endpoint
 
@@ -1152,8 +1174,9 @@ choose the nearest available timestamp if the valid-time window moves.
 
 ### Color Schemes
 
-LibreWXR supports the 9 original Rain Viewer color schemes, a contributed scheme from the Datameteo Educational team, the high-resolution Viper HD palette by Ben Mitchell, the MRMS CREF operational palette used by NOAA/NSSL's MRMS Product Viewer, the 33/40 Max Storm stepped palette from ABC 33/40's Chief Meteorologist James Aydelott via Ben Mitchell's WxTools, and a raw grayscale mode:
+LibreWXR supports the 9 original Rain Viewer color schemes, a contributed scheme from the Datameteo Educational team, the high-resolution Viper HD palette by Ben Mitchell, the MRMS CREF operational palette used by NOAA/NSSL's MRMS Product Viewer, the 33/40 Max Storm stepped palette from ABC 33/40's Chief Meteorologist James Aydelott via Ben Mitchell's WxTools, a Windy-inspired radar palette contributed by Gerrit Grunwald, and a raw grayscale mode:
 
+<!-- BEGIN GENERATED: color-scheme-table-descriptions -->
 | ID | Name | Description |
 |----|------|-------------|
 | 0 | Black and White | Grayscale intensity |
@@ -1170,7 +1193,9 @@ LibreWXR supports the 9 original Rain Viewer color schemes, a contributed scheme
 | 11 | MRMS CREF | Stepped 5-dBZ operational palette used by NOAA/NSSL's MRMS Product Viewer for composite reflectivity. Cyan through blue / green / yellow / orange / red into a magenta band at 70 dBZ, with light-tan and purple swatches for sub-zero / clear-air returns |
 | 12 | 33/40 Max Storm | Stepped 5-dBZ palette designed by ABC 33/40 Chief Meteorologist James Aydelott, published via Ben Mitchell's WxTools (WxTools.org). Green ramp for light precip (10–30 dBZ) stepping through yellow / orange / red for moderate-to-heavy, into a pink / magenta convective band at 55+ dBZ. Snow variant reuses the Universal Blue gradient. Also used by RadarScope, Supercell Wx, and others |
 | 13 | MetService NZ (Dark) | MetService New Zealand-inspired palette (dark-basemap variant), contributed by ashuttl via GitHub discussion #4 |
+| 14 | Windy | Radar palette inspired by the iOS Windy app, contributed by Gerrit Grunwald (Photo-Planner); gray for light precipitation deepening through blue / teal / green / yellow / orange into deep purple for extreme reflectivity |
 | 255 | Raw | Grayscale proportional to dBZ — useful for custom client-side coloring |
+<!-- END GENERATED: color-scheme-table-descriptions -->
 
 Use the scheme ID as the `{color}` path parameter. If an invalid ID is provided, the server falls back to Rainbow @ Selex SI (7).
 
@@ -1292,7 +1317,7 @@ The two map examples include:
 - **Source selector** — switch between your local server and the public instance (`api.librewxr.net`) without editing code. Auto-detects the best default based on how the file is opened.
 - **Layer modes** — Radar, Satellite, or Radar + Satellite (satellite as a cloud background under animated radar)
 - **Light/dark theme** — toggles both the base map style and UI colors
-- **Color scheme selector** — 14 color schemes plus a raw grayscale (255) option
+- **Color scheme selector** — 15 color schemes plus a raw grayscale (255) option
 - **Motion arrows and nowcast** — with full animation support
 - **Draggable scrubber** — timeline with past/nowcast visual distinction and tick labels
 - **Weather-alerts overlay** — severity-styled WMO alert polygons (toggleable)

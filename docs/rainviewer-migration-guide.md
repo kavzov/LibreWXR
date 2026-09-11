@@ -57,15 +57,17 @@ Higher tiers still offer the full functionality but require a paid subscription.
 LibreWXR provides everything the pre-restriction Rain Viewer API offered, self-hosted with no usage limits:
 
 - All zoom levels up to 12
-- All 14 color schemes + raw grayscale
+- All 15 color schemes + raw grayscale
 - 256px and 512px tiles
 - PNG and WebP formats
 - Nowcast/forecast frames (up to 60 minutes)
 - Smoothing and snow color options
 - WMO CAP weather alerts as a GeoJSON feed (`/v2/alerts` with point, bounding-box, and polygon-simplification query params)
+- Detected storm cells with centroid lat/lon and motion vectors as a GeoJSON or JSON feed (`/v2/storm-cells` with point-and-radius query params)
 
 Plus additional features Rain Viewer didn't offer:
 - Precipitation motion arrows (`?arrows=light` or `?arrows=dark`)
+- Storm-cell markers (`?cells=light` or `?cells=dark`)
 - Configurable noise filtering and speckle removal
 - ECMWF IFS 9km global model layer + NOAA RRQPE global observed precipitation (60S-70N) + regional NWP layers (HRRR, HRRR-Alaska, HRDPS, JMA MSM, AROME Antilles, AROME Guyane, AROME Indien, AROME Ncaled, AROME Polyn, DMI DINI, ICON-EU, WRF-SMN)
 - Optical flow interpolation for smooth global animation
@@ -189,7 +191,7 @@ Repeated requests for the same location hit the tile cache (the snapped origin i
 | Feature | Rain Viewer (Free, Post-2026) | Rain Viewer (Paid) | LibreWXR |
 |---|---|---|---|
 | Max zoom | 7 | 12 | 12 |
-| Color schemes | 1 | 9 | 14 + raw grayscale |
+| Color schemes | 1 | 9 | 15 + raw grayscale |
 | Tile sizes | 256px | 256px, 512px | 256px, 512px |
 | Image formats | PNG | PNG, WebP | PNG, WebP |
 | Smoothing | No | Yes | Yes |
@@ -213,7 +215,7 @@ These are things to be aware of but generally don't require code changes:
 
 - **Satellite imagery**: LibreWXR serves NOAA GMGSI where Rain Viewer's paid layer was 10-minute infrared-only (discontinued for everyone January 2026): a global (±72.7 deg) hourly LW+VIS composite — infrared at night, visible reflectance by day, with a natural day/night terminator — with up to 12 hourly frames of history. The `satellite.infrared` metadata array works the same way and tile URLs use fixed `0`/`0_0` color/options segments: `/v2/satellite/{timestamp}/{size}/{z}/{x}/{y}/0/0_0.{ext}` (png or webp). `LIBREWXR_SATELLITE_ENABLED=false` empties the catalog array and makes tile requests return 503.
 
-- **Color scheme rendering**: LibreWXR reproduces all 9 original Rain Viewer color schemes from the same color lookup tables, plus five contributed schemes (14 named total) and a raw grayscale mode (255). The visual output should be identical for a given scheme ID.
+- **Color scheme rendering**: LibreWXR reproduces all 9 original Rain Viewer color schemes from the same color lookup tables, plus six contributed schemes (15 named total) and a raw grayscale mode (255). The visual output should be identical for a given scheme ID.
 
 - **Tile caching headers**: LibreWXR serves tiles with `Cache-Control: public` — `max-age=300` (5 minutes) for the latest and nowcast frames, and `max-age=7200` (2 hours) for historical frames, which are immutable once backfill is complete. This is compatible with any CDN or caching proxy.
 

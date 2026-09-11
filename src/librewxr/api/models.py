@@ -26,6 +26,30 @@ class AlertsResponse(BaseModel):
     features: list[GeoJSONFeature]
 
 
+class StormCellProperties(BaseModel):
+    area_km2: float
+    max_dbz: float
+    motion_speed_kmh: float | None
+    motion_heading_deg: float | None
+    region: str
+
+
+class StormCellFeature(BaseModel):
+    type: Literal["Feature"] = "Feature"
+    properties: StormCellProperties
+    geometry: dict
+
+
+class StormCellsResponse(BaseModel):
+    type: Literal["FeatureCollection"] = "FeatureCollection"
+    features: list[StormCellFeature]
+
+
+class StormCellsData(BaseModel):
+    generated_at: int | None
+    cells: list[dict]
+
+
 class RadarTimestamp(BaseModel):
     time: int
     path: str

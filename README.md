@@ -42,7 +42,7 @@ Beyond this though, is the goal of creating a far more customizable API backend 
 ## Features
 
 - **Rain Viewer v2 API compatible** — drop-in replacement, no client changes needed
-- **All 14 color schemes** — Black & White, Rainviewer Original, Universal Blue, Titan, The Weather Channel (TWC), Meteored, NEXRAD Level III, Rainbow @ Selex SI, Dark Sky, Datameteo Valerio, Viper HD, MRMS CREF, 33/40 Max Storm, MetService NZ (Dark), plus raw grayscale
+- **All 15 color schemes** — Black & White, Rainviewer Original, Universal Blue, Titan, The Weather Channel (TWC), Meteored, NEXRAD Level III, Rainbow @ Selex SI, Dark Sky, Datameteo Valerio, Viper HD, MRMS CREF, 33/40 Max Storm, MetService NZ (Dark), Windy, plus raw grayscale
 - **Tile sizes** — 256px and 512px
 - **Image formats** — PNG and WebP (with configurable lossy/lossless quality)
 - **Smoothing** — zoom-adaptive Gaussian blur with seamless tile boundaries
@@ -469,7 +469,7 @@ GET /v2/radar/{timestamp}/{size}/{z}/{x}/{y}/{color}/{smooth}_{snow}.{ext}
 | `size` | `256`, `512` | Tile size in pixels |
 | `z` | integer | Zoom level |
 | `x`, `y` | integer-valued strings | Standard slippy map tile coordinates — segments containing a dot are interpreted as lat/lon (see the Radar Point Tiles section) |
-| `color` | `0`-`13`, `255` | Color scheme (see below) |
+| `color` | `0`-`14`, `255` | Color scheme (see below) |
 | `smooth` | `0`, `1` | Enable smoothing |
 | `snow` | `0`, `1` | Enable snow precipitation colors |
 | `ext` | `png`, `webp` | Image format |
@@ -515,6 +515,7 @@ without colour-space conversion.
 
 **Color schemes:**
 
+<!-- BEGIN GENERATED: color-scheme-table -->
 | ID | Name |
 |---|---|
 | 0 | Black and White |
@@ -529,9 +530,11 @@ without colour-space conversion.
 | 9 | Datameteo Valerio |
 | 10 | Viper HD |
 | 11 | MRMS CREF |
-| 12 | 33/40 Max Storm | Stepped 5-dBZ palette by ABC 33/40 Chief Meteorologist James Aydelott (via WxTools); snow variant reuses the Universal Blue gradient |
+| 12 | 33/40 Max Storm |
 | 13 | MetService NZ (Dark) |
+| 14 | Windy |
 | 255 | Raw (grayscale) |
+<!-- END GENERATED: color-scheme-table -->
 
 #### Radar Point Tiles (Lat/Lon Windows)
 
@@ -593,6 +596,30 @@ like Tornado Watches are resolved to zone polygons at ingest.
 | `simplify` | Polygon simplification tolerance in meters (default 1000, `0` = full resolution) |
 
 Returns `503` if `LIBREWXR_ALERTS_ENABLED=false`.
+
+#### Storm Cells (LibreWXR extension)
+
+```
+GET /v2/storm-cells
+GET /v2/storm-cells?lat={lat}&lon={lon}&radius_km={radius}
+GET /v2/storm-cells?format=json
+```
+
+Returns detected storm cells from the latest radar frame. The default
+response is a GeoJSON `FeatureCollection` with one `Point` feature per
+cell (centroid coordinates `[lon, lat]`); `format=json` returns a plain
+`{generated_at, cells}` payload instead. Each cell carries `area_km2`,
+`max_dbz`, `motion_speed_kmh` / `motion_heading_deg` (null when no
+motion data) and `region` properties.
+
+| Query parameter | Description |
+|---|---|
+| *(none)* | All detected cells worldwide |
+| `lat` + `lon` | Cells within `radius_km` of the point (both required together) |
+| `radius_km` | Search radius in km (default 100, ignored without lat/lon) |
+| `format` | `geojson` (default) or `json` |
+
+Returns `503` when storm-cell detection is disabled.
 
 #### Health
 
@@ -695,7 +722,7 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_WEBP_QUALITY` | `100` | WebP quality (100 = lossless default, 1-99 = lossy) |
 | `LIBREWXR_WARMER_THREADS` | *mode* | Background tile warming pool size (single: 0 = CPU count - 1; multi: 4 sizes the request-executor pool, not warming — warming is single-mode only) |
 | `LIBREWXR_COORD_PAGECACHE_PRIME_INTERVAL` | `1800` | Multi-mode interval in seconds for re-advising existing shared coordinate arrays into the host page cache (0 = every fetch cycle; reboot always re-primes) |
-| `LIBREWXR_WARM_COORD_ZOOM` | *mode* | Background pre-warm of coordinate caches up to this zoom at startup (single: 6; multi: no eager warm; 0 = mode default, negative = disabled, positive = force that zoom) |
+| `LIBREWXR_WARM_COORD_ZOOM` | *mode* | Background pre-warm of coordinate caches up to this zoom at startup (single: 4; multi: no eager warm; 0 = mode default, negative = disabled, positive = force that zoom) |
 | `LIBREWXR_WARM_OVERVIEW_ZOOM` | `4` | Pre-render overview tiles up to this zoom after each fetch (single mode only; -1 = disable) |
 | **Deployment mode + workers** | | |
 | `COMPOSE_PROFILES` | `single` | `single` or `multi` — picks compose services AND app-side per-mode defaults |
@@ -954,7 +981,7 @@ The `examples/` directory contains three self-contained HTML files showcasing th
 - **Source selector** — switch between local (`localhost:8080`) and the public instance (`api.librewxr.net`) with auto-detection
 - **Layer modes** — Radar, Satellite, or Radar + Satellite (satellite as background under radar)
 - **Light/dark theme** — toggles both the base map and UI styling
-- **Color scheme selector** — 14 color schemes plus a raw grayscale (255) option
+- **Color scheme selector** — 15 color schemes plus a raw grayscale (255) option
 - **Weather-alerts overlay** — severity-styled WMO alert polygons
 - **Options panel** — collapsible controls for smoothing, snow mask, PNG/WebP output format, and 256/512px tile size with HiDPI auto-detection
 - **Motion arrows** — off, light, or dark
@@ -1007,6 +1034,7 @@ A sample of the projects and deployments built on the LibreWXR API:
 | [Linecast](https://github.com/ashuttl/linecast) | Weather, tides, the sun, the moon, and maps, drawn for the terminal. The Old Farmer's Almanac meets Minitel. |
 | [LocalSky](https://github.com/silenthooligan/localsky) | Hyperlocal weather on your hardware. Smart irrigation when you want it. |
 | [Merry Sky](https://merrysky.net) | A lightweight forecasting website providing an all-in-one hourly summary of the upcoming temperature, precipitations and more. |
+| [Photo-Planner](https://apps.apple.com/de/app/photo-planner/id6764817751) | An app to visualize the field of view for selected cameras and lenses and overlay it onto a map. |
 | [PiClock](https://github.com/n0bel/PiClock) ([updated fork](https://github.com/SerBrynden/PiClock)) | A Fancy Clock built around a monitor and a Raspberry Pi. |
 | [Presura](https://presura.eu) | A multi-language weather viewer for the European Union. |
 | [RidePilot](https://apps.apple.com/us/app/ridepilot-smart-bike-computer/id6790916720) | A cycling tracking app. |
