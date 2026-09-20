@@ -735,7 +735,8 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_POOL_RENDER_MEMORY` | `6G` | Memory limit per renderer instance in pool mode |
 | `LIBREWXR_POOL_RENDER_MEMSWAP_LIMIT` | `-1` | Combined RAM + swap limit per pool renderer (`8G` with `7G` RAM allows 1G swap) |
 | `LIBREWXR_POOL_RENDER_CPUS` | `4.5` | CPU limit per renderer instance in pool mode |
-| `LIBREWXR_POOL_RENDER_MEMORY_LIMIT_MB` | `5120` | Internal pressure threshold per renderer instance |
+| `LIBREWXR_POOL_RENDER_MEMORY_LIMIT_MB` | `0` | Internal pressure threshold per renderer instance (`0` = auto-detect its cgroup limit) |
+| `LIBREWXR_POOL_RENDER_MEMORY_PRESSURE_CHECK_INTERVAL` | `30` | Memory-pressure check interval per pool renderer, in seconds |
 | **Multi-mode tile-server split** (set automatically by compose) | | |
 | `LIBREWXR_RENDER_ONLY` | `false` | When `1`, skip fetcher / NWP / satellite init and only render tiles from the snapshot |
 | `LIBREWXR_STATE_POLL_INTERVAL` | `1.0` | Seconds between state.json mtime polls in render-only mode |

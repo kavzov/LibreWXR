@@ -707,7 +707,7 @@ Number of uvicorn worker processes. The default tracks `LIBREWXR_MODE`.
 
 ### `LIBREWXR_MEMORY_LIMIT_MB`
 
-Memory limit in MB for the memory pressure monitor. The monitor checks the container's cgroup usage against this limit using the kernel-irreclaimable share as the decision metric: `anon + shmem` on cgroup v2 (from `memory.stat`), `rss + shmem` on cgroup v1, falling back to the raw usage file (`memory.current` / `memory.usage_in_bytes`) when the stat file can't be parsed, and finally to the worker's own RSS outside containers. Clean file-backed page cache is excluded from the decision metric because in multi mode all render workers memmap the same snapshot files — those pages are shared, clean, and kernel-reclaimable, so they are not actionable pressure (tmpfs-backed cache dirs stay counted via `shmem`). Thresholds: at ~80% it logs a warning; at ~85% each worker evicts half its tile cache and runs `malloc_trim(0)` to return freed pages to the OS; at ~90% the tile and coordinate caches are cleared entirely. Each worker applies a small fixed random offset to its thresholds (warn ±1 percentage point, evict ±2) so workers in a shared cgroup don't trip in lock-step, and an eviction level only acts after two consecutive checks above it (the warn-level log fires on the first crossing). In multi mode every worker reads the same cgroup figure, so the thresholds fire across all workers in the same check window — the cache evictions add up to a container-wide drop.
+Memory limit in MB for the memory pressure monitor. The monitor checks the container's cgroup usage against this limit using the kernel-irreclaimable share as the decision metric: `anon + shmem` on cgroup v2 (from `memory.stat`), `rss + shmem` on cgroup v1, falling back to the raw usage file (`memory.current` / `memory.usage_in_bytes`) when the stat file can't be parsed, and finally to the worker's own RSS outside containers. Clean file-backed page cache is excluded from the decision metric because in multi mode all render workers memmap the same snapshot files — those pages are shared, clean, and kernel-reclaimable, so they are not actionable pressure (tmpfs-backed cache dirs stay counted via `shmem`). Thresholds: at ~80% it logs a warning; at ~85% each worker evicts half its tile cache and runs `malloc_trim(0)` to return freed pages to the OS; at ~90% the tile and coordinate caches are cleared entirely. Each worker applies a small fixed random offset to its thresholds (warn ±1 percentage point, evict ±2) so workers in a shared cgroup don't trip in lock-step, and an eviction level only acts after two consecutive checks above it (the warn-level log fires on the first crossing). After an eviction, that worker waits 60 seconds before acting again while pressure remains elevated; dropping below the eviction band rearms it immediately. In multi mode every worker reads the same cgroup figure, so the thresholds fire across all workers in the same check window — the cache evictions add up to a container-wide drop.
 
 | | |
 |---|---|
@@ -762,7 +762,8 @@ The optional `docker-compose.pool.yml` overlay replaces the single renderer
 endpoint with two renderer containers and a `least_conn` router. Its limits
 are per instance: `LIBREWXR_POOL_WORKERS` (default `3`),
 `LIBREWXR_POOL_RENDER_MEMORY` (`6G`), `LIBREWXR_POOL_RENDER_CPUS` (`4.5`),
-`LIBREWXR_POOL_RENDER_MEMORY_LIMIT_MB` (`5120`), and
+`LIBREWXR_POOL_RENDER_MEMORY_LIMIT_MB` (`0`, auto-detected from the cgroup),
+`LIBREWXR_POOL_RENDER_MEMORY_PRESSURE_CHECK_INTERVAL` (`30` seconds), and
 `LIBREWXR_POOL_RENDER_MEMSWAP_LIMIT` (`-1`, unlimited). Set
 `LIBREWXR_RENDER_POOL_ENABLED=true` so `scripts/auto-update.sh` preserves the
 overlay during automatic rebuilds.

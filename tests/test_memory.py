@@ -32,7 +32,12 @@ class _FakeTileCache:
         self.clear_calls += 1
 
 
-def _make_monitor(monkeypatch, limit_mb: int = 1000, check_interval: int = 30):
+def _make_monitor(
+    monkeypatch,
+    limit_mb: int = 1000,
+    check_interval: int = 30,
+    eviction_cooldown_seconds: float = 60.0,
+):
     """Build a MemoryMonitor with a fake tile cache and coord-clear recorder."""
     tile_cache = _FakeTileCache()
     coord_calls: list[int] = []
@@ -41,6 +46,7 @@ def _make_monitor(monkeypatch, limit_mb: int = 1000, check_interval: int = 30):
         lambda: coord_calls.append(1),
         limit_mb,
         check_interval,
+        eviction_cooldown_seconds,
     )
     return monitor, tile_cache, coord_calls
 
@@ -392,12 +398,38 @@ class TestHysteresis:
         assert tile_cache.evict_calls == 0
         assert tile_cache.clear_calls == 0
 
-    def test_eviction_acts_every_check_once_past_hysteresis(self, monkeypatch):
+    def test_eviction_waits_for_cooldown_after_first_action(self, monkeypatch):
+        clock = {"now": 100.0}
+        monkeypatch.setattr("librewxr.memory.time.monotonic", lambda: clock["now"])
         monitor, tile_cache, _ = _make_monitor(monkeypatch)
         _fake_cgroup_usage(monkeypatch, fraction=0.875)
         for _ in range(4):
             monitor._check()
-        assert tile_cache.evict_calls == 3  # checks 2, 3, 4 all act
+        assert tile_cache.evict_calls == 1
+
+        clock["now"] += 59.0
+        monitor._check()
+        assert tile_cache.evict_calls == 1
+
+        clock["now"] += 1.0
+        monitor._check()
+        assert tile_cache.evict_calls == 2
+
+    def test_recovery_rearms_eviction_before_cooldown_expires(self, monkeypatch):
+        clock = {"now": 100.0}
+        monkeypatch.setattr("librewxr.memory.time.monotonic", lambda: clock["now"])
+        monitor, tile_cache, _ = _make_monitor(monkeypatch)
+        state = _fake_cgroup_usage(monkeypatch, fraction=0.875)
+        monitor._check()
+        monitor._check()
+        assert tile_cache.evict_calls == 1
+
+        state["fraction"] = 0.70
+        monitor._check()
+        state["fraction"] = 0.875
+        monitor._check()
+        monitor._check()
+        assert tile_cache.evict_calls == 2
 
     def test_cgroup_total_mb_reported_from_check(self, monkeypatch):
         monitor, _, _ = _make_monitor(monkeypatch)
