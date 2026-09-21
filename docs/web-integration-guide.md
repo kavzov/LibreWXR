@@ -404,7 +404,10 @@ GET /v2/storm-cells?lat={lat}&lon={lon}&radius_km={radius}
 GET /v2/storm-cells?format=json
 ```
 
-Returns detected convective storm cells from the latest radar frame. The default response is a GeoJSON `FeatureCollection` of `Point` features at each cell centroid (coordinates `[lon, lat]`); pass `format=json` for a plain `{generated_at, cells}` payload instead.
+Returns detected convective storm cells from the latest radar frame. The default response is a GeoJSON `FeatureCollection` of `Point` features at each cell centroid (coordinates `[lon, lat]`); pass `format=json` for a plain `{generated_at, detected_at, cells}` payload instead. Both formats include
+`detected_at`, the exact source radar frame timestamp, and `generated_at`, the
+detection completion time. Show markers only on the matching observed frame;
+hide them on historical or forecast frames and when the snapshot is stale.
 
 **Query parameters:**
 

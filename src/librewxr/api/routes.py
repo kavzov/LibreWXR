@@ -2551,11 +2551,16 @@ async def get_storm_cells_rest(
     # would be a cycle at module level.
     from librewxr.mcp.tools import get_storm_cells as query_storm_cells
 
-    cells = await query_storm_cells(storm_cell_store, lat, lon, radius_km)
+    snapshot = await storm_cell_store.snapshot()
+    cells = await query_storm_cells(snapshot, lat, lon, radius_km)
+    timing = {
+        "generated_at": int(snapshot.last_updated) or None,
+        "detected_at": snapshot.detected_at_timestamp or None,
+    }
 
     if format == "json":
         return StormCellsData(
-            generated_at=int(storm_cell_store.last_updated),
+            **timing,
             cells=cells,
         )
 
@@ -2576,4 +2581,4 @@ async def get_storm_cells_rest(
             )
         )
 
-    return StormCellsResponse(type="FeatureCollection", features=features)
+    return StormCellsResponse(type="FeatureCollection", features=features, **timing)

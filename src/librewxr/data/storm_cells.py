@@ -13,6 +13,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -54,6 +55,22 @@ _CELL_DTYPE = np.dtype([
 # ---------------------------------------------------------------------------
 # StormCellStore
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class StormCellSnapshot:
+    """One detection generation; arrays stay alive across a store replacement."""
+
+    cells: dict[str, np.ndarray]
+    counts: dict[str, int]
+    last_updated: float
+    detected_at_timestamp: int
+
+    async def get_cells(self) -> dict[str, np.ndarray]:
+        return self.cells
+
+    async def get_counts(self) -> dict[str, int]:
+        return self.counts
+
 
 class StormCellStore:
     """Lightweight store for detected storm cells.
@@ -180,6 +197,14 @@ class StormCellStore:
         """Return the actual cell count per region (vs the MAX cap)."""
         async with self._lock:
             return dict(self._counts)
+
+    async def snapshot(self) -> StormCellSnapshot:
+        """Read cells and their timestamps together, never across generations."""
+        async with self._lock:
+            return StormCellSnapshot(
+                dict(self._cells), dict(self._counts),
+                self._last_updated, self._detected_at_timestamp,
+            )
 
     @property
     def last_updated(self) -> float:
@@ -366,8 +391,17 @@ def detect_storm_cells(
             centroid_row = float(centroids[label][1])
 
             # Max dBZ within the cell -- decode from uint8 pixel.
-            cell_mask = labels == label
-            cell_pixels = frame_uint8[cell_mask]
+            # OpenCV already provides a tight bounding box. Restrict the
+            # maximum search to it instead of scanning the entire region for
+            # every surviving cell. Keep the label mask: holes and overlapping
+            # bounding boxes can contain pixels belonging to another cell.
+            left = int(stats[label, cv2.CC_STAT_LEFT])
+            top = int(stats[label, cv2.CC_STAT_TOP])
+            width = int(stats[label, cv2.CC_STAT_WIDTH])
+            height = int(stats[label, cv2.CC_STAT_HEIGHT])
+            window = np.s_[top:top + height, left:left + width]
+            cell_mask = labels[window] == label
+            cell_pixels = frame_uint8[window][cell_mask]
             max_pixel = int(cell_pixels.max())
             max_dbz = float(max_pixel) / 2.0 - 32.0  # decode_dbz formula
 

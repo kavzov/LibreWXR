@@ -31,6 +31,10 @@ class _MockStormCellStore:
         self._cells = {k: v for k, v in cells_by_region.items()}
         self._counts = {k: v for k, v in counts.items()}
         self.last_updated = last_updated
+        self.detected_at_timestamp = int(last_updated) - 300
+
+    async def snapshot(self):
+        return self
 
     async def get_cells(self):
         return dict(self._cells)
@@ -124,6 +128,8 @@ def test_geojson_default_shape(app):
     assert resp.status_code == 200
     data = resp.json()
     assert data["type"] == "FeatureCollection"
+    assert data["detected_at"] == 1_699_999_700
+    assert data["generated_at"] == 1_700_000_000
     assert len(data["features"]) == 2
 
     by_region = {f["properties"]["region"]: f for f in data["features"]}
@@ -163,6 +169,7 @@ def test_json_format(app):
     assert resp.status_code == 200
     data = resp.json()
     assert data["generated_at"] == 1_700_000_000
+    assert data["detected_at"] == 1_699_999_700
     assert len(data["cells"]) == 2
     keys = {
         "lat", "lon", "area_km2", "max_dbz",

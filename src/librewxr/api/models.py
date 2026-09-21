@@ -43,10 +43,13 @@ class StormCellFeature(BaseModel):
 class StormCellsResponse(BaseModel):
     type: Literal["FeatureCollection"] = "FeatureCollection"
     features: list[StormCellFeature]
+    generated_at: int | None = None
+    detected_at: int | None = None
 
 
 class StormCellsData(BaseModel):
     generated_at: int | None
+    detected_at: int | None = None
     cells: list[dict]
 
 
