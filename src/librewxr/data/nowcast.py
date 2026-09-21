@@ -37,6 +37,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -300,6 +301,9 @@ class NowcastStore:
         if cleanup_tmp:
             for path in self._memmap_dir.glob("*.tmp"):
                 path.unlink(missing_ok=True)
+            for path in self._memmap_dir.glob(".stage-*"):
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
         logger.debug(
             "Nowcast memmap directory: %s (persistent=%s)",
             self._memmap_dir, self._persistent,
@@ -325,6 +329,75 @@ class NowcastStore:
         os.replace(tmp, final)
         return np.memmap(final, dtype=data.dtype, mode="r", shape=data.shape)
 
+    def create_stage_dir(self) -> Path:
+        """Create a private directory for one generation's frame arrays."""
+        return Path(tempfile.mkdtemp(prefix=".stage-", dir=self._memmap_dir))
+
+    @staticmethod
+    def cleanup_stage_dir(stage_dir: Path) -> None:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
+    def stage_region(
+        self, stage_dir: Path, kind: str, timestamp: int,
+        name: str, data: np.ndarray,
+    ) -> np.ndarray:
+        """Move a completed region array out of anonymous RAM immediately."""
+        path = stage_dir / f"{kind}_{timestamp}_{name}.dat"
+        mm = np.memmap(path, dtype=data.dtype, mode="w+", shape=data.shape)
+        mm[:] = data
+        mm.flush()
+        del mm
+        return np.memmap(path, dtype=data.dtype, mode="r", shape=data.shape)
+
+    def _commit_region(self, name: str, data: np.ndarray) -> np.ndarray:
+        """Rename an already-written staged array, or persist a plain array."""
+        filename = getattr(data, "filename", None)
+        staged = Path(str(filename)) if filename else None
+        if (
+            staged is not None
+            and staged.parent.parent == self._memmap_dir
+            and staged.parent.name.startswith(".stage-")
+            and staged.name == f"{name}.dat"
+        ):
+            final = self._memmap_dir / staged.name
+            os.replace(staged, final)
+            return np.memmap(final, dtype=data.dtype, mode="r", shape=data.shape)
+        return self._to_memmap(name, data)
+
+    async def prune_orphan_files(self) -> tuple[int, int]:
+        """Remove old generations only after a fresh snapshot is published."""
+        async with self._lock:
+            live = {
+                Path(str(arr.filename)).name
+                for frame in (*self._frames.values(), *self._animation_frames.values())
+                for arr in frame.regions.values()
+            }
+            live.update(
+                Path(str(arr.filename)).name for arr in self._flows.values()
+            )
+            if self._nwp_flow is not None:
+                live.add(Path(str(self._nwp_flow.filename)).name)
+
+            def remove() -> tuple[int, int]:
+                count = size = 0
+                for path in self._memmap_dir.iterdir():
+                    if not path.is_file() or path.suffix != ".dat":
+                        continue
+                    if not path.name.startswith(("frame_", "animation_", "flow_")) \
+                            and path.name != "nwp_flow.dat":
+                        continue
+                    if path.name in live:
+                        continue
+                    try:
+                        size += path.stat().st_size
+                        path.unlink()
+                        count += 1
+                    except OSError:
+                        logger.warning("Could not remove stale nowcast file %s", path)
+                return count, size
+
+            return await asyncio.to_thread(remove)
+
     async def replace_all(
         self, frames: list[NowcastFrame],
     ) -> list[int]:
@@ -346,7 +419,7 @@ class NowcastStore:
             # Convert region arrays to memmaps
             for frame in frames:
                 for name, data in list(frame.regions.items()):
-                    frame.regions[name] = self._to_memmap(
+                    frame.regions[name] = self._commit_region(
                         f"frame_{frame.timestamp}_{name}", data
                     )
 
@@ -418,7 +491,7 @@ class NowcastStore:
                     except OSError:
                         pass
                 for name, data in list(frame.regions.items()):
-                    frame.regions[name] = self._to_memmap(
+                    frame.regions[name] = self._commit_region(
                         f"animation_{frame.timestamp}_{name}", data,
                     )
                 self._animation_frames[frame.timestamp] = frame
@@ -838,52 +911,55 @@ class NowcastGenerator:
         # cv2.remap; reduced for arrows which downsample flow ~10-30x
         # while drawing) and whether Phase B (per-step extrapolation)
         # runs at all.
-        nowcast_frames, flows = await asyncio.to_thread(
-            self._generate_sync,
-            prev_frame.regions, latest_frame.regions,
-            latest_ts, n_steps, interval,
-            settings.nowcast_blend_mode,
-            external_by_region,
-            extrapolate,
+        stage_dir = self._nowcast_store.create_stage_dir() if extrapolate else None
+        stage_region = (
+            lambda kind, ts, name, data: self._nowcast_store.stage_region(
+                stage_dir, kind, ts, name, data,
+            )
+            if stage_dir is not None else None
         )
-
-        # The flows swap is unconditional — the arrow overlay depends on
-        # it in both the nowcast-on and arrow-flow-only paths.
-        await self._nowcast_store.replace_flows(flows)
-
-        # Phase A-NWP — composite global flow raster for the hybrid
-        # arrow path.  Only the arrow overlay reads this (nowcast
-        # extrapolation doesn't), so gate on ``arrow_flow_enabled``.
-        # When the flag is off, clear any prior raster so a stale field
-        # can't leak arrows in a deployment that just disabled it.
-        if settings.arrow_flow_enabled and self._nwp_chain is not None:
-            nwp_flow = await asyncio.to_thread(
-                self._compute_nwp_flow_sync, prev_ts, latest_ts, interval,
+        try:
+            nowcast_frames, flows = await asyncio.to_thread(
+                self._generate_sync,
+                prev_frame.regions, latest_frame.regions,
+                latest_ts, n_steps, interval,
+                settings.nowcast_blend_mode,
+                external_by_region,
+                extrapolate,
+                stage_region,
             )
-            await self._nowcast_store.replace_nwp_flow(nwp_flow)
-        else:
-            await self._nowcast_store.replace_nwp_flow(None)
 
-        # The frames swap only matters in the nowcast-on path; skipping
-        # it on the arrow-flow-only path leaves NowcastStore._frames
-        # empty, which is exactly what ``routes.radar_tile`` expects for
-        # a nowcast-disabled deployment (no nowcast tiles to serve).
-        if extrapolate and nowcast_frames:
-            old_timestamps = await self._nowcast_store.replace_all(nowcast_frames)
-            if self._cache is not None:
-                for ts in old_timestamps:
-                    self._cache.invalidate_timestamp(ts)
-            logger.debug(
-                "Nowcast updated: %d frames (T+%d to T+%d min)",
-                len(nowcast_frames),
-                interval // 60,
-                n_steps * interval // 60,
-            )
-        elif flows:
-            logger.debug(
-                "Arrow flow updated: %d region%s (nowcast disabled)",
-                len(flows), "s" if len(flows) != 1 else "",
-            )
+            # The flows swap is unconditional — the arrow overlay depends on
+            # it in both the nowcast-on and arrow-flow-only paths.
+            await self._nowcast_store.replace_flows(flows)
+
+            # The NWP flow is only needed by the arrow overlay.
+            if settings.arrow_flow_enabled and self._nwp_chain is not None:
+                nwp_flow = await asyncio.to_thread(
+                    self._compute_nwp_flow_sync, prev_ts, latest_ts, interval,
+                )
+                await self._nowcast_store.replace_nwp_flow(nwp_flow)
+            else:
+                await self._nowcast_store.replace_nwp_flow(None)
+
+            if extrapolate and nowcast_frames:
+                old_timestamps = await self._nowcast_store.replace_all(nowcast_frames)
+                if self._cache is not None:
+                    for ts in old_timestamps:
+                        self._cache.invalidate_timestamp(ts)
+                logger.debug(
+                    "Nowcast updated: %d frames (T+%d to T+%d min)",
+                    len(nowcast_frames), interval // 60,
+                    n_steps * interval // 60,
+                )
+            elif flows:
+                logger.debug(
+                    "Arrow flow updated: %d region%s (nowcast disabled)",
+                    len(flows), "s" if len(flows) != 1 else "",
+                )
+        finally:
+            if stage_dir is not None:
+                self._nowcast_store.cleanup_stage_dir(stage_dir)
 
         # Display-only motion-compensated frames live beside, not inside,
         # the analytical nowcast timeline.  Point-nowcast and alert sampling
@@ -898,19 +974,26 @@ class NowcastGenerator:
             existing_animation = set(
                 await self._nowcast_store.get_animation_timestamps()
             )
-            animation_frames, valid_animation = await asyncio.to_thread(
-                self._generate_animation_sync,
-                observed_frames,
-                nowcast_frames,
-                flows,
-                interval,
-                substeps,
-                existing_animation,
-            )
-            changed_animation = await self._nowcast_store.update_animation(
-                animation_frames,
-                valid_animation,
-            )
+            animation_stage = self._nowcast_store.create_stage_dir()
+            try:
+                animation_frames, valid_animation = await asyncio.to_thread(
+                    self._generate_animation_sync,
+                    observed_frames,
+                    nowcast_frames,
+                    flows,
+                    interval,
+                    substeps,
+                    existing_animation,
+                    lambda kind, ts, name, data: self._nowcast_store.stage_region(
+                        animation_stage, kind, ts, name, data,
+                    ),
+                )
+                changed_animation = await self._nowcast_store.update_animation(
+                    animation_frames,
+                    valid_animation,
+                )
+            finally:
+                self._nowcast_store.cleanup_stage_dir(animation_stage)
             if self._cache is not None:
                 for timestamp in changed_animation:
                     self._cache.invalidate_timestamp(timestamp)
@@ -940,6 +1023,7 @@ class NowcastGenerator:
         blend_mode: str = "blended",
         external_by_region: dict[str, dict[int, np.ndarray]] | None = None,
         extrapolate: bool = True,
+        stage_region: Callable[[str, int, str, np.ndarray], np.ndarray] | None = None,
     ) -> tuple[list[NowcastFrame], dict[str, np.ndarray]]:
         """Synchronous nowcast generation (runs in a thread).
 
@@ -1104,7 +1188,12 @@ class NowcastGenerator:
                     # behaviour for an uncovered region.
                     continue
                 region_name, frame_data = result
-                regions[region_name] = frame_data
+                regions[region_name] = (
+                    stage_region("frame", nowcast_ts, region_name, frame_data)
+                    if stage_region is not None else frame_data
+                )
+            results.clear()
+            result = None
 
             frames.append(NowcastFrame(
                 timestamp=nowcast_ts,
@@ -1129,6 +1218,7 @@ class NowcastGenerator:
         interval: int,
         substeps: int,
         existing_timestamps: set[int] | None = None,
+        stage_region: Callable[[str, int, str, np.ndarray], np.ndarray] | None = None,
     ) -> tuple[list[NowcastFrame], set[int]]:
         """Build display-only frames between native timeline timestamps.
 
@@ -1149,6 +1239,11 @@ class NowcastGenerator:
         existing_timestamps = existing_timestamps or set()
         generated: list[NowcastFrame] = []
         valid_timestamps: set[int] = set()
+
+        def retain(timestamp: int, name: str, data: np.ndarray) -> np.ndarray:
+            if stage_region is None:
+                return data
+            return stage_region("animation", timestamp, name, data)
 
         observed_frames = sorted(observed_frames, key=lambda frame: frame.timestamp)
         last_observed_pair = len(observed_frames) - 2
@@ -1192,7 +1287,9 @@ class NowcastGenerator:
                     interpolated, flow = interpolate_pair_at_fraction(
                         data0, data1, part / substeps, flow=flow,
                     )
-                    target.regions[region_name] = interpolated
+                    target.regions[region_name] = retain(
+                        target.timestamp, region_name, interpolated,
+                    )
                 del flow
             generated.extend(targets)
 
@@ -1247,8 +1344,9 @@ class NowcastGenerator:
             if data is not None and flow_low is not None:
                 flow = _upscale_flow(flow_low, data.shape)
                 for target, _, _, _, _, total_step in forecast_jobs:
-                    target.regions[region_name] = _extrapolate_forward(
-                        data, flow, total_step,
+                    target.regions[region_name] = retain(
+                        target.timestamp, region_name,
+                        _extrapolate_forward(data, flow, total_step),
                     )
                 del flow
                 continue
@@ -1266,7 +1364,9 @@ class NowcastGenerator:
                 interpolated, fallback_flow = interpolate_pair_at_fraction(
                     data0, data1, fraction, flow=fallback_flow,
                 )
-                target.regions[region_name] = interpolated
+                target.regions[region_name] = retain(
+                    target.timestamp, region_name, interpolated,
+                )
             del fallback_flow
 
         return generated, valid_timestamps

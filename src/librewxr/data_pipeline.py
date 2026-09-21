@@ -244,6 +244,7 @@ async def run_pipeline() -> None:
         # atomic rename to a worker thread so the serialisation never
         # blocks the event loop.
         payload = snapshot_state(stores)
+        snapshot_written = False
         try:
             await asyncio.to_thread(
                 write_state_snapshot,
@@ -251,8 +252,26 @@ async def run_pipeline() -> None:
                 cache_dir,
                 settings.state_retention_generations,
             )
+            snapshot_written = True
         except Exception:
             logger.exception("Failed to dump master state snapshot")
+        # A restarted pipeline starts with an empty in-memory timeline, so
+        # update_animation cannot see files left by the previous process.
+        # Prune them only after publishing a populated replacement snapshot;
+        # render workers can then reload the current generation safely.
+        if (
+            snapshot_written and nowcast_store is not None
+            and nowcast_store.__getstate__() is not None
+        ):
+            try:
+                removed, bytes_removed = await nowcast_store.prune_orphan_files()
+                if removed:
+                    logger.info(
+                        "Removed %d orphaned nowcast files (%d bytes)",
+                        removed, bytes_removed,
+                    )
+            except Exception:
+                logger.exception("Failed to prune orphaned nowcast files")
         # Prime freshly written memmap frames into the host page cache so
         # render workers don't cold-fault on a slow backing disk (the host
         # page cache is shared between the pipeline and renderer

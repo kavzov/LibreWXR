@@ -150,6 +150,67 @@ class TestNowcastStore:
         assert [frame.period for frame in frames] == ["past", "forecast"]
         assert await store.get_animation_frame(999) is None
 
+    @pytest.mark.asyncio
+    async def test_staged_frames_commit_without_copy_and_survive_reload(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        store = NowcastStore(cache_dir=tmp_path)
+        stage = store.create_stage_dir()
+        data = np.full((4, 5), 37, dtype=np.uint8)
+        staged = store.stage_region(stage, "frame", 1000, "R", data)
+        animation = store.stage_region(stage, "animation", 500, "R", data)
+
+        def no_second_write(*_args):
+            raise AssertionError("staged arrays must be renamed, not copied")
+
+        monkeypatch.setattr(store, "_to_memmap", no_second_write)
+        await store.replace_all([NowcastFrame(1000, {"R": staged})])
+        await store.update_animation(
+            [NowcastFrame(500, {"R": animation}, period="past")], {500},
+        )
+        store.cleanup_stage_dir(stage)
+        assert not stage.exists()
+
+        reloaded = NowcastStore(cache_dir=tmp_path, cleanup_tmp=False)
+        reloaded.__setstate__(store.__getstate__())
+        frame, _ = await reloaded.get_frame(1000)
+        np.testing.assert_array_equal(frame.regions["R"], data)
+        observed = await reloaded.get_animation_frame(500)
+        np.testing.assert_array_equal(observed.regions["R"], data)
+
+    @pytest.mark.asyncio
+    async def test_orphan_prune_keeps_current_generation(self, tmp_path: Path):
+        store = NowcastStore(cache_dir=tmp_path)
+        await store.replace_all([
+            NowcastFrame(1000, {"R": np.ones((2, 3), dtype=np.uint8)}),
+        ])
+        await store.update_animation([
+            NowcastFrame(500, {"R": np.ones((2, 3), dtype=np.uint8)}),
+        ], {500})
+        directory = tmp_path / "nowcast"
+        stale = directory / "animation_100_R.dat"
+        stale.write_bytes(b"old")
+        unrelated = directory / "other.dat"
+        unrelated.write_bytes(b"keep")
+
+        assert await store.prune_orphan_files() == (1, 3)
+        assert not stale.exists()
+        assert (directory / "frame_1000_R.dat").exists()
+        assert (directory / "animation_500_R.dat").exists()
+        assert unrelated.exists()
+
+    def test_pipeline_start_removes_abandoned_stage_only(self, tmp_path: Path):
+        store = NowcastStore(cache_dir=tmp_path)
+        stage = store.create_stage_dir()
+        store.stage_region(
+            stage, "frame", 1000, "R", np.ones((2, 2), dtype=np.uint8),
+        )
+        live = tmp_path / "nowcast" / "frame_900_R.dat"
+        live.write_bytes(b"live")
+        NowcastStore(cache_dir=tmp_path)
+        assert not stage.exists()
+        assert live.exists()
+
 
 def test_animation_generator_inserts_midpoints_without_changing_native_frames():
     observed0 = RadarFrame(
@@ -179,6 +240,28 @@ def test_animation_generator_inserts_midpoints_without_changing_native_frames():
     ]
     assert frames[0].regions["R"].mean() == pytest.approx(22, abs=1)
     assert frames[1].blend_weight == pytest.approx(0.9)
+
+
+def test_animation_generation_stages_each_region(tmp_path: Path):
+    store = NowcastStore(cache_dir=tmp_path)
+    stage = store.create_stage_dir()
+    observed = [
+        RadarFrame(timestamp=ts, regions={"R": np.full((8, 8), value, np.uint8)})
+        for ts, value in [(0, 20), (300, 24)]
+    ]
+    forecast = [NowcastFrame(
+        timestamp=600, regions={"R": np.full((8, 8), 24, np.uint8)},
+    )]
+    frames, valid = NowcastGenerator._generate_animation_sync(
+        observed, forecast, {"R": np.zeros((8, 8, 2), np.float32)},
+        interval=300, substeps=2, existing_timestamps=set(),
+        stage_region=lambda kind, ts, name, data: store.stage_region(
+            stage, kind, ts, name, data,
+        ),
+    )
+    assert valid == {150, 450}
+    assert all(isinstance(frame.regions["R"], np.memmap) for frame in frames)
+    assert [frame.regions["R"].shape for frame in frames] == [(8, 8), (8, 8)]
 
 
 def test_animation_generator_backfills_history_incrementally():
@@ -548,6 +631,22 @@ class TestCoarsen:
         assert step1.shape == step6.shape == (H, W)
         assert step1.dtype == np.uint8 and step6.dtype == np.uint8
         assert step6.max() < step1.max()
+
+    def test_generate_sync_stages_forecast_steps(self, tmp_path: Path):
+        store = NowcastStore(cache_dir=tmp_path)
+        stage = store.create_stage_dir()
+        blob = _make_blob(60, 120)
+        frames, _ = NowcastGenerator._generate_sync(
+            {"USCOMP": blob}, {"USCOMP": blob},
+            latest_ts=1000, n_steps=3, interval=300,
+            stage_region=lambda kind, ts, name, data: store.stage_region(
+                stage, kind, ts, name, data,
+            ),
+        )
+        assert len(frames) == 3
+        assert all(isinstance(frame.regions["USCOMP"], np.memmap)
+                   for frame in frames)
+        assert [frame.timestamp for frame in frames] == [1300, 1600, 1900]
 
     def test_generate_sync_coarsen_disabled_matches_raw_warp(self, monkeypatch):
         """With coarsening disabled, the step-6 frame is bit-identical to
