@@ -3,7 +3,7 @@
 #   docker compose -f docker-compose.yml -f docker-compose.pool.yml up -d
 
 x-pool-renderer: &pool-renderer
-  profiles: ["multi"]
+  profiles: ["multi", "single"]
   build: .
   command: ["python", "-m", "librewxr.main"]
   env_file:
@@ -65,7 +65,7 @@ services:
       LIBREWXR_LOG_FILE: /logs/librewxr-secondary.log
 
   renderer-router:
-    profiles: ["multi"]
+    profiles: ["multi", "single"]
     image: ${LIBREWXR_NGINX_IMAGE:-docker.io/library/nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de}
     command: ["nginx", "-g", "daemon off;"]
     ports:

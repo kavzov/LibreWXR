@@ -1,0 +1,43 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+        implementation: [numpy]
+        include:
+          - python-version: "3.12"
+            implementation: native
+    name: Python ${{ matrix.python-version }} / ${{ matrix.implementation }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -e ".[dev,mcp]"
+      - name: Build and install native extension
+        if: matrix.implementation == 'native'
+        run: |
+          .venv/bin/python -m pip install ./native
+          .venv/bin/python -c "import _librewxr_native"
+      - name: Run tests
+        env:
+          LIBREWXR_NATIVE_RENDER: ${{ matrix.implementation == 'native' && 'on' || 'off' }}
+        run: .venv/bin/python -m pytest -q

@@ -6,8 +6,9 @@ We don't exercise the full fetch loop here — that touches real network
 endpoints and is covered by the per-source integration tests.  The
 goals are:
 
-1. ``run_pipeline`` errors out loudly when ``LIBREWXR_CACHE_DIR`` is
-   unset (the multi-worker split is meaningless without a shared dir).
+1. An unset ``LIBREWXR_CACHE_DIR`` falls back to a stable tempdir via
+   ``resolve_cache_dir`` (covered in test_config.py); a render-only
+   worker still fails loudly when no pipeline ever writes state.json.
 2. The module imports without dragging in FastAPI / uvicorn.
 3. A minimal pipeline can be wired up far enough to dump a state.json
    snapshot and shut down cleanly when SIGTERM arrives.
@@ -27,6 +28,23 @@ import pytest
 pytestmark = pytest.mark.store
 
 
+@pytest.fixture(autouse=True)
+def _restore_render_singletons(monkeypatch):
+    # Lifespan tests rewire global routes state. Restore it afterwards so
+    # API fixtures collected earlier retain their own stores and executors.
+    from librewxr.api import routes
+
+    for name in (
+        "frame_store", "tile_cache", "nwp_grids", "ecmwf_grid", "nwp_chain",
+        "satellite_grids", "nowcast_store", "storm_cell_store", "alerts_store",
+        "alerts_fetcher", "radar_cache", "radar_fetcher", "enabled_regions",
+        "alerts_enabled", "precip_mask", "shared_tile_store", "present_executor",
+        "io_executor", "render_queue", "memory_monitor", "tile_request_tracker",
+        "start_time",
+    ):
+        monkeypatch.setattr(routes, name, getattr(routes, name))
+
+
 def test_module_does_not_import_fastapi():
     # The whole point of the split is that the pipeline doesn't need
     # FastAPI / uvicorn / starlette / librewxr.api pulled in.  We can't
@@ -42,17 +60,51 @@ def test_module_does_not_import_fastapi():
     assert hasattr(mod, "main")
 
 
-def test_run_pipeline_requires_cache_dir(monkeypatch):
-    # No cache_dir → SystemExit with a clear message.  Without this the
-    # pipeline would silently start with no shared snapshot and render
-    # workers would idle forever waiting for state.json.
+@pytest.mark.parametrize("separate_alerts_cache", [False, True])
+async def test_pipeline_alerts_cache_precedence(tmp_path, monkeypatch, separate_alerts_cache):
+    """The alerts fetcher honours its explicit cache, or uses the shared one."""
+    from unittest.mock import Mock
+
+    from librewxr import data_pipeline
     from librewxr.config import settings
 
-    monkeypatch.setattr(settings, "cache_dir", "")
-    from librewxr import data_pipeline
+    shared_cache = tmp_path / "shared"
+    alerts_cache = tmp_path / "alerts"
+    monkeypatch.setattr(settings, "cache_dir", str(shared_cache))
+    monkeypatch.setattr(
+        settings, "alerts_cache_dir", str(alerts_cache) if separate_alerts_cache else "",
+    )
+    monkeypatch.setattr(settings, "alerts_enabled", True)
+    monkeypatch.setattr(data_pipeline, "_mask_save_task", None)
+    for name in ("nowcast_enabled", "arrow_flow_enabled", "storm_cells_enabled"):
+        monkeypatch.setattr(settings, name, False)
 
-    with pytest.raises(SystemExit, match="LIBREWXR_CACHE_DIR"):
-        asyncio.run(data_pipeline.run_pipeline())
+    monkeypatch.setattr(data_pipeline, "enabled_regions_with_always_on", Mock(return_value=[]))
+    for name in ("collect_nwp_contributions", "collect_satellite_contributions"):
+        monkeypatch.setattr(data_pipeline, name, Mock(return_value=[]))
+    monkeypatch.setattr(
+        data_pipeline, "collect_radar_coverage_metadata", Mock(return_value=({}, {}, {})),
+    )
+    for name in (
+        "FrameStore", "RadarFetcher", "build_coverage_masks", "build_feather_masks",
+        "persist_masks_in_background",
+    ):
+        monkeypatch.setattr(data_pipeline, name, Mock())
+    monkeypatch.setattr(
+        data_pipeline, "RadarFrameCache", Mock(return_value=Mock(load_frames=lambda _: [])),
+    )
+
+    class AlertsWired(Exception):
+        pass
+
+    fetcher = Mock(side_effect=AlertsWired)
+    monkeypatch.setattr(data_pipeline, "WMOAlertsFetcher", fetcher)
+    # Stop at construction, before any network fetch or signal registration.
+    with pytest.raises(AlertsWired):
+        await data_pipeline.run_pipeline()
+
+    expected = alerts_cache if separate_alerts_cache else shared_cache
+    assert fetcher.call_args.kwargs["cache_dir"] == str(expected)
 
 
 def test_pipeline_writes_state_json_via_hook(tmp_path, monkeypatch):
@@ -107,8 +159,8 @@ def test_pipeline_writes_state_json_via_hook(tmp_path, monkeypatch):
     assert "ecmwf_grid" not in payload["stores"]
 
 
-@pytest.mark.asyncio
-async def test_render_only_lifespan_picks_up_snapshot(tmp_path, monkeypatch):
+@pytest.mark.parametrize("fallback_cache", [False, True])
+async def test_render_only_lifespan_picks_up_snapshot(tmp_path, monkeypatch, fallback_cache):
     # Pipeline-side: write a state.json with one frame.  Render-only-side:
     # spin up _render_only_lifespan and confirm the FrameStore came back
     # populated and routes were wired.
@@ -127,7 +179,7 @@ async def test_render_only_lifespan_picks_up_snapshot(tmp_path, monkeypatch):
     dump_state({"frame_store": producer}, cache_dir)
 
     monkeypatch.setattr(settings, "render_only", True)
-    monkeypatch.setattr(settings, "cache_dir", str(cache_dir))
+    monkeypatch.setattr(settings, "cache_dir", "" if fallback_cache else str(cache_dir))
     # Disable optional stores that don't appear in the snapshot — keeps
     # the render-only path from spinning up Cloud / Nowcast plumbing
     # this smoke test doesn't care about.  Both ``nowcast_enabled`` and
@@ -147,6 +199,9 @@ async def test_render_only_lifespan_picks_up_snapshot(tmp_path, monkeypatch):
     from librewxr import main as main_module
     from librewxr.api import routes
 
+    if fallback_cache:
+        monkeypatch.setattr(main_module, "resolve_cache_dir", lambda _: cache_dir)
+
     # The warm-pass jitter (uniform 0..15 s) would stall this smoke test;
     # the constant is module-level precisely so tests can neutralize it.
     monkeypatch.setattr(main_module, "_WARM_JITTER_MAX_S", 0.0)
@@ -158,6 +213,7 @@ async def test_render_only_lifespan_picks_up_snapshot(tmp_path, monkeypatch):
     async with main_module._render_only_lifespan(_StubApp()):
         # Frame store should have been populated from the snapshot.
         assert routes.frame_store is not None
+        assert settings.cache_dir == str(cache_dir)
         timestamps = await routes.frame_store.get_timestamps()
         assert timestamps == [42]
         # Render-only workers must not have a fetcher or radar_cache.
@@ -369,16 +425,31 @@ async def test_render_only_lifespan_yields_before_coord_warm(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_render_only_requires_cache_dir(monkeypatch):
+    # A missing LIBREWXR_CACHE_DIR no longer hard-fails: resolve_cache_dir
+    # falls back to a stable per-host tempdir.  With no pipeline writing
+    # state.json there, the worker fails on the state wait timeout, and
+    # the error names the fallback path so the operator can see where it
+    # looked.
+    import tempfile
+    from pathlib import Path
+
     from librewxr.config import settings
 
     monkeypatch.setattr(settings, "render_only", True)
     monkeypatch.setattr(settings, "cache_dir", "")
+    monkeypatch.setattr(settings, "state_wait_timeout", 1)
+    monkeypatch.setattr(settings, "state_poll_interval", 0.1)
 
     from librewxr import main as main_module
+
+    fallback = Path(tempfile.gettempdir()) / "librewxr-cache"
 
     class _StubApp:
         pass
 
-    with pytest.raises(RuntimeError, match="LIBREWXR_CACHE_DIR"):
+    with pytest.raises(RuntimeError) as excinfo:
         async with main_module._render_only_lifespan(_StubApp()):
             pass
+    message = str(excinfo.value)
+    assert "Is the data pipeline running?" in message
+    assert str(fallback) in message

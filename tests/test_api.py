@@ -141,7 +141,6 @@ def _make_test_app() -> tuple[FastAPI, FrameStore, TileCache, int, int]:
     routes.frame_store = store
     routes.tile_cache = cache
     routes.ecmwf_grid = None
-    routes.tile_warmer = None
     routes.nowcast_store = None
     routes.start_time = time.time()
     routes.enabled_regions = ["USCOMP"]
@@ -679,15 +678,19 @@ class TestHealthCluster:
         assert requests["hot_tiles"] >= 0
         assert "hit_rate" in requests
 
-    def test_cluster_survives_reader_failure(self, client, monkeypatch):
+    def test_cluster_survives_reader_failure(self, client, monkeypatch, tmp_path):
         """A failing pulse scan degrades the section to None — /health
         itself must never raise."""
         c, _, _ = client
 
+        # Pin cache_dir so the pulse-scan branch is taken; on a clean
+        # checkout cache_dir is empty and the route skips
+        # read_worker_pulses entirely, so no failure would occur.
+        monkeypatch.setattr(settings, "cache_dir", str(tmp_path))
+
         def boom(_cache_dir):
             raise OSError("pulse scan failed")
 
-        monkeypatch.setattr(settings, "cache_dir", "/nonexistent/test-cache")
         monkeypatch.setattr(
             "librewxr.api.routes.read_worker_pulses", boom,
         )

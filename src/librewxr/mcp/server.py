@@ -159,17 +159,12 @@ def build_mcp_http_app():
 def main() -> None:
     """Console entry point for the stdio transport (``librewxr-mcp``).
 
-    Requires ``LIBREWXR_CACHE_DIR`` to point at the shared volume where
-    the data pipeline (or single-mode server) writes ``state.json``.
+    Reads the shared cache directory where
+    the data pipeline writes ``state.json`` (``librewxr.main`` auto-spawns
+    the pipeline when run without ``LIBREWXR_RENDER_ONLY``).
     """
     from librewxr.mcp.context import build_stdio_lifespan
 
-    if not settings.cache_dir:
-        raise SystemExit(
-            "LIBREWXR_CACHE_DIR must be set for the stdio MCP transport -- "
-            "it's the shared directory the data pipeline (or single-mode "
-            "server) writes state.json into."
-        )
     mcp = FastMCP(
         "librewxr-mcp",
         lifespan=build_stdio_lifespan,
