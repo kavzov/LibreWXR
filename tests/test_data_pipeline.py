@@ -55,6 +55,53 @@ def test_run_pipeline_requires_cache_dir(monkeypatch):
         asyncio.run(data_pipeline.run_pipeline())
 
 
+@pytest.mark.parametrize("separate_alerts_cache", [False, True])
+async def test_pipeline_alerts_cache_precedence(tmp_path, monkeypatch, separate_alerts_cache):
+    """The alerts fetcher honours its explicit cache, or uses the shared one."""
+    from unittest.mock import Mock
+
+    from librewxr import data_pipeline
+    from librewxr.config import settings
+
+    shared_cache = tmp_path / "shared"
+    alerts_cache = tmp_path / "alerts"
+    monkeypatch.setattr(settings, "cache_dir", str(shared_cache))
+    monkeypatch.setattr(
+        settings, "alerts_cache_dir", str(alerts_cache) if separate_alerts_cache else "",
+    )
+    monkeypatch.setattr(settings, "alerts_enabled", True)
+    monkeypatch.setattr(data_pipeline, "_mask_save_task", None)
+    for name in ("nowcast_enabled", "arrow_flow_enabled", "storm_cells_enabled"):
+        monkeypatch.setattr(settings, name, False)
+
+    monkeypatch.setattr(data_pipeline, "enabled_regions_with_always_on", Mock(return_value=[]))
+    for name in ("collect_nwp_contributions", "collect_satellite_contributions"):
+        monkeypatch.setattr(data_pipeline, name, Mock(return_value=[]))
+    monkeypatch.setattr(
+        data_pipeline, "collect_radar_coverage_metadata", Mock(return_value=({}, {}, {})),
+    )
+    for name in (
+        "FrameStore", "RadarFetcher", "build_coverage_masks", "build_feather_masks",
+        "persist_masks_in_background",
+    ):
+        monkeypatch.setattr(data_pipeline, name, Mock())
+    monkeypatch.setattr(
+        data_pipeline, "RadarFrameCache", Mock(return_value=Mock(load_frames=lambda _: [])),
+    )
+
+    class AlertsWired(Exception):
+        pass
+
+    fetcher = Mock(side_effect=AlertsWired)
+    monkeypatch.setattr(data_pipeline, "WMOAlertsFetcher", fetcher)
+    # Stop at construction, before any network fetch or signal registration.
+    with pytest.raises(AlertsWired):
+        await data_pipeline.run_pipeline()
+
+    expected = alerts_cache if separate_alerts_cache else shared_cache
+    assert fetcher.call_args.kwargs["cache_dir"] == str(expected)
+
+
 def test_pipeline_writes_state_json_via_hook(tmp_path, monkeypatch):
     # End-to-end: bypass the heavy bits (fetcher, nwp_chain, alerts)
     # and verify that on_cycle_complete dumps state.json with the

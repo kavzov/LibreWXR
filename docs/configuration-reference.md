@@ -1658,7 +1658,9 @@ Max concurrent HTTP connections when polling the WMO endpoints.
 
 ### `LIBREWXR_ALERTS_CACHE_DIR`
 
-Cache directory for the downloaded MeteoAlarm geocode data. Empty = system temp.
+Cache directory for the downloaded MeteoAlarm geocode data. When set, takes
+precedence over `LIBREWXR_CACHE_DIR` in both deployment modes. When empty, uses
+`LIBREWXR_CACHE_DIR` if configured, otherwise the system temp directory.
 
 | | |
 |---|---|

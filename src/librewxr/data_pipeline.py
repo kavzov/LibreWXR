@@ -331,13 +331,13 @@ async def run_pipeline() -> None:
 
     alerts_fetcher = None
     if alerts_store is not None:
+        # An explicit alerts cache takes precedence over the shared cache.
         alerts_cache = (
-            cache_dir if settings.cache_dir
-            else (Path(settings.alerts_cache_dir) if settings.alerts_cache_dir else None)
+            Path(settings.alerts_cache_dir) if settings.alerts_cache_dir else cache_dir
         )
         alerts_fetcher = WMOAlertsFetcher(
             store=alerts_store,
-            cache_dir=str(alerts_cache) if alerts_cache else None,
+            cache_dir=str(alerts_cache),
             interval=settings.alerts_fetch_interval,
             concurrency=settings.alerts_concurrency,
         )

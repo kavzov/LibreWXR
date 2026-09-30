@@ -1056,9 +1056,10 @@ async def lifespan(app: FastAPI):
     alerts_store = None
     alerts_fetcher = None
     if settings.alerts_enabled:
-        alerts_cache = Path(settings.cache_dir) if settings.cache_dir else None
-        if alerts_cache is None and settings.alerts_cache_dir:
-            alerts_cache = Path(settings.alerts_cache_dir)
+        alerts_cache = (
+            Path(settings.alerts_cache_dir) if settings.alerts_cache_dir
+            else (Path(settings.cache_dir) if settings.cache_dir else None)
+        )
 
         alerts_store = AlertsStore()
         alerts_fetcher = WMOAlertsFetcher(
