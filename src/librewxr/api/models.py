@@ -164,6 +164,7 @@ class RadarPointNowcastFrame(BaseModel):
     wet_fraction: float | None
     max_dbz: float | None
     max_rate_mmh: float | None
+    sample_cell_distance_km: float | None = None
     blend_weight: float
 
 

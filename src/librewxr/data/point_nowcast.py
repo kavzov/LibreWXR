@@ -32,6 +32,7 @@ class RadarNeighborhoodSample:
     wet_fraction: float | None
     max_dbz: float | None
     max_rate_mmh: float | None
+    sample_cell_distance_km: float | None = None
 
 
 def _point_pixel_coordinates(
@@ -128,7 +129,9 @@ def sample_neighborhood(
     cols = np.arange(col_min, col_max + 1, dtype=np.float64)
     row_dist = (rows[:, None] - row_f) * row_km
     col_dist = (cols[None, :] - col_f) * col_km
+    distances = np.sqrt(row_dist * row_dist + col_dist * col_dist)
     circle = row_dist * row_dist + col_dist * col_dist <= radius_km * radius_km
+    sampled_distances = distances[circle]
     pixels = np.asarray(frame_array[row_min:row_max + 1, col_min:col_max + 1])[circle]
     if pixels.size == 0:
         # A radius smaller than half a native pixel can otherwise miss every
@@ -147,13 +150,18 @@ def sample_neighborhood(
                 max_rate_mmh=None,
             )
         pixels = np.asarray([frame_array[row, col]], dtype=np.uint8)
+        sampled_distances = np.asarray([math.hypot((row - row_f) * row_km, (col - col_f) * col_km)])
 
+    cell_distance = float(np.min(sampled_distances))
     threshold = max(1, int(math.ceil((noise_floor_dbz + 32.0) * 2.0)))
     wet = pixels >= threshold
     wet_count = int(np.count_nonzero(wet))
     sample_count = int(pixels.size)
     if wet_count:
+        # Report the distance of the selected maximum-rate cell. Equal rates
+        # use the nearest cell, then native row/column order deterministically.
         max_pixel = int(np.max(pixels[wet]))
+        cell_distance = float(np.min(sampled_distances[wet & (pixels == max_pixel)]))
         max_dbz = max_pixel / 2.0 - 32.0
         max_rate_mmh = dbz_to_rate_mmh(max_dbz)
     else:
@@ -167,6 +175,7 @@ def sample_neighborhood(
         wet_fraction=wet_count / sample_count,
         max_dbz=max_dbz,
         max_rate_mmh=max_rate_mmh,
+        sample_cell_distance_km=cell_distance,
     )
 
 
@@ -299,5 +308,6 @@ def _frame_payload(
         "wet_fraction": sample.wet_fraction,
         "max_dbz": sample.max_dbz,
         "max_rate_mmh": sample.max_rate_mmh,
+        "sample_cell_distance_km": sample.sample_cell_distance_km,
         "blend_weight": blend_weight,
     }

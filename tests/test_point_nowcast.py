@@ -227,3 +227,29 @@ def test_point_nowcast_endpoint_without_observations(monkeypatch) -> None:
 
     assert response.status_code == 503
     assert response.json()["detail"] == "Radar observations not available"
+
+
+def test_station_cell_distance_dry_wet_and_subpixel() -> None:
+    region = _region()
+    grid = np.zeros((10, 10), dtype=np.uint8)
+    dry = sample_neighborhood(region, 0.05, 0.05, 1.2, grid, 10.0)
+    assert dry.coverage == "in_range"
+    assert dry.sample_cell_distance_km == pytest.approx(0.0)
+    assert dry.max_rate_mmh is None
+
+    grid[5, 6] = _encoded(30.0)
+    wet = sample_neighborhood(region, 0.05, 0.05, 1.2, grid, 10.0)
+    assert wet.sample_cell_distance_km == pytest.approx(1.1132, abs=0.001)
+    assert wet.max_rate_mmh > 0
+    from librewxr.api.models import RadarPointNowcastFrame
+    from librewxr.data.point_nowcast import _frame_payload
+    model = RadarPointNowcastFrame(**_frame_payload(1, 0, "observed", wet, 1.0))
+    assert model.model_dump()["sample_cell_distance_km"] == wet.sample_cell_distance_km
+
+    nearest = sample_neighborhood(region, 0.055, 0.055, 0.01, grid, 10.0)
+    assert nearest.sample_count == 1
+    assert nearest.sample_cell_distance_km > 0.7
+
+    missing = sample_neighborhood(region, 5.0, 5.0, 0.5, grid, 10.0)
+    assert missing.coverage == "out_of_range"
+    assert missing.sample_cell_distance_km is None
