@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 import shutil
@@ -229,6 +230,35 @@ def parse_s3_listing_keys(xml_bytes: bytes) -> list[str]:
         if elem.tag.endswith("Key"):
             keys.append(elem.text or "")
     return keys
+
+
+def _decode_band_rows(chunk_rows: int, factor: int) -> int:
+    """Rows per decode band: a multiple of both the HDF5 chunk height and
+    the downsample factor.
+
+    Chunk alignment means every compressed chunk is inflated exactly
+    once (a band edge inside a chunk would inflate it twice); factor
+    alignment keeps each downsample block inside one band.  The live
+    GLB-5 chunks are 813 rows, so the default factor 2 decodes four
+    1626-row bands.  Contiguous (unchunked) variables use ~1024 rows.
+    """
+    if chunk_rows > 0:
+        return math.lcm(chunk_rows, factor)
+    return -(-1024 // factor) * factor
+
+
+def _band_readable(shape: tuple[int, ...], rows: int, cols: int) -> bool:
+    """True for a ``(rows, cols)`` or ``(1, rows, cols)`` variable."""
+    if len(shape) == 2:
+        return tuple(shape) == (rows, cols)
+    return len(shape) == 3 and shape[0] == 1 and tuple(shape[1:]) == (rows, cols)
+
+
+def _read_row_band(var, ndim: int, start: int, stop: int) -> np.ndarray:
+    """Read rows ``[start, stop)`` of a 2D (or leading-singleton 3D) variable."""
+    if ndim == 3:
+        return np.asarray(var[0, start:stop, :])
+    return np.asarray(var[start:stop, :])
 
 
 def _fmt_slot(ts: int) -> str:
@@ -564,50 +594,88 @@ class RRQPEGrid:
 
         Reads the ``Rows``/``Columns`` dimensions and the RRQPE variable
         attributes from the file itself (so tests can feed small
-        synthetic files); the module constants are the fallback when the
-        file doesn't carry them.  DQF==3 pixels become NaN before the
-        block-nanmean downsample, then Z-R encode.
+        synthetic files).  The packed int16 values are read raw (netCDF4
+        auto mask-and-scale off) and ``scale_factor`` / ``add_offset``
+        are applied exactly once here — leaving auto-scaling on and
+        scaling again would divide every rate by 10.  DQF==3 and
+        ``_FillValue`` pixels become NaN before the block-nanmean
+        downsample, then Z-R encode.
+
+        Decoding runs in row bands (``_decode_band_rows``) so only one
+        band's float32 working set is alive at a time: the whole-grid
+        path peaked at ~2.5 GB RSS per 4 MB file, a band at a few hundred
+        MB.  Bands start on multiples of the downsample factor, so block
+        averaging never straddles a band edge and the result is identical
+        to decoding the whole grid at once.
         """
         import netCDF4
 
+        factor = self._downsample
         tmp_path = None
+        ds = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp:
                 tmp.write(data_bytes)
                 tmp_path = tmp.name
             with HDF5_LOCK:
                 ds = netCDF4.Dataset(tmp_path, "r")
-                try:
-                    rows = ds.dimensions["Rows"].size
-                    cols = ds.dimensions["Columns"].size
-                    rvar = ds.variables["RRQPE"]
-                    rate_raw = np.asarray(rvar[:], dtype=np.float64)
-                    scale = float(getattr(rvar, "scale_factor", 1.0))
-                    offset = float(getattr(rvar, "add_offset", 0.0))
-                    dqf = np.asarray(ds.variables["DQF"][:])
-                finally:
-                    ds.close()
-            # Collapse a leading singleton time dimension if present.
-            if rate_raw.ndim == 3:
-                rate_raw = rate_raw[0]
-            if dqf.ndim == 3:
-                dqf = dqf[0]
-            if rate_raw.shape != (rows, cols) or dqf.shape != (rows, cols):
+                rows = ds.dimensions["Rows"].size
+                cols = ds.dimensions["Columns"].size
+                rvar = ds.variables["RRQPE"]
+                dvar = ds.variables["DQF"]
+                rvar.set_auto_maskandscale(False)
+                dvar.set_auto_maskandscale(False)
+                scale = np.float32(getattr(rvar, "scale_factor", 1.0))
+                offset = np.float32(getattr(rvar, "add_offset", 0.0))
+                fill = getattr(rvar, "_FillValue", None)
+                chunking = rvar.chunking()
+                rshape, dshape = rvar.shape, dvar.shape
+            # A leading singleton time dimension is allowed and skipped.
+            if not (
+                _band_readable(rshape, rows, cols)
+                and _band_readable(dshape, rows, cols)
+            ):
                 logger.warning(
                     "RRQPE: unexpected shape rate=%s dqf=%s (want (%d, %d)); "
                     "rejecting",
-                    rate_raw.shape, dqf.shape, rows, cols,
+                    rshape, dshape, rows, cols,
                 )
                 return None
-            rate = (rate_raw * scale + offset).astype(np.float32)
-            # DQF==3 is no-data; DQF==2 (degraded) stays valid.
-            rate = np.where(dqf == 3, np.nan, rate)
-            downsampled = block_nanmean_downsample(rate, self._downsample)
-            return precip_rate_to_dbz_encoded(downsampled, dbz_offset=dbz_offset)
+            chunk_rows = chunking[-2] if isinstance(chunking, list) else 0
+            band_rows = _decode_band_rows(chunk_rows, factor)
+            out_rows, out_cols = rows // factor, cols // factor
+            crop_rows = out_rows * factor
+            encoded = np.empty((out_rows, out_cols), dtype=np.uint8)
+            for start in range(0, crop_rows, band_rows):
+                stop = min(start + band_rows, crop_rows)
+                with HDF5_LOCK:
+                    raw = _read_row_band(rvar, len(rshape), start, stop)
+                    dqf = _read_row_band(dvar, len(dshape), start, stop)
+                rate = raw.astype(np.float32)
+                rate *= scale
+                rate += offset
+                # DQF==3 is no-data; DQF==2 (degraded) stays valid.
+                invalid = dqf == 3
+                if fill is not None:
+                    invalid |= raw == fill
+                rate[invalid] = np.nan
+                del raw, dqf, invalid
+                downsampled = block_nanmean_downsample(rate, factor)
+                del rate
+                encoded[start // factor:stop // factor] = precip_rate_to_dbz_encoded(
+                    downsampled, dbz_offset=dbz_offset,
+                )
+            return encoded
         except Exception:
             logger.exception("RRQPE: failed to decode NetCDF4 buffer")
             return None
         finally:
+            if ds is not None:
+                with HDF5_LOCK:
+                    try:
+                        ds.close()
+                    except Exception:
+                        pass
             if tmp_path is not None:
                 try:
                     Path(tmp_path).unlink(missing_ok=True)

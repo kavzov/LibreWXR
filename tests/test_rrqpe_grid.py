@@ -475,7 +475,8 @@ def _synthetic_nc_bytes(rows: int = 4, cols: int = 4, rate: float = 3.0) -> byte
         rvar.add_offset = np.float32(0.0)
         rvar.units = "mm/h"
         dvar = ds.createVariable("DQF", "i1", ("Rows", "Columns"))
-        rvar[:] = np.full((rows, cols), int(rate / 0.1), dtype=np.int16)
+        # Auto-scaling packs the physical rate (mm/h) to int16 on write.
+        rvar[:] = np.full((rows, cols), rate, dtype=np.float32)
         dvar[:] = np.zeros((rows, cols), dtype=np.int8)
         ds.close()
         with open(path, "rb") as fh:
@@ -485,6 +486,124 @@ def _synthetic_nc_bytes(rows: int = 4, cols: int = 4, rate: float = 3.0) -> byte
             os.unlink(path)
         except OSError:
             pass
+
+
+def _packed_nc_bytes(
+    packed: np.ndarray,
+    dqf: np.ndarray,
+    *,
+    chunk_rows: int | None = None,
+    time_dim: bool = False,
+) -> bytes:
+    """NetCDF4 buffer with explicit packed int16 RRQPE values and DQF flags.
+
+    ``chunk_rows`` sets the HDF5 chunk height (full-width chunks) so the
+    banded decode crosses several chunks; ``time_dim`` adds a leading
+    singleton dimension in front of both variables.
+    """
+    from netCDF4 import Dataset
+
+    rows, cols = packed.shape
+    dims = ("Rows", "Columns")
+    chunks = [chunk_rows, cols] if chunk_rows else None
+    if time_dim:
+        dims = ("time",) + dims
+        chunks = [1] + chunks if chunks else None
+    fd, path = tempfile.mkstemp(suffix=".nc")
+    os.close(fd)
+    try:
+        ds = Dataset(path, "w", format="NETCDF4")
+        if time_dim:
+            ds.createDimension("time", 1)
+        ds.createDimension("Rows", rows)
+        ds.createDimension("Columns", cols)
+        rvar = ds.createVariable(
+            "RRQPE", "i2", dims, fill_value=np.int16(-9990),
+            zlib=True, chunksizes=chunks,
+        )
+        rvar.scale_factor = np.float32(0.1)
+        rvar.add_offset = np.float32(0.0)
+        dvar = ds.createVariable("DQF", "i1", dims, zlib=True, chunksizes=chunks)
+        # Write the packed integers as-is: auto-scaling on write would
+        # divide them by scale_factor.
+        rvar.set_auto_maskandscale(False)
+        rvar[:] = packed[None] if time_dim else packed
+        dvar[:] = dqf[None] if time_dim else dqf
+        ds.close()
+        with open(path, "rb") as fh:
+            return fh.read()
+    finally:
+        os.unlink(path)
+
+
+def _whole_grid_reference(
+    packed: np.ndarray, dqf: np.ndarray, factor: int, dbz_offset: float,
+) -> np.ndarray:
+    """Decode the packed grid in one pass, scaling exactly once."""
+    rate = packed.astype(np.float32) * np.float32(0.1)
+    rate[(dqf == 3) | (packed == -9990)] = np.nan
+    return precip_rate_to_dbz_encoded(
+        block_nanmean_downsample(rate, factor), dbz_offset=dbz_offset,
+    )
+
+
+class TestDecode:
+    def test_scale_factor_applied_exactly_once(self, tmp_path):
+        """A packed 30 (× 0.1) must decode as 3.0 mm/h, not 0.3 mm/h."""
+        grid = RRQPEGrid(cache_dir=tmp_path, downsample=1)
+        encoded = grid._decode_to_encoded(
+            _synthetic_nc_bytes(rows=4, cols=4, rate=3.0), 6.0,
+        )
+        expected = precip_rate_to_dbz_encoded(
+            np.array([[3.0]], dtype=np.float32), dbz_offset=6.0,
+        )[0, 0]
+        assert encoded is not None
+        assert np.all(encoded == expected)
+
+    @pytest.mark.parametrize("factor", [1, 2, 4])
+    @pytest.mark.parametrize("chunk_rows", [None, 3, 5])
+    def test_banded_decode_matches_whole_grid(self, tmp_path, factor, chunk_rows):
+        rng = np.random.default_rng(42)
+        rows, cols = 37, 24  # odd row count: the crop drops the tail rows
+        packed = rng.integers(0, 600, size=(rows, cols)).astype(np.int16)
+        packed[rng.random((rows, cols)) < 0.4] = 0
+        dqf = np.zeros((rows, cols), dtype=np.int8)
+        dqf[rng.random((rows, cols)) < 0.1] = 2  # degraded stays valid
+        dqf[rng.random((rows, cols)) < 0.1] = 3  # no-data
+        packed[rng.random((rows, cols)) < 0.05] = -9990
+        packed[:4, :4] = -9990  # an all-missing block at every factor
+        data = _packed_nc_bytes(packed, dqf, chunk_rows=chunk_rows)
+
+        grid = RRQPEGrid(cache_dir=tmp_path, downsample=factor)
+        encoded = grid._decode_to_encoded(data, 6.0)
+
+        expected = _whole_grid_reference(packed, dqf, factor, 6.0)
+        assert encoded is not None
+        assert encoded.shape == (rows // factor, cols // factor)
+        np.testing.assert_array_equal(encoded, expected)
+
+    def test_leading_singleton_time_dimension(self, tmp_path):
+        packed = np.full((6, 8), 50, dtype=np.int16)
+        dqf = np.zeros((6, 8), dtype=np.int8)
+        data = _packed_nc_bytes(packed, dqf, chunk_rows=2, time_dim=True)
+
+        encoded = RRQPEGrid(cache_dir=tmp_path, downsample=2)._decode_to_encoded(
+            data, 6.0,
+        )
+
+        np.testing.assert_array_equal(
+            encoded, _whole_grid_reference(packed, dqf, 2, 6.0),
+        )
+
+    def test_band_rows_align_to_chunks_and_factor(self):
+        from librewxr.sources.world.rrqpe.grid import _decode_band_rows
+
+        # Live GLB-5 chunks are 813 rows.
+        assert _decode_band_rows(813, 1) == 813
+        assert _decode_band_rows(813, 2) == 1626
+        assert _decode_band_rows(813, 4) == 3252
+        assert _decode_band_rows(0, 2) == 1024
+        assert _decode_band_rows(0, 3) % 3 == 0
 
 
 class _S3Transport:
