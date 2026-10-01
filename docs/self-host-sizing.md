@@ -186,13 +186,21 @@ disk budget. The lightning artifact adds ~360 small files/hour under
 caches.
 
 **RRQPE memory:** the RRQPE observed-precipitation layer (NOAA
-Enterprise Rain Rate) is now a radar region, so its frames live in the
-FrameStore like any other region: 12 past frames × ~29 MB at the
-default downsample (`LIBREWXR_RRQPE_DOWNSAMPLE=2`, 0.04° stored) is
-~350 MB, plus ~175 MB of nowcast-extrapolated frames (6 × ~29 MB) and
-transient warp buffers comparable to USCOMP's existing peaks.  Net add
-versus the old NWP-source form is roughly the nowcast half.  Factor 4
-(0.08°) cuts a frame to ~7 MB; factor 1 (native 0.02°) is ~117 MB.
+Enterprise Rain Rate) is a radar region, so its frames live in the
+FrameStore like any other region. Each frame is 27.9 MiB at the default
+downsample (`LIBREWXR_RRQPE_DOWNSAMPLE=2`, 0.04°). It is held as a
+file-backed memmap in the scan store (~11-12 scans), the FrameStore
+(`MAX_FRAMES` plus grace), the nowcast (`NOWCAST_FRAMES`) and, with
+`RADAR_ANIMATION_SUBSTEPS=2`, the animation intermediates. The three
+retained state generations keep two superseded nowcast/animation sets alive
+as hardlinks. That totals ~3.2 GiB of disk and reclaimable page cache at
+12 past + 12 nowcast frames.
+
+Transient anon in the pipeline is ~1 GiB NumPy-tracked (up to ~2 GiB RSS)
+during each nowcast pass, because the global wrap-padded warp builds full
+coordinate grids, and ~0.3 GiB per decoded scan. Factor 4 (0.08°) cuts a
+frame to ~7 MiB; factor 1 (native 0.02°) is ~112 MiB. Measurements and an
+enable/rollback procedure are in [rrqpe-rollout.md](rrqpe-rollout.md).
 
 ## Configuration Knobs
 

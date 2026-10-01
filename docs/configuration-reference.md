@@ -921,6 +921,8 @@ NOAA's Enterprise Rain Rate (RRQPE) GLB-5 blend is ingested as a single coarse g
 
 It is an IR-based satellite **estimate**, not a measurement: it underestimates warm / stratiform rain, is unreliable over snow and ice surfaces, and only covers the 60°S-70°N geostationary ring. Scans publish on a 10-min cadence with ~17-min median latency.
 
+Every RRQPE frame carries the scan 30 minutes older than its label (see `LIBREWXR_RRQPE_MATCH_TOLERANCE_SECONDS`), and the optical-flow nowcast extrapolates that stale frame forward. With `LIBREWXR_FETCH_INTERVAL` below the 600-second scan cadence, consecutive frames share a scan. The flow then alternates between zero (persistence) and twice the real motion, so RRQPE forecast frames are low-confidence at 5-minute fetch intervals. `/v2/radar/point-nowcast.json` labels RRQPE answers with `source.type: "satellite"` and `source.nominal_lag_seconds: 1800`. For memory figures, the nowcast analysis and an enable/rollback procedure, see [rrqpe-rollout.md](rrqpe-rollout.md).
+
 Data is distributed under the NOAA Open Data Dissemination (NODD) program. Attribution is requested: "Precipitation data from NOAA Enterprise Rain Rate (RRQPE)". No endorsement by NOAA is implied, and don't present modified data as unaltered NOAA data. Blend inputs include JMA Himawari-9 and EUMETSAT Meteosat-9/10; courtesy attribution to the contributing agencies is appreciated but not required.
 
 #### `LIBREWXR_RRQPE_ENABLED`
