@@ -247,6 +247,15 @@ small circle and returns observed and forecast frames relative to the latest
 observation. Check `stale` and each frame's `coverage` before using its
 `wet_fraction`, `max_dbz`, or `max_rate_mmh` values.
 
+Check `source.type` before calling the result radar. Outside Doppler
+coverage, the 60S-70N band is answered by the RRQPE satellite estimate
+(`"type": "satellite"`, ~4.45 km cells). Its frames carry a scan
+`source.nominal_lag_seconds` (30 minutes) older than their label, so
+"now" is a 30-35 minute old estimate. Show the requested attribution
+(`source.attribution`) next to it. At a five-minute fetch interval, treat
+its forecast frames as low-confidence; the
+[RRQPE rollout notes](rrqpe-rollout.md) explain why.
+
 The returned forecast horizon is data-driven. With a five-minute fetch
 interval and six configured nowcast frames it is 30 minutes; use twelve frames
 to publish 60 minutes. Increasing the count extends the existing optical-flow

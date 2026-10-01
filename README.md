@@ -331,7 +331,13 @@ around one coordinate. Each frame includes its observed/forecast period,
 minute offset from the latest observation, radar coverage, region, sampled and
 wet pixel counts, wet fraction, maximum dBZ/rain rate, and nowcast blend
 weight. The response also reports the latest observation age, stale status,
-and the history/forecast horizons actually available.
+and the history/forecast horizons actually available, plus a `source` object
+naming the region that answered and what it observes: `type` is `radar` for
+Doppler composites and `satellite` for RRQPE, together with the grid spacing,
+the nominal data lag (RRQPE frames carry the scan 30 minutes older than their
+label) and the requested attribution. `source` is `null` when no frame has
+in-range data for the point. See [RRQPE rollout notes](docs/rrqpe-rollout.md)
+for how RRQPE behaves in the forecast frames.
 
 `radius_km` accepts `(0, 10]`, `past_minutes` accepts `0-120`, and
 `future_minutes` accepts `0-60`. The endpoint only filters frames already held
@@ -348,6 +354,13 @@ Example response fields:
   "stale": false,
   "history_minutes_available": 30,
   "forecast_minutes_available": 30,
+  "source": {
+    "region": "OPERA",
+    "type": "radar",
+    "grid_spacing_km": 1.0,
+    "nominal_lag_seconds": null,
+    "attribution": null
+  },
   "frames": [
     {
       "time": 1787372700,

@@ -26,6 +26,8 @@ from __future__ import annotations
 from librewxr.config import settings
 from librewxr.data.regions import RegionDef
 
+from .grid import RRQPE_LAG_SECONDS
+
 
 def _downsample_factor() -> int:
     """The configured block-averaging factor for the native 0.02° grid."""
@@ -50,6 +52,11 @@ RRQPE = RegionDef(
     # Coarse global fill layer — no meaningful convective cells at the
     # 25 km² storm-cell minimum (see ``RegionDef.storm_cells``).
     storm_cells=False,
+    # A geostationary IR rain-rate estimate, not Doppler reflectivity;
+    # every frame carries the scan RRQPE_LAG_SECONDS older than its label.
+    observation_type="satellite",
+    nominal_lag_seconds=RRQPE_LAG_SECONDS,
+    attribution="Precipitation data from NOAA Enterprise Rain Rate (RRQPE)",
 )
 
 

@@ -185,6 +185,18 @@ class RadarPointNowcastFrame(BaseModel):
     blend_weight: float
 
 
+class RadarPointNowcastSource(BaseModel):
+    """The region that answers a point-nowcast request and what it observes."""
+
+    region: str
+    type: Literal["radar", "satellite"]
+    # Coarser axis of the region's native cell at the requested latitude.
+    grid_spacing_km: float
+    # Fixed offset between source data time and frame time (RRQPE: 1800).
+    nominal_lag_seconds: int | None = None
+    attribution: str | None = None
+
+
 class RadarPointNowcastResponse(BaseModel):
     generated: int
     latitude: float
@@ -196,4 +208,6 @@ class RadarPointNowcastResponse(BaseModel):
     stale: bool
     history_minutes_available: int
     forecast_minutes_available: int
+    # None unless at least one frame carries in-range data for the point.
+    source: RadarPointNowcastSource | None = None
     frames: list[RadarPointNowcastFrame]

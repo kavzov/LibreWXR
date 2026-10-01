@@ -38,6 +38,16 @@ class RegionDef:
     # junk cell markers in the ``?cells=`` overlay.  Default True — every
     # Doppler-derived regional composite stays eligible.
     storm_cells: bool = True
+    # What the region's frames observe: "radar" for Doppler composites,
+    # "satellite" for satellite-derived estimates (RRQPE).  Point consumers
+    # report it so a satellite estimate is never presented as radar.
+    observation_type: str = "radar"
+    # Fixed design offset (seconds) between the source data time and the
+    # frame time it is served under — RRQPE serves each frame the scan
+    # 30 min its senior.  None when the region declares no fixed offset.
+    nominal_lag_seconds: int | None = None
+    # Attribution requested by the data provider; empty when none declared.
+    attribution: str = ""
     # Lambert Azimuthal Equal Area parameters (only used when proj="laea")
     laea_lat0: float = 0.0   # latitude of projection origin
     laea_lon0: float = 0.0   # central meridian

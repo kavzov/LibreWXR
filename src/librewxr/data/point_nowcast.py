@@ -252,7 +252,35 @@ async def build_point_nowcast(
         "stale": latest_age_seconds > max(fetch_interval * 2, 600),
         "history_minutes_available": max(history_offsets, default=0),
         "forecast_minutes_available": max(forecast_offsets, default=0),
+        "source": _source_payload(region, lat, frames),
         "frames": frames,
+    }
+
+
+def _source_payload(
+    region: RegionDef | None, lat: float, frames: list[dict],
+) -> dict | None:
+    """Describe the region whose data answered the request.
+
+    ``None`` unless at least one frame carries in-range data: a region can
+    resolve by its bbox while its provider is disabled or failing (e.g.
+    RRQPE under ``LIBREWXR_ENABLED_REGIONS=ALL`` with
+    ``LIBREWXR_RRQPE_ENABLED=false``), and an empty series must not be
+    labelled with that region's observation type.  Callers use ``type`` to
+    keep a satellite estimate (RRQPE) from being presented as radar, and
+    ``nominal_lag_seconds`` to date its frames.
+    """
+    if region is None or not any(
+        frame["coverage"] == "in_range" for frame in frames
+    ):
+        return None
+    row_km, col_km = _pixel_size_km(region, lat)
+    return {
+        "region": region.name,
+        "type": region.observation_type,
+        "grid_spacing_km": round(max(row_km, col_km), 2),
+        "nominal_lag_seconds": region.nominal_lag_seconds,
+        "attribution": region.attribution or None,
     }
 
 

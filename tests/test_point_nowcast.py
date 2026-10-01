@@ -176,6 +176,7 @@ def test_build_point_nowcast_reports_stale_and_no_coverage(monkeypatch) -> None:
     assert result["latest_age_seconds"] >= 1_200
     assert all(frame["coverage"] == "out_of_range" for frame in result["frames"])
     assert all(frame["region"] is None for frame in result["frames"])
+    assert result["source"] is None
 
 
 def test_point_nowcast_endpoint_and_query_validation(monkeypatch) -> None:
@@ -205,6 +206,8 @@ def test_point_nowcast_endpoint_and_query_validation(monkeypatch) -> None:
     assert response.status_code == 200
     data = response.json()
     assert data["radius_km"] == 1.2
+    assert data["source"]["region"] == "TEST_POINT"
+    assert data["source"]["type"] == "radar"
     assert data["forecast_minutes_available"] == 10
     assert data["frames"][-1]["period"] == "forecast"
     assert response.headers["cache-control"] == "private, max-age=60"
