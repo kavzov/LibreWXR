@@ -24,6 +24,7 @@ from librewxr.data.nowcast import (
     _coarsen_frame,
     _coarsen_sigma_km,
     _compute_flow,
+    _compute_region_flow,
     _coverage_degraded,
     _extrapolate_forward,
     _max_flow_pixels,
@@ -1996,3 +1997,135 @@ class TestNowcastStoreSetstateStaleFiles:
         assert leftover.exists()
         # The store still operates normally on the shared dir.
         assert store._memmap_dir == nowcast_dir
+
+
+# ---------------------------------------------------------------------------
+# Coarse native cadence (RRQPE: 600 s scans served on 300 s frames)
+# ---------------------------------------------------------------------------
+
+
+class _MultiFrameStore:
+    def __init__(self, frames: dict[int, dict]):
+        self._frames = frames
+
+    async def get_timestamps(self):
+        return sorted(self._frames)
+
+    async def get_frame(self, ts):
+        if ts not in self._frames:
+            return None
+        return RadarFrame(timestamp=ts, regions=dict(self._frames[ts]))
+
+
+class TestNativeCadencePairing:
+    """Frames every 300 s over scans every 600 s: the newest pair repeats a
+    scan, so motion must be measured one scan apart and halved."""
+
+    _NAME = "COARSE_CADENCE"
+
+    @pytest.fixture
+    def coarse_region(self, monkeypatch):
+        from librewxr.data import regions as _regions_mod
+        from librewxr.data.regions import RegionDef
+
+        def register(native: int) -> RegionDef:
+            region = RegionDef(
+                name=self._NAME, west=0.0, east=12.0, south=0.0, north=6.0,
+                pixel_size=0.05, group="TEST",
+                grid_width=W, grid_height=H,
+                native_interval_seconds=native,
+            )
+            monkeypatch.setitem(_regions_mod.REGIONS, self._NAME, region)
+            return region
+        return register
+
+    @staticmethod
+    def _wet_mean_dx(flow: np.ndarray, frame: np.ndarray) -> float:
+        h, w = flow.shape[:2]
+        wet = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA) > 0
+        return float(flow[..., 0][wet].mean())
+
+    async def _run(self, monkeypatch):
+        from librewxr.config import settings
+
+        scan_old = _make_blob(60, 100, radius=20)
+        scan_new = _make_blob(60, 104, radius=20)  # 4 px per 600 s scan step
+        frames = {
+            1000: {self._NAME: scan_old},
+            1300: {self._NAME: scan_new},
+            1600: {self._NAME: scan_new},  # same scan served again
+        }
+        store = NowcastStore()
+        gen = NowcastGenerator(_MultiFrameStore(frames), store, cache=None,
+                               nowcast_contributions=[])
+        for name, value in {
+            "fetch_interval": 300, "nowcast_enabled": True, "nowcast_frames": 2,
+            "nowcast_blend_mode": "radar", "radar_animation_substeps": 1,
+            "arrow_flow_enabled": False, "nowcast_coarsen_enabled": False,
+        }.items():
+            monkeypatch.setattr(settings, name, value)
+        await gen.generate()
+        flow = (await store.get_flows())[self._NAME]
+        return self._wet_mean_dx(flow, scan_new), store
+
+    async def test_flow_measured_one_scan_apart_and_halved(self, monkeypatch, coarse_region):
+        coarse_region(600)
+        mean_dx, store = await self._run(monkeypatch)
+        # 4 px per 600 s scan step -> ~2 px per 300 s frame step.
+        assert mean_dx == pytest.approx(2.0, abs=0.7)
+        frame, _ = await store.get_frame(1900)
+        assert frame is not None and self._NAME in frame.regions
+
+    async def test_without_native_cadence_the_repeated_scan_freezes_motion(
+        self, monkeypatch, coarse_region,
+    ):
+        coarse_region(0)  # pre-fix behaviour: newest pair is one scan twice
+        mean_dx, _ = await self._run(monkeypatch)
+        assert abs(mean_dx) < 0.3
+
+    async def test_falls_back_to_plain_pair_without_older_frame(self, coarse_region):
+        coarse_region(600)
+        latest = {self._NAME: _make_blob(60, 104, radius=20)}
+        prev = {self._NAME: _make_blob(60, 100, radius=20)}
+        gen = NowcastGenerator(
+            _MultiFrameStore({1300: prev, 1600: latest}), NowcastStore(),
+            cache=None, nowcast_contributions=[],
+        )
+        prev_regions = dict(prev)
+        scales = await gen._native_cadence_pairs(
+            latest, prev_regions, 1600, [1300, 1600], 300,
+        )
+        assert scales == {}
+        assert prev_regions[self._NAME] is prev[self._NAME]
+
+    def test_flow_scale_halves_unclamped_flow_and_one_is_identity(self):
+        prev = _make_blob(60, 100, radius=20)
+        latest = _make_blob(60, 104, radius=20)
+        _, base_clamped, base, _ = _compute_region_flow("UNREGISTERED", prev, latest, 1000, 600)
+        _, same_clamped, same, _ = _compute_region_flow(
+            "UNREGISTERED", prev, latest, 1000, 600, flow_scale=1.0,
+        )
+        assert np.array_equal(base, same) and np.array_equal(base_clamped, same_clamped)
+        _, _, half, _ = _compute_region_flow(
+            "UNREGISTERED", prev, latest, 1000, 600, flow_scale=0.5,
+        )
+        assert np.array_equal(half, base * np.float32(0.5))
+
+    def test_animation_uses_pair_flow_for_coarse_cadence_regions(self):
+        """A repeated scan must not be smeared by the rescaled forecast flow."""
+        scan = _make_blob(60, 104, radius=20)
+        observed = [
+            RadarFrame(timestamp=1300, regions={self._NAME: scan}),
+            RadarFrame(timestamp=1600, regions={self._NAME: scan.copy()}),
+        ]
+        flows = {self._NAME: np.full((H, W, 2), (2.0, 0.0), dtype=np.float32)}
+
+        smeared, _ = NowcastGenerator._generate_animation_sync(
+            observed, [], flows, 300, 2,
+        )
+        own_pair, _ = NowcastGenerator._generate_animation_sync(
+            observed, [], flows, 300, 2, pair_flow_regions=frozenset({self._NAME}),
+        )
+
+        assert not np.array_equal(smeared[0].regions[self._NAME], scan)
+        assert np.array_equal(own_pair[0].regions[self._NAME], scan)

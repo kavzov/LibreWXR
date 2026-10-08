@@ -48,6 +48,12 @@ class RegionDef:
     nominal_lag_seconds: int | None = None
     # Attribution requested by the data provider; empty when none declared.
     attribution: str = ""
+    # Native cadence (seconds) of the region's underlying data when it is
+    # coarser than the fetch interval — RRQPE scans every 600 s while frames
+    # may be stored every 300 s, so neighbouring frames can repeat a scan.
+    # The nowcast then measures motion between frames one native interval
+    # apart.  0 = the data updates every fetch interval.
+    native_interval_seconds: int = 0
     # Lambert Azimuthal Equal Area parameters (only used when proj="laea")
     laea_lat0: float = 0.0   # latitude of projection origin
     laea_lon0: float = 0.0   # central meridian

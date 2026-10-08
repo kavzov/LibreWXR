@@ -881,6 +881,17 @@ class NowcastGenerator:
         interval = settings.fetch_interval
         extrapolate = settings.nowcast_enabled
 
+        # Regions whose data updates slower than the fetch interval (RRQPE:
+        # one scan per 600 s) measure motion against the frame one native
+        # interval back — the newest pair may repeat a scan (zero flow) or
+        # straddle a full scan step (double speed).  The flow is scaled back
+        # to per-interval motion; without that older frame the plain pair is
+        # used.
+        prev_regions = dict(prev_frame.regions)
+        flow_scales = await self._native_cadence_pairs(
+            latest_frame.regions, prev_regions, latest_ts, timestamps, interval,
+        )
+
         # External nowcast contributions are part of the extrapolation
         # phase only — the arrow-flow path doesn't need them (it never
         # produces forecast frames), so skip the async fetch entirely
@@ -931,12 +942,13 @@ class NowcastGenerator:
         try:
             nowcast_frames, flows = await asyncio.to_thread(
                 self._generate_sync,
-                prev_frame.regions, latest_frame.regions,
+                prev_regions, latest_frame.regions,
                 latest_ts, n_steps, interval,
                 settings.nowcast_blend_mode,
                 external_by_region,
                 extrapolate,
                 stage_region,
+                flow_scales,
             )
 
             # The flows swap is unconditional — the arrow overlay depends on
@@ -997,6 +1009,7 @@ class NowcastGenerator:
                     lambda kind, ts, name, data: self._nowcast_store.stage_region(
                         animation_stage, kind, ts, name, data,
                     ),
+                    frozenset(flow_scales),
                 )
                 changed_animation = await self._nowcast_store.update_animation(
                     animation_frames,
@@ -1023,6 +1036,43 @@ class NowcastGenerator:
                     for timestamp in changed_animation:
                         self._cache.invalidate_timestamp(timestamp)
 
+    async def _native_cadence_pairs(
+        self,
+        latest_regions: dict[str, np.ndarray],
+        prev_regions: dict[str, np.ndarray],
+        latest_ts: int,
+        timestamps: list[int],
+        interval: int,
+    ) -> dict[str, float]:
+        """Swap in older frames for coarse-cadence regions; return scales.
+
+        Mutates ``prev_regions`` for every region whose
+        ``RegionDef.native_interval_seconds`` exceeds ``interval`` and whose
+        frame one native interval back is stored, and returns
+        ``{region: interval / native_interval}`` for those regions.
+        """
+        from librewxr.data.regions import REGIONS as _ALL_REGIONS
+
+        older_cache: dict[int, RadarFrame | None] = {}
+        scales: dict[str, float] = {}
+        stored = set(timestamps)
+        for name in latest_regions:
+            region_def = _ALL_REGIONS.get(name)
+            native = region_def.native_interval_seconds if region_def else 0
+            if native <= interval:
+                continue
+            older_ts = latest_ts - native
+            if older_ts not in stored:
+                continue
+            if older_ts not in older_cache:
+                older_cache[older_ts] = await self._store.get_frame(older_ts)
+            older = older_cache[older_ts]
+            if older is None or name not in older.regions:
+                continue
+            prev_regions[name] = older.regions[name]
+            scales[name] = interval / native
+        return scales
+
     @staticmethod
     def _generate_sync(
         prev_regions: dict[str, np.ndarray],
@@ -1034,6 +1084,7 @@ class NowcastGenerator:
         external_by_region: dict[str, dict[int, np.ndarray]] | None = None,
         extrapolate: bool = True,
         stage_region: Callable[[str, int, str, np.ndarray], np.ndarray] | None = None,
+        flow_scales: dict[str, float] | None = None,
     ) -> tuple[list[NowcastFrame], dict[str, np.ndarray]]:
         """Synchronous nowcast generation (runs in a thread).
 
@@ -1092,10 +1143,12 @@ class NowcastGenerator:
         # come back in the same order as the ``latest_regions``
         # iteration; assembly happens here in the driving thread only
         # (task bodies never mutate shared dicts).
+        flow_scales = flow_scales or {}
         region_results = list(_nowcast_pool().map(
             lambda r: _compute_region_flow(
                 r, prev_regions.get(r), latest_regions.get(r),
                 flow_target_dim, interval,
+                flow_scale=flow_scales.get(r, 1.0),
             ),
             latest_regions,
         ))
@@ -1229,6 +1282,7 @@ class NowcastGenerator:
         substeps: int,
         existing_timestamps: set[int] | None = None,
         stage_region: Callable[[str, int, str, np.ndarray], np.ndarray] | None = None,
+        pair_flow_regions: frozenset[str] = frozenset(),
     ) -> tuple[list[NowcastFrame], set[int]]:
         """Build display-only frames between native timeline timestamps.
 
@@ -1288,7 +1342,13 @@ class NowcastGenerator:
             for region_name in sorted(common_regions):
                 data0 = frame0.regions[region_name]
                 data1 = frame1.regions[region_name]
-                flow_low = flows.get(region_name)
+                # Coarse-cadence regions extrapolate with a flow measured one
+                # native interval apart and rescaled; it does not describe this
+                # pair (which may repeat a scan), so the pair gets its own.
+                flow_low = (
+                    None if region_name in pair_flow_regions
+                    else flows.get(region_name)
+                )
                 flow = (
                     _upscale_flow(flow_low, data0.shape)
                     if flow_low is not None else None
@@ -1537,8 +1597,15 @@ def _compute_region_flow(
     data1: np.ndarray | None,
     flow_target_dim: int,
     interval: int,
+    flow_scale: float = 1.0,
 ) -> tuple[str, np.ndarray, np.ndarray, float | None] | None:
     """Phase A per-region optical-flow task (runs on the nowcast pool).
+
+    ``flow_scale`` converts motion measured between ``data0`` and ``data1``
+    to motion per ``interval`` — below 1 when the pair is one native
+    interval of a coarse-cadence region apart (see
+    ``RegionDef.native_interval_seconds``).  It is applied to the low-
+    resolution field before the per-interval clamp.
 
     Returns ``None`` when the region must be skipped this cycle —
     either a prev/latest frame is missing (silent skip, as before) or
@@ -1598,6 +1665,8 @@ def _compute_region_flow(
         flow_small * (1.0 / scale)
         if scale < 1.0 else flow_small
     )
+    if flow_scale != 1.0:
+        flow_unclamped = flow_unclamped * np.float32(flow_scale)
     # Cap unphysical motion vectors before extrapolation.  Without
     # this, Farneback's polynomial fit at data/no-data boundaries
     # reports 50-200+ px/step magnitudes, which the inverse-warp

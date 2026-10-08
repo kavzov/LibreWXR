@@ -26,7 +26,7 @@ from __future__ import annotations
 from librewxr.config import settings
 from librewxr.data.regions import RegionDef
 
-from .grid import RRQPE_LAG_SECONDS
+from .grid import RRQPE_LAG_SECONDS, SCAN_INTERVAL_SECONDS
 
 
 def _downsample_factor() -> int:
@@ -57,6 +57,9 @@ RRQPE = RegionDef(
     observation_type="satellite",
     nominal_lag_seconds=RRQPE_LAG_SECONDS,
     attribution="Precipitation data from NOAA Enterprise Rain Rate (RRQPE)",
+    # One scan per 10 min: at a 5-min fetch interval two consecutive frames
+    # carry the same scan, so motion is measured one scan apart.
+    native_interval_seconds=SCAN_INTERVAL_SECONDS,
 )
 
 

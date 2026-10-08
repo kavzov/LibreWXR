@@ -252,9 +252,9 @@ coverage, the 60S-70N band is answered by the RRQPE satellite estimate
 (`"type": "satellite"`, ~4.45 km cells). Its frames carry a scan
 `source.nominal_lag_seconds` (30 minutes) older than their label, so
 "now" is a 30-35 minute old estimate. Show the requested attribution
-(`source.attribution`) next to it. At a five-minute fetch interval, treat
-its forecast frames as low-confidence; the
-[RRQPE rollout notes](rrqpe-rollout.md) explain why.
+(`source.attribution`) next to it. Its forecast frames extrapolate that
+lagged estimate, so give them lower confidence than radar; the
+[RRQPE rollout notes](rrqpe-rollout.md) have the details.
 
 The returned forecast horizon is data-driven. With a five-minute fetch
 interval and six configured nowcast frames it is 30 minutes; use twelve frames

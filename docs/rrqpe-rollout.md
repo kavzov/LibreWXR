@@ -104,23 +104,26 @@ Two caveats matter to clients:
    The "current" RRQPE frame is a 30-35 minute old estimate, and a forecast
    frame labelled `T + k` is that scan extrapolated by `k`. Physically it
    describes roughly `T + k - 30 min`.
-2. **5-minute frames over 10-minute scans.** The nowcast computes flow
-   between the two newest frames and treats it as motion per
-   `FETCH_INTERVAL`. At 300 s, every other pair is the same scan twice:
-   flow is zero, so the forecast is persistence. The pairs in between hold
-   scans 10 min apart, which doubles the apparent speed. On the
-   2026-10-01 04:30/04:40 UTC scans, wet-area motion had a median of
-   58 km/h and a p90 of 228 km/h, and 15% of vectors hit the 200 km/h
-   clamp. Pairing the same scans at their true 10-min spacing gives
-   29 km/h median, 114 km/h p90 and 0.6% clamped. The RRQPE forecast
-   therefore alternates between frozen and double-speed every cycle.
+2. **5-minute frames over 10-minute scans (fixed).** The nowcast used to
+   take motion from the two newest frames as motion per `FETCH_INTERVAL`.
+   At 300 s every other pair was one scan twice, giving zero flow and a
+   frozen forecast. The pairs in between held scans 10 min apart and
+   doubled the speed: on live scans the wet-area median was 58-62 km/h,
+   p90 228 km/h, with 15% of vectors clamped.
 
-Recommendation: treat RRQPE forecast frames as low-confidence guidance, and
-do not derive "rain starts/ends in N minutes" from them, until the nowcast
-pairs RRQPE frames one native scan apart and scales the flow to the fetch
-interval. The animation's newest-pair interpolation must keep using the pair
-flow. At the upstream default `FETCH_INTERVAL=600` the cadence problem does
-not occur; the 30-minute lag still applies.
+   RRQPE now declares `native_interval_seconds=600`. For any such region
+   the nowcast measures motion between the newest frame and the one a
+   native interval earlier, which is always two distinct scans, and scales
+   the flow to the fetch interval. On the same scans that gives a median of
+   29-31 km/h, p90 114 km/h, with ~1% clamped, every cycle. The animation's
+   newest-pair interpolation computes its own pair flow for these regions,
+   so a repeated scan is not smeared. Without the older frame (cold start,
+   gaps) the plain newest pair is used, as before.
+
+Recommendation: RRQPE forecast frames are now usable as motion guidance. They
+remain an extrapolated IR estimate that starts 30-35 minutes in the past, so
+give them lower confidence than radar, especially for "rain starts/ends in N
+minutes".
 
 ## Point-nowcast contract
 
