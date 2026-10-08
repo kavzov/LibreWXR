@@ -229,16 +229,26 @@ def _clamp_flow(flow: np.ndarray, max_magnitude_px: float) -> np.ndarray:
     """
     dx = flow[..., 0]
     dy = flow[..., 1]
-    mag = np.sqrt(dx * dx + dy * dy)
+    # Same arithmetic as ``sqrt(dx*dx + dy*dy)`` and
+    # ``where(over, cap / maximum(mag, 1e-9), 1)`` evaluated in place: on a
+    # full-resolution global grid (RRQPE, ~29 M px) each temporary is
+    # ~117 MB, and the warp clamps once per forecast step.
+    mag = dx * dx
+    mag += dy * dy
+    np.sqrt(mag, out=mag)
     over = mag > max_magnitude_px
     if not np.any(over):
         return flow
-    scale = np.where(
-        over, max_magnitude_px / np.maximum(mag, 1e-9), 1.0,
-    ).astype(np.float32)
-    clamped = flow.copy()
-    clamped[..., 0] = (dx * scale).astype(np.float32)
-    clamped[..., 1] = (dy * scale).astype(np.float32)
+    scale = mag  # reuse the buffer: magnitudes are not needed past here
+    np.maximum(scale, 1e-9, out=scale)
+    np.divide(max_magnitude_px, scale, out=scale)
+    scale[~over] = 1.0
+    scale = scale.astype(np.float32, copy=False)
+    clamped = flow * scale[..., None]
+    if clamped.dtype != np.float32:
+        # Historical result for non-float32 input: the scale and each
+        # product were rounded through float32 before being stored back.
+        clamped = clamped.astype(np.float32).astype(flow.dtype)
     return clamped
 
 
@@ -1671,7 +1681,8 @@ def _extrapolate_forward(
     regions: the frame and flow are wrap-padded on the column axis
     (``_WRAP_FLOW_PAD`` — larger than the clamp-bounded maximum
     displacement, so central samples never leave the padded frame), the
-    map is built on the padded grid, and the warp uses
+    map is built on the padded grid (relative displacements when OpenCV
+    supports them, so no coordinate grids), and the warp uses
     ``cv2.BORDER_WRAP`` so any sample that does fall outside the padded
     frame still lands on the periodic continuation rather than zero.
     The result is cropped back to the unpadded width.  ``False`` (every
@@ -1687,18 +1698,23 @@ def _extrapolate_forward(
         pad = min(_WRAP_FLOW_PAD, w // 8)
         frame = np.pad(frame, ((0, 0), (pad, pad)), mode="wrap")
         flow = np.pad(flow, ((0, 0), (pad, pad), (0, 0)), mode="wrap")
-        # Coordinate grid over the PADDED frame (column indices are P-space
-        # already — the crop back below restores the unwrapped view).  The
-        # row axis never wraps.
-        ys, xs = np.mgrid[0:h, 0 : w + 2 * pad].astype(np.float32)
+        # Any caller grids describe the unpadded frame; the fallback below
+        # rebuilds them over the PADDED frame (P-space column indices — the
+        # crop back below restores the unwrapped view).
+        xs = ys = None
     relative_map = getattr(cv2, "WARP_RELATIVE_MAP", 0)
-    if not wrap and relative_map:
+    if relative_map:
+        # Displacement maps: OpenCV adds the pixel coordinates itself, so
+        # no full-frame coordinate grids are allocated.  For the padded
+        # global path this drops two float32 grids plus an int64 mgrid
+        # transient per step (~0.7 GiB for RRQPE) with identical output —
+        # the coordinates still live in padded space.
         map_x = -steps * flow[..., 0]
         map_y = -steps * flow[..., 1]
         interpolation = cv2.INTER_LINEAR | relative_map
     else:
         if xs is None or ys is None:
-            ys, xs = np.mgrid[0:h, 0:frame.shape[1]].astype(np.float32)
+            ys, xs = np.mgrid[0:frame.shape[0], 0:frame.shape[1]].astype(np.float32)
         map_x = xs - steps * flow[..., 0]
         map_y = ys - steps * flow[..., 1]
         interpolation = cv2.INTER_LINEAR

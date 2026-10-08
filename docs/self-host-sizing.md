@@ -196,9 +196,8 @@ retained state generations keep two superseded nowcast/animation sets alive
 as hardlinks. That totals ~3.2 GiB of disk and reclaimable page cache at
 12 past + 12 nowcast frames.
 
-Transient anon in the pipeline is ~1 GiB NumPy-tracked (up to ~2 GiB RSS)
-during each nowcast pass, because the global wrap-padded warp builds full
-coordinate grids, and ~0.3 GiB per decoded scan. Factor 4 (0.08°) cuts a
+Transient anon in the pipeline is ~0.6 GiB NumPy-tracked (up to ~1.1 GiB
+RSS) during each nowcast pass and ~0.3 GiB per decoded scan. Factor 4 (0.08°) cuts a
 frame to ~7 MiB; factor 1 (native 0.02°) is ~112 MiB. Measurements and an
 enable/rollback procedure are in [rrqpe-rollout.md](rrqpe-rollout.md).
 

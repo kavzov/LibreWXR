@@ -63,16 +63,18 @@ Each phase was measured on RRQPE alone in a fresh process:
 |---|---|---|---|---|
 | Decode one scan (after fix) | Each new scan, ~every 10 min; ~11 sequentially at a cold start | 1.6 s | 0.33 GiB | ~0.86 GiB |
 | Decode one scan (before fix) | | 2.3 s | 2.34 GiB | ~2.5 GiB |
-| Nowcast, 12 steps (distinct scans) | Every cycle | 6.8 s | 1.0 GiB | ~1.9 GiB |
-| Nowcast, 12 steps (same scan twice) | Every other cycle at 5 min | 4.4 s | 1.0 GiB | ~1.5 GiB |
+| Nowcast, 12 steps, frames staged to memmaps (after relative-map warp) | Every cycle | 3.5 s | 0.61 GiB | ~1.1 GiB |
+| Nowcast, 12 steps, frames staged to memmaps (before) | | 7.4 s | 0.98 GiB | ~1.8 GiB |
 | Animation intermediates (substeps 2) | Every cycle | 1.1 s | 0.64 GiB | ~0.3 GiB |
 
-The nowcast cost comes from the wrap-padded warp that global regions use:
-`_extrapolate_forward(..., wrap=True)` still builds two full float32
-coordinate grids, plus an int64 `mgrid` transient, for every step. Regional
-radars use OpenCV relative maps and avoid that. Nowcast steps run on a
-4-thread pool, so the RRQPE task overlaps the USCOMP/OPERA tasks of the same
-step. Budget **~1-2 GiB extra transient anon** in the pipeline during nowcast
+The nowcast cost comes from the wrap-padded warp that global regions use.
+It used to build two full float32 coordinate grids, plus an int64 `mgrid`
+transient, for every step. It now passes OpenCV relative displacement maps
+(as regional radars already did), and `_clamp_flow` works in place. The 12
+output frames are byte-identical (same SHA-256 on live 2026-10-08 scans),
+and the cycle takes half the time. Nowcast steps run on a 4-thread pool, so
+the RRQPE task overlaps the USCOMP/OPERA tasks of the same step. Budget
+**~0.6-1.1 GiB extra transient anon** in the pipeline during nowcast
 generation and **<1 GiB** while a scan decodes. Steady-state anon rises only
 by tens of MiB: flows are stored at ≤1000 px and everything else is memmaps.
 

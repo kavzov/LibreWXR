@@ -985,6 +985,36 @@ class TestClampFlow:
         assert abs(clamped[10, 10, 1] - 7.071) < 0.01
 
 
+class TestClampFlowInPlace:
+    """``_clamp_flow`` matches the historical temporary-heavy formula."""
+
+    @staticmethod
+    def _reference(flow, cap):
+        dx = flow[..., 0]
+        dy = flow[..., 1]
+        mag = np.sqrt(dx * dx + dy * dy)
+        over = mag > cap
+        if not np.any(over):
+            return flow
+        scale = np.where(over, cap / np.maximum(mag, 1e-9), 1.0).astype(np.float32)
+        clamped = flow.copy()
+        clamped[..., 0] = (dx * scale).astype(np.float32)
+        clamped[..., 1] = (dy * scale).astype(np.float32)
+        return clamped
+
+    @pytest.mark.parametrize("dtype", [np.float32, np.float64])
+    @pytest.mark.parametrize("cap", [0.25, 1.0, 3.75, 1e9])
+    def test_matches_reference(self, dtype, cap):
+        rng = np.random.default_rng(11)
+        flow = rng.normal(0.0, 2.0, (40, 70, 2)).astype(dtype)
+        flow[0, 0] = 0.0  # zero vector: the 1e-9 floor path
+        expected = self._reference(flow, cap)
+        out = _clamp_flow(flow, cap)
+        assert out.dtype == expected.dtype
+        assert np.array_equal(out, expected)
+        assert (out is flow) == (expected is flow)
+
+
 class TestExtrapolationClampingPreventsStreaks:
     """End-to-end: synthesize a hard data/no-data boundary, verify
     that flow clamping bounds the magnitude of extrapolated motion.
@@ -1099,6 +1129,48 @@ class TestDatelineWrap:
         flow = np.zeros((h, w, 2), dtype=np.float32)
         out = _extrapolate_forward(latest, flow, steps=3, wrap=True)
         assert np.array_equal(out, latest)
+
+    @staticmethod
+    def _absolute_map_warp(frame, flow, steps, max_px=None):
+        """Reference: the padded absolute-coordinate warp used before the
+        global path switched to relative maps."""
+        h, w = frame.shape
+        if flow.shape[:2] != (h, w):
+            flow = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR)
+        if max_px is not None:
+            flow = _clamp_flow(flow, max_px)
+        pad = min(256, w // 8)
+        frame = np.pad(frame, ((0, 0), (pad, pad)), mode="wrap")
+        flow = np.pad(flow, ((0, 0), (pad, pad), (0, 0)), mode="wrap")
+        ys, xs = np.mgrid[0:h, 0 : w + 2 * pad].astype(np.float32)
+        warped = cv2.remap(
+            frame, xs - steps * flow[..., 0], ys - steps * flow[..., 1],
+            interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_WRAP,
+        )
+        return warped[:, pad : pad + w]
+
+    @pytest.mark.skipif(
+        not getattr(cv2, "WARP_RELATIVE_MAP", 0),
+        reason="OpenCV without relative remap maps",
+    )
+    @pytest.mark.parametrize("steps", [1, 2.5, 6, 12])
+    @pytest.mark.parametrize("max_px", [None, 1.5])
+    def test_wrap_relative_maps_match_absolute_reference(self, monkeypatch, steps, max_px):
+        """The global path warps bit-identically without coordinate grids."""
+        rng = np.random.default_rng(3)
+        h, w = self._H, self._W * 4
+        latest = (rng.random((h, w)) * 200).astype(np.uint8)
+        latest[:, : w // 3] = 0
+        latest = np.maximum(latest, _disk(h, w, 30, w - 6, 8))
+        flow_low = rng.normal(0.0, 1.5, (h // 4, w // 4, 2)).astype(np.float32)
+        expected = self._absolute_map_warp(latest, flow_low, steps, max_px)
+
+        def no_grids(*_args, **_kwargs):
+            raise AssertionError("coordinate grids must not be built")
+
+        monkeypatch.setattr(np, "mgrid", type("NoGrid", (), {"__getitem__": no_grids})())
+        out = _extrapolate_forward(latest, flow_low, steps, max_px=max_px, wrap=True)
+        assert np.array_equal(out, expected)
 
     def test_generate_sync_global_region_seam_survives(self, global_region):
         """End-to-end: Farneback between two seam-adjacent frames and a
