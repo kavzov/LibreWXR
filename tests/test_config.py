@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from librewxr.config import Settings, resolve_cache_dir
+from librewxr.config import Settings, resolve_cache_dir, resolve_volatile_dir
 
 
 def _fresh_settings(monkeypatch, *, mode, warm_zoom=None):
@@ -171,3 +171,16 @@ def test_render_threads_legacy_alias_and_new_name_precedence(monkeypatch):
     assert Settings(_env_file=None).render_threads == 2
     monkeypatch.setenv("LIBREWXR_RENDER_THREADS", "3")
     assert Settings(_env_file=None).render_threads == 3
+
+
+def test_resolve_volatile_dir_unset_returns_none(monkeypatch):
+    s = _fresh_settings(monkeypatch, mode="multi")
+    monkeypatch.setattr(s, "volatile_cache_dir", "")
+    assert resolve_volatile_dir(s) is None
+
+
+def test_resolve_volatile_dir_uses_configured_path(monkeypatch, tmp_path):
+    s = _fresh_settings(monkeypatch, mode="multi")
+    target = tmp_path / "volatile"
+    monkeypatch.setattr(s, "volatile_cache_dir", str(target))
+    assert resolve_volatile_dir(s) == target

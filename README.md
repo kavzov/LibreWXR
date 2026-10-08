@@ -16,28 +16,40 @@
 
 A self-hostable, drop-in replacement for the [Rain Viewer](https://www.rainviewer.com/) API. LibreWXR serves weather radar tiles using freely available radar composite data from multiple sources, with full compatibility for any client built against the Rain Viewer v2 API.
 
-## Contents
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0--or--later-blue" alt="License: AGPL-3.0-or-later"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white" alt="Python 3.11+"></a>
+  <a href="https://github.com/JoshuaKimsey/LibreWXR/actions/workflows/test.yml"><img src="https://github.com/JoshuaKimsey/LibreWXR/actions/workflows/test.yml/badge.svg" alt="Tests status"></a>
+  <a href="https://ko-fi.com/librewxr"><img src="https://img.shields.io/badge/Ko--fi-LibreWXR-FF5E5B" alt="Support on Ko-fi"></a>
+</p>
 
-- [Why?](#why)
-- [Features](#features)
-- [Current Limitations](#current-limitations)
-- [Coverage](#coverage)
-- [Quick Start](#quick-start)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [Deployment](#deployment)
-- [Architecture](#architecture)
-- [Data Sources](#data-sources)
-- [Examples](#examples)
-- [Supporters](#supporters)
-- [Who's Using LibreWXR](#whos-using-librewxr)
-- [License](#license)
+<p align="center">
+  <img src="docs/readme-hero.png" alt="LibreWXR rendering radar and satellite layers on a map" width="800">
+</p>
+
+<p align="center">
+  <img src="docs/readme-demo.gif" alt="Animated radar loop rendered by LibreWXR" width="720">
+</p>
 
 ## Why?
 
-Rain Viewer recently (as of January 1st, 2026) restricted their free API tier: maximum zoom 7, single color scheme, no satellite, no forecast, PNG only. LibreWXR restores the full pre-restriction functionality as a self-hosted service.
+Rain Viewer recently (as of January 1st, 2026) restricted their free API tier. LibreWXR restores the full pre-restriction functionality as a free, self-hosted service:
 
-Beyond this though, is the goal of creating a far more customizable API backend for self hosters. The ability to specify regions, radar styles, denoising levels, and more to come as well. With the goal being self-hosting, there are far greater possibilities for what can be both ingested and output via the API, and there is no need to offer any limitations on what is provided, aside from the technicality of the implementation of such features.
+| | Rain Viewer free tier | LibreWXR (self-hosted) |
+|---|---|---|
+| Max zoom level | 7 | 12 (configurable) |
+| Color schemes | Universal Blue only | 15 schemes + raw grayscale |
+| Satellite layer | None | Global (GOES / Meteosat / Himawari composite) |
+| Forecast layer | None | 60-minute nowcast (radar extrapolation + NWP blend) |
+| Image formats | PNG | PNG + WebP (configurable quality) |
+| Permitted use | Personal / educational only | Your server, your terms (AGPL-3.0-or-later) |
+| Uptime & rate limits | Best-effort, none guaranteed | Set by your own infrastructure |
+
+<sub>Rain Viewer free-tier details as published at rainviewer.com/api, current as of October 2026.</sub>
+
+Switching an existing client over? The [Rain Viewer → LibreWXR migration guide](docs/rainviewer-migration-guide.md) covers the two-line change most apps need.
+
+Beyond compatibility, the goal is a far more customizable API backend for self-hosters — configurable regions, radar styles, denoising levels, and more — with no limits on what the API can ingest and output beyond what the implementation allows.
 
 ## Features
 
@@ -54,7 +66,7 @@ Beyond this though, is the goal of creating a far more customizable API backend 
 - **Precipitation nowcasting (experimental)** — 60-minute short-range forecast by extrapolating recent radar forward using optical flow, with configurable blend mode: smooth radar-to-model blending (default), pure radar extrapolation (closest to Rain Viewer), or pure NWP forecast. The model side is taken from the active NWP chain — HRRR over CONUS, ICON-EU/DINI over Europe, WRF-SMN over the S. American Cone, JMA MSM over Japan + adjacent East Asia, IFS elsewhere. Beyond 60 minutes, always uses pure model. Quality varies by weather pattern — works best for steady, organized precipitation; less reliable for fast-developing convection
 - **Precipitation motion arrows** — optional Dark Sky-style arrows showing storm movement direction and speed, derived from optical flow. Available for both radar and ECMWF data globally. Supports light and dark styles for different map themes via `?arrows=light` or `?arrows=dark` query parameter
 - **Real satellite imagery (GMGSI composite)** — NOAA's hourly global mosaic (GOES-East + GOES-West + Meteosat-9 + Meteosat-10 + Himawari-9, composited by NESDIS) ingested as longwave IR + visible channels and rendered as a VIS-over-LW composite with a natural day/night terminator crossfade. Day side shows continents and clouds as they appear from space; night side shows cold-cloud IR on a transparent basemap. Up to 12 hours of hourly animation with persistent disk caching. Populates the Rain Viewer-compatible `satellite.infrared` endpoint
-- **Weather alerts (WMO CAP + NWS)** — global weather alerts polled every 5 minutes from severeweather.wmo.int, with MeteoAlarm geocodes for European polygon resolution. US alerts come directly from the NWS API, with zone-based alerts (e.g. Tornado Watches) resolved to zone polygons at ingest. Surfaced through a Rain Viewer-extension alerts API (`/v2/alerts/...`). Configurable via `LIBREWXR_ALERTS_ENABLED`
+- **Weather alerts (WMO CAP + NWS)** — global weather alerts polled every 5 minutes from severeweather.wmo.int, with MeteoAlarm geocodes for European polygon resolution. US alerts come directly from the NWS API, with zone-based alerts (e.g. Tornado Watches) resolved to zone polygons at ingest. Surfaced through a Rain Viewer-extension alerts API (`/v2/alerts`). Configurable via `LIBREWXR_ALERTS_ENABLED`
 - **Snow detection** — per-pixel snow/rain classification. Regional NWP sources classify natively from their own 2-metre temperature field (HRRR-CONUS, HRRR-Alaska, WRF-SMN, DMI DINI, ICON-EU, JMA MSM); ECMWF IFS snowfall ratio fills everywhere else
 - **Noise filtering** — configurable dBZ noise floor and speckle removal
 - **Pipeline + render-worker architecture** — a data pipeline process fetches all radar / NWP / satellite / alerts data while one or more render workers serve tiles from a shared memmap snapshot. Split across processes so every core can render in parallel instead of being GIL-bound at one. `COMPOSE_PROFILES=multi` is the shipped default; a legacy `single` profile maps to one render worker with the legacy-single defaults
@@ -99,38 +111,9 @@ documents the throwaway venv recipe).
 
 ### Radar regions
 
-| Code | Region | Source | Resolution | RAM per frame |
-|---|---|---|---|---|
-| `USCOMP` | Continental US | NCEP MRMS (IEM fallback) | 0.005° (~500m) | ~63 MB |
-| `AKCOMP` | Alaska | NCEP MRMS (IEM fallback) | 0.01° (~1km) | ~6 MB |
-| `HICOMP` | Hawaii | NCEP MRMS (IEM fallback) | 0.005° (~500m) | ~3.4 MB |
-| `PRCOMP` | Puerto Rico | NCEP MRMS (IEM fallback) | 0.01° (~1km) | ~1 MB |
-| `GUCOMP` | Guam | NCEP MRMS (IEM fallback) | 0.0085° (~850m) | ~1 MB |
-| `CACOMP` | Canada | MSC GeoMet (MRMS blending) | 0.025° (~2.5km) | ~6 MB |
-| `SVCOMP` | El Salvador + neighbours | MARN/SNET (San Andrés, 120 km) | 0.00926° (~1km) | <1 MB |
-| `OPERA` | Europe (27 countries) | EUMETNET OPERA | 1km | ~16 MB |
-| `ITCOMP` | Italy + neighbours | DPC Radar (24-radar national composite) | ~1km (spherical TM) | ~2 MB |
-| `TWCOMP` | Taiwan + W. Pacific buffer | CWA QPESUMS (7-radar composite) | 0.0125° (~1.4km) | ~1 MB |
-| `JPCOMP` | Japan archipelago | JMA HRPN (20 radars + AMeDAS gauge correction) | 0.0125° (~1.4km) | ~4 MB |
-| `MYPENINSULAR` | Peninsular Malaysia + Singapore + N. Sumatra | MET Malaysia (12-radar composite) | 0.022° lon / 0.019° lat (~2.5km) | <1 MB |
-| `MYEAST` | East Malaysia (Borneo) + Brunei | MET Malaysia (12-radar composite) | 0.022° lon / 0.019° lat (~2.5km) | <1 MB |
-| `PHCOMP` | Philippines (Luzon, Visayas, Mindanao) | PAGASA PANAHON (9-radar mosaic) | 0.0069° lon / 0.0091° lat (~770m) | ~4 MB |
-| `RRQPE` | Global 60S-70N band (always-on) | NOAA Enterprise Rain Rate GLB-5 (satellite-derived observed) | 0.04° stored (0.02° native) | ~29 MB |
+Fourteen radar composites — US (CONUS, Alaska, Hawaii, Puerto Rico, Guam), Canada, Central America, Europe (OPERA pan-European composite + DPC for Italy), Taiwan, Japan, Peninsular + East Malaysia, and the Philippines — plus the always-on global `RRQPE` observed band. Per-region codes, sources, resolutions, and station counts live in [`docs/coverage.md`](docs/coverage.md); what each region costs in frame memory is in [`docs/self-host-sizing.md`](docs/self-host-sizing.md).
 
-RRQPE is not part of any group — it is the always-on global observed bottom tier that fills past/current frames wherever no finer radar region claims the pixel, and it joins nowcast extrapolation like any other region.
-
-Group aliases: `CONUS` (continental US only), `US` (all US regions), `CANADA` (Canada), `CENTRAL_AMERICA` (El Salvador + W. Honduras + S. Guatemala + offshore Pacific), `EUROPE` (OPERA pan-European composite + DPC for Italy), `SOUTHEAST_ASIA` (MET Malaysia peninsular + east composites covering Peninsular Malaysia, Borneo, Brunei, Singapore, N. Sumatra + PAGASA PANAHON mosaic covering the Philippines), `TAIWAN` (CWA QPESUMS composite covering Taiwan + offshore Pacific), `JAPAN` (JMA HRPN composite covering the Japanese archipelago), `ALL` (everything).
-You can also mix groups and individual regions: `CONUS,EUROPE,CANADA`.
-
-Examples:
-```bash
-LIBREWXR_ENABLED_REGIONS=CONUS          # just continental US
-LIBREWXR_ENABLED_REGIONS=US             # all US regions
-LIBREWXR_ENABLED_REGIONS=EUROPE         # Europe only (OPERA composite)
-LIBREWXR_ENABLED_REGIONS=CANADA         # Canada only
-LIBREWXR_ENABLED_REGIONS=CONUS,EUROPE   # continental US + Europe
-LIBREWXR_ENABLED_REGIONS=ALL            # everything available (default)
-```
+Region groups: `CONUS`, `US`, `CANADA`, `CENTRAL_AMERICA`, `EUROPE`, `SOUTHEAST_ASIA`, `TAIWAN`, `JAPAN`, `ALL` — freely mixable with individual regions, e.g. `LIBREWXR_ENABLED_REGIONS=CONUS,EUROPE`.
 
 ### Regional NWP chain
 
@@ -140,45 +123,9 @@ the narrowest model whose domain covers it, falling through to wider
 models elsewhere. Soft feathering at every domain edge prevents visible
 seams where domains meet.
 
-| Region | Source | Resolution | Cycles | Toggle |
-|---|---|---|---|---|
-| Continental US | NOAA HRRR-CONUS | 3 km LCC | hourly | `LIBREWXR_NA_NWP_SOURCE=hrrr` |
-| Alaska | NOAA HRRR-Alaska | 3 km polar stereo | 3-hourly | *(bundled with HRRR)* |
-| Canada + N. fringe of CONUS | ECCC HRDPS-Continental | 2.5 km rotated lat/lon | 6-hourly | `LIBREWXR_HRDPS_ENABLED=true` |
-| Most of populated Europe | DMI HARMONIE-AROME DINI | 2 km LCC | 3-hourly | `LIBREWXR_EU_NWP_PROFILE=dini_with_icon_eu` |
-| European remainder | DWD ICON-EU | ~7 km | 3-hourly | `LIBREWXR_EU_NWP_PROFILE=icon_eu_only` *(or `dini_with_icon_eu`)* |
-| Eastern Caribbean | Météo-France AROME Antilles | 2.5 km lat/lon | 4 cycles/day | `LIBREWXR_AROME_ANTILLES_ENABLED=true` |
-| French Guiana + neighbours | Météo-France AROME Guyane | 2.5 km lat/lon | 4 cycles/day | `LIBREWXR_AROME_GUYANE_ENABLED=true` |
-| SW Indian Ocean (Réunion, Mayotte, Madagascar) | Météo-France AROME Indien | 2.5 km lat/lon | 4 cycles/day | `LIBREWXR_AROME_INDIEN_ENABLED=true` |
-| New Caledonia | Météo-France AROME Nouvelle-Calédonie | 2.5 km lat/lon | 4 cycles/day | `LIBREWXR_AROME_NCALED_ENABLED=true` |
-| French Polynesia | Météo-France AROME Polynésie | 2.5 km lat/lon | 4 cycles/day | `LIBREWXR_AROME_POLYN_ENABLED=true` |
-| South American Cone | SMN Argentina WRF-DET | 4 km LCC | 6-hourly | `LIBREWXR_WRF_SMN_ENABLED=true` |
-| Japan + Korean Peninsula + Taiwan | JMA MSM (Mesoscale Model) | 5 km lat/lon | 3-hourly | `LIBREWXR_JMA_MSM_ENABLED=true` |
-| Everywhere else | ECMWF IFS | 9 km global | 6-hourly | `LIBREWXR_ECMWF_ENABLED=true` |
+The full model-by-model table (coverage, resolution, projection, cycle cadence, and per-model toggles) is in [`docs/coverage.md`](docs/coverage.md); fine-tuning knobs (`LIBREWXR_*_PUBLISH_DELAY_MINUTES`, `LIBREWXR_*_DBZ_OFFSET`) and the default global-coverage recipe are in [`docs/configuration-reference.md`](docs/configuration-reference.md).
 
-Each model gets its own `LIBREWXR_*_PUBLISH_DELAY_MINUTES` and
-`LIBREWXR_*_DBZ_OFFSET` for fine tuning — see `src/librewxr/config.py`
-or [`docs/configuration-reference.md`](docs/configuration-reference.md)
-for the full surface.
-
-**Default recipe for broad global coverage:**
-
-```bash
-LIBREWXR_NA_NWP_SOURCE=hrrr               # CONUS + Alaska
-LIBREWXR_HRDPS_ENABLED=true               # Canada
-LIBREWXR_EU_NWP_PROFILE=dini_with_icon_eu # Europe (DINI + ICON-EU)
-LIBREWXR_AROME_ANTILLES_ENABLED=true      # eastern Caribbean
-LIBREWXR_AROME_GUYANE_ENABLED=true        # French Guiana
-LIBREWXR_AROME_INDIEN_ENABLED=true        # SW Indian Ocean
-LIBREWXR_AROME_NCALED_ENABLED=true        # New Caledonia
-LIBREWXR_AROME_POLYN_ENABLED=true         # French Polynesia
-LIBREWXR_WRF_SMN_ENABLED=true             # South American Cone
-LIBREWXR_JMA_MSM_ENABLED=true             # Japan + Korean Peninsula + Taiwan
-LIBREWXR_ECMWF_ENABLED=true               # global IFS layer (everywhere else)
-```
-
-The active chain is logged at startup as `NWP chain: [...]` and
-surfaced under `/health` for verification.
+The active chain is logged at startup as `NWP chain: [...]` and surfaced under `/health` for verification.
 
 ## Quick Start
 
@@ -354,12 +301,7 @@ Returns available radar timestamps and the host URL, matching Rain Viewer's resp
       ...
     ]
   },
-  "satellite": {
-    "infrared": [
-      {"time": 1773030600, "path": "/v2/satellite/1773030600"},
-      ...
-    ]
-  }
+  "satellite": {"infrared": [{"time": 1773030600, "path": "/v2/satellite/1773030600"}, ...]}
 }
 ```
 
@@ -486,18 +428,7 @@ GET /v2/radar/{timestamp}/{size}/{z}/{x}/{y}/{color}/{smooth}_{snow}.{ext}
 | `arrows` | `light`, `dark` | Draw precipitation motion arrows (light for dark maps, dark for light maps) |
 | `cells` | `light`, `dark` | Draw detected storm-cell markers (light for dark maps, dark for light maps) |
 
-**Examples with query parameters:**
-
-```
-# With motion arrows (light for dark maps, dark for light maps)
-https://api.librewxr.net/v2/radar/{timestamp}/256/{z}/{x}/{y}/10/1_1.png?arrows=light
-
-# With storm-cell overlay (detected cells + motion arrows at each centroid)
-https://api.librewxr.net/v2/radar/{timestamp}/256/{z}/{x}/{y}/10/1_1.png?cells=light
-
-# Combined: motion arrows + storm cells
-https://api.librewxr.net/v2/radar/{timestamp}/256/{z}/{x}/{y}/10/1_1.png?arrows=light&cells=light
-```
+Ready-made integration snippets: see [`docs/web-integration-guide.md`](docs/web-integration-guide.md) and the [Examples](#examples) section below.
 
 #### Radar Motion Tiles (LibreWXR extension)
 
@@ -554,7 +485,7 @@ GET /v2/radar/{timestamp}/{size}/{z}/{lat}/{lon}/{color}/{smooth}_{snow}.{ext}
 | `lat`, `lon` | decimal degrees | Image center; path segments containing a dot are treated as lat/lon, plain integer segments as x/y tile indices |
 | `size` | `256`, `512` | Image size (intermediate values quantize: `< 512` becomes `256`) |
 
-The center is snapped to the nearest pixel at that zoom; longitude wraps across the antimeridian and latitude clamps to the Web Mercator limit (+/-85.0511 deg). Unknown timestamps return 404, and areas with no data return a transparent 200 PNG. A timestamp of `0` is an alias for the latest frame — the resolved timestamp is returned in the `X-Frame-Timestamp` response header. The `?arrows=` and `?cells=` query parameters are tile-mode only and are silently ignored on lat/lon window URLs; the coverage variant is `/v2/coverage/0/{size}/{z}/{lat}/{lon}/0/0_0.png`.
+The center is snapped to the nearest pixel at that zoom; longitude wraps across the antimeridian and latitude clamps to the Web Mercator limit. Unknown timestamps return 404; no-data areas return a transparent 200 PNG; a timestamp of `0` aliases the latest frame, with the resolved timestamp returned in the `X-Frame-Timestamp` header. The `?arrows=` / `?cells=` parameters are tile-mode only; the coverage variant is `/v2/coverage/0/{size}/{z}/{lat}/{lon}/0/0_0.png`.
 
 #### Satellite Tiles
 
@@ -569,7 +500,7 @@ GET /v2/satellite/{timestamp}/{size}/{z}/{x}/{y}/0/0_0.{ext}
 | `z`, `x`, `y` | integers | Standard slippy map tile coordinates |
 | `ext` | `png`, `webp` | Image format |
 
-Returns real satellite imagery tiles backed by NOAA GMGSI. The endpoint serves a VIS-over-LW composite when both channels are loaded: the daytime side shows visible reflectance (continents, oceans, sunlit clouds) and the night side falls through to longwave IR (cold cloud tops on a transparent basemap). The terminator crossfade emerges naturally from the underlying reflectance field. Hourly cadence; global coverage between ±72.7° latitude.
+Returns NOAA GMGSI satellite tiles: the daytime side shows visible reflectance (continents, oceans, sunlit clouds); the night side falls through to longwave IR. Hourly cadence, global between ±72.7° latitude.
 
 #### Coverage Tiles
 
@@ -587,20 +518,7 @@ GET /v2/alerts?lat={lat}&lon={lon}
 GET /v2/alerts?bbox=west,south,east,north
 ```
 
-Returns active weather alerts as a GeoJSON `FeatureCollection`, with
-each feature carrying the alert polygon plus CAP metadata (severity,
-urgency, certainty, event, headline, sender, expiry). Fed by the WMO
-CAP feed (global) and the NWS API (US, direct); US zone-based alerts
-like Tornado Watches are resolved to zone polygons at ingest.
-
-| Query parameter | Description |
-|---|---|
-| *(none)* | All active alerts worldwide |
-| `lat` + `lon` | Alerts whose polygon contains the point |
-| `bbox=W,S,E,N` | Alerts whose polygon intersects the bounding box |
-| `simplify` | Polygon simplification tolerance in meters (default 1000, `0` = full resolution) |
-
-Returns `503` if `LIBREWXR_ALERTS_ENABLED=false`.
+Returns active weather alerts as a GeoJSON `FeatureCollection` carrying the alert polygon plus CAP metadata (severity, urgency, certainty, event, headline, sender, expiry) — fed by the WMO CAP feed (global) and the NWS API (US direct), with US zone-based alerts (e.g. Tornado Watches) resolved to zone polygons at ingest. Point queries (`lat`/`lon`) return containing alerts; `bbox=W,S,E,N` returns intersecting alerts; `simplify` sets polygon simplification in meters (default 1000, `0` = full resolution). Returns `503` if `LIBREWXR_ALERTS_ENABLED=false`.
 
 #### Storm Cells (LibreWXR extension)
 
@@ -610,21 +528,7 @@ GET /v2/storm-cells?lat={lat}&lon={lon}&radius_km={radius}
 GET /v2/storm-cells?format=json
 ```
 
-Returns detected storm cells from the latest radar frame. The default
-response is a GeoJSON `FeatureCollection` with one `Point` feature per
-cell (centroid coordinates `[lon, lat]`); `format=json` returns a plain
-`{generated_at, cells}` payload instead. Each cell carries `area_km2`,
-`max_dbz`, `motion_speed_kmh` / `motion_heading_deg` (null when no
-motion data) and `region` properties.
-
-| Query parameter | Description |
-|---|---|
-| *(none)* | All detected cells worldwide |
-| `lat` + `lon` | Cells within `radius_km` of the point (both required together) |
-| `radius_km` | Search radius in km (default 100, ignored without lat/lon) |
-| `format` | `geojson` (default) or `json` |
-
-Returns `503` when storm-cell detection is disabled.
+Returns detected storm cells from the latest radar frame as a GeoJSON `FeatureCollection` (one `Point` feature per cell centroid; `format=json` returns a plain `{generated_at, cells}` payload instead). Each cell carries `area_km2`, `max_dbz`, `motion_speed_kmh` / `motion_heading_deg` (null when no motion data), and `region`. `lat` + `lon` + `radius_km` (default 100) filter to a search radius. Returns `503` when storm-cell detection is disabled.
 
 #### Health
 
@@ -654,13 +558,14 @@ Instances self-describe via `/.well-known/ai-catalog.json` and `<mcp path>/serve
 
 ## Configuration
 
-All settings are configured via environment variables (or a `.env` file). Copy `.env.example` to `.env` and adjust as needed. Every setting has a sensible default.
+All settings are configured via environment variables (or a `.env` file). Copy `.env.example` to `.env` and adjust as needed. Every setting has a sensible default, so the service boots with zero configuration:
 
-The table below covers the **commonly-tuned settings**. The full surface
-(including per-source NWP publish delays, dBZ calibration offsets, and
-source base URLs) lives in
-[`docs/configuration-reference.md`](docs/configuration-reference.md) and
-the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
+```bash
+LIBREWXR_PUBLIC_URL=https://radar.example.com   # advertised in metadata responses
+LIBREWXR_CACHE_DIR=/var/lib/librewxr            # persistent disk cache shared by pipeline + renderers
+LIBREWXR_ENABLED_REGIONS=ALL                    # radar regions to enable (see [Coverage](#radar-regions))
+LIBREWXR_WORKERS=8                              # render workers, ideally one per physical core
+```
 
 | Variable | Default | Description |
 |---|---|---|
@@ -753,9 +658,7 @@ the inline comments in [`src/librewxr/config.py`](src/librewxr/config.py).
 | `LIBREWXR_STORM_CELLS_MIN_DBZ` | `40` | Minimum dBZ for a pixel to be part of a detected cell. |
 | `LIBREWXR_STORM_CELLS_MIN_AREA_KM2` | `25.0` | Minimum cell area in km^2 — filters out noise/small cells. |
 
-Requires `pip install -e ".[mcp]"` (adds `fastmcp`). Full reference: [`docs/configuration-reference.md`](docs/configuration-reference.md).
-
-See `.env.example` for detailed descriptions and tuning guidance for each setting.
+The full surface (every `LIBREWXR_*` variable with type, default, and range — including per-source NWP publish delays, dBZ calibration offsets, and source base URLs) lives in [`docs/configuration-reference.md`](docs/configuration-reference.md), with inline comments in [`src/librewxr/config.py`](src/librewxr/config.py). See `.env.example` for detailed descriptions and tuning guidance for each setting.
 
 ## Deployment
 
@@ -763,9 +666,32 @@ LibreWXR runs as a data pipeline plus one or more render workers,
 sharing state via memmap files + a `state.json` snapshot on a shared
 volume. Docker Compose starts both for you; the `pipeline` and
 `renderer` services both belong to the `multi` profile (a legacy
-`single` profile starts the same pair).
+`single` profile starts the same pair). The process layout and data
+flow diagrams are in [Architecture](#architecture) below.
 
-### Pipeline + render workers
+```bash
+# In .env
+COMPOSE_PROFILES=multi
+
+# Then:
+docker compose up -d
+```
+
+For a laptop, small VPS, or home server, keep the same architecture but
+run fewer render workers (`LIBREWXR_WORKERS=1` or `2`). Bare metal,
+`python -m librewxr.main` auto-spawns the pipeline and runs one render
+worker unless `LIBREWXR_WORKERS` is set.
+
+Tiles are served with `Cache-Control: public, max-age=300`, so any caching
+reverse proxy or free-tier CDN works out of the box — for most
+self-hosting scenarios, one worker behind Cloudflare is sufficient. RAM
+and scaling tables (per-worker-count and per-audience) live in
+[`docs/self-host-sizing.md`](docs/self-host-sizing.md). Coming from the
+removed one-process deployment: [`docs/single-mode-migration.md`](docs/single-mode-migration.md).
+
+## Architecture
+
+### Process layout
 
 The data pipeline fetches and stores everything; the render side scales
 to N worker processes that each map the same files, so 32 workers don't
@@ -796,51 +722,6 @@ split hands one core to each render process instead of serializing the
 render path through a single process's GIL, and a fetch crash in the
 pipeline no longer takes the tile server down. Production observation on
 an 80-core / 32 GB rack: ~16 GB total RSS, all cores active under load.
-Run with:
-
-```bash
-# In .env
-COMPOSE_PROFILES=multi
-
-# Then:
-docker compose up -d
-```
-
-For a laptop, small VPS, or home server, keep the same architecture but
-run fewer render workers (`LIBREWXR_WORKERS=1` or `2`). Bare metal,
-`python -m librewxr.main` auto-spawns the pipeline and runs one render
-worker unless `LIBREWXR_WORKERS` is set.
-
-### RAM requirements
-
-The architecture shares the radar / NWP / satellite / alert state across
-all render workers via memmap, so adding workers doesn't multiply the
-data RAM — only the per-worker tile cache (default 128 MB) and Python
-interpreter overhead (~80 MB). A small-box deployment runs 1-2 render
-workers and lands near the old one-process footprint (pipeline RAM
-plus a little per-worker overhead).
-
-| Configuration | Pipeline RAM | Render RAM | Total |
-|---|---|---|---|
-| ALL regions + full NWP chain, 8 workers | ~8-10 GB | ~3-4 GB | ~12-14 GB |
-| ALL regions + full NWP chain, 16 workers | ~8-10 GB | ~5-6 GB | ~14-16 GB |
-| ALL regions + full NWP chain, 32 workers | ~8-10 GB | ~7-8 GB | ~16-18 GB |
-
-Production observation on an 80-core / 32 GB rack (32 workers): ~16 GB
-total RSS across both containers.
-
-### Scaling
-
-| Users | Workers | RAM (ALL regions + full NWP) |
-|---|---|---|
-| 1-5 (personal) | 1 | ~9-10 GB |
-| 5-50 (small community) | 1-2 (with CDN) | ~9-18 GB |
-| 50-500 (medium) | 8-16 | ~12-16 GB |
-| 500+ (large) | 24-32+ (with CDN) | ~16-20 GB |
-
-Tiles are served with `Cache-Control: public, max-age=300`, so any caching reverse proxy (nginx, Cloudflare, etc.) will work out of the box for high-traffic deployments. A CDN like Cloudflare (free tier works) absorbs most tile requests at the edge, meaning a single worker can serve far more users than the table above suggests. Using a Cloudflare Tunnel also provides free HTTPS with no certificate management. For most self-hosting scenarios, 1 worker behind Cloudflare is sufficient.
-
-## Architecture
 
 ### Data flow
 
@@ -1019,7 +900,9 @@ A sample of the projects and deployments built on the LibreWXR API:
 | [Presura](https://presura.eu) | A multi-language weather viewer for the European Union. |
 | [RidePilot](https://apps.apple.com/us/app/ridepilot-smart-bike-computer/id6790916720) | A cycling tracking app. |
 | [Rueckenwind](https://rueckenwind.piepgras.de) | A cycling navigation app for iOS, built on BRouter and OpenStreetMap. |
+| [SparkRadar](https://sparkradar.app) | A weather radar app with LibreWXR powering its International Mosaic layer. |
 | [Silver Skies (Desktop)](https://github.com/poliberry/silverskies-desktop) | A desktop weather radar, forecast, and severe alert dashboard (Electron + Next.js). |
+| [SkyMonitor](https://skymonitor.app) ([GitHub](https://github.com/chicagoeas/sky-monitor)) | SkyMonitor is a weather website that uses multiple APIs to get you the most accurate weather information for where you are! |
 | [South Alabama Mesonet](https://mesonet.southalabama.edu) | A network of weather stations monitoring conditions across Southern Alabama. |
 | [StormView Rewrite](https://github.com/arc360alt/StormView-Rewrite) | A rewritten version of stormview to be faster, lighter. |
 | [Variable Weather](https://variablewx.librewxr.net) ([GitHub](https://github.com/JoshuaKimsey/variable-weather)) | Inspired by Breezy Weather, Variable Weather makes it easy and fun to get the weather information you need. |

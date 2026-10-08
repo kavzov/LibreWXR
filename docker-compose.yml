@@ -48,10 +48,25 @@ services:
     environment:
       LIBREWXR_CACHE_DIR: /data/cache
       LIBREWXR_LOG_FILE: /logs/librewxr.log
+      # Optional RAM-backed directory for stores regenerated every fetch
+      # cycle (nowcast frames + flows, precip masks, storm cells, RRQPE
+      # scan cache).  Uncomment in BOTH services along with the matching
+      # tmpfs bind mount below (identical source/target path) so the
+      # absolute memmap paths in state.json resolve in the pipeline and
+      # every render worker.  tmpfs pages count against the container
+      # memory limit.  See docs/configuration-reference.md.
+      # LIBREWXR_VOLATILE_CACHE_DIR: /dev/shm/librewxr
+      # Prefer the gitignored docker-compose.override.yml instead: it
+      # auto-merges over this file and survives `git pull` with no conflicts.
     volumes:
       - librewxr-cache:/data/cache
       - earthkit-cache:/root/.cache/earthkit-regrid
       - ./logs:/logs
+      # Shared host tmpfs backing LIBREWXR_VOLATILE_CACHE_DIR above.
+      # Uncomment in BOTH services (identical path on each side).
+      # - /dev/shm/librewxr:/dev/shm/librewxr
+      # Update-safe route; worked example in docs/configuration-reference.md
+      # (LIBREWXR_VOLATILE_CACHE_DIR).
     restart: unless-stopped
     # Docker interprets memswap_limit as RAM + swap.  Keep unlimited by
     # default; operators can bound anonymous-page spill independently from
@@ -93,9 +108,24 @@ services:
       # the renderer reads everything from the pipeline's snapshot.
       LIBREWXR_RENDER_ONLY: "1"
       LIBREWXR_LOG_FILE: /logs/librewxr.log
+      # Optional RAM-backed directory for stores regenerated every fetch
+      # cycle (nowcast frames + flows, precip masks, storm cells, RRQPE
+      # scan cache).  Uncomment in BOTH services along with the matching
+      # tmpfs bind mount below (identical source/target path) so the
+      # absolute memmap paths in state.json resolve in the pipeline and
+      # every render worker.  tmpfs pages count against the container
+      # memory limit.  See docs/configuration-reference.md.
+      # LIBREWXR_VOLATILE_CACHE_DIR: /dev/shm/librewxr
+      # Prefer the gitignored docker-compose.override.yml instead: it
+      # auto-merges over this file and survives `git pull` with no conflicts.
     volumes:
       - librewxr-cache:/data/cache
       - ./logs:/logs
+      # Shared host tmpfs backing LIBREWXR_VOLATILE_CACHE_DIR above.
+      # Uncomment in BOTH services (identical path on each side).
+      # - /dev/shm/librewxr:/dev/shm/librewxr
+      # Update-safe route; worked example in docs/configuration-reference.md
+      # (LIBREWXR_VOLATILE_CACHE_DIR).
     # Render workers wait for state.json with a 300 s default timeout
     # (LIBREWXR_STATE_WAIT_TIMEOUT).  depends_on starts the pipeline
     # first so the wait window is shorter on cold start.

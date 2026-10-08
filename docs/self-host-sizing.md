@@ -54,6 +54,67 @@ tile traffic without a CDN in front. Scale vertically: the designed
 shape is one pipeline writer plus N render workers per host - not
 multi-node.
 
+## Frame Memory per Region
+
+Each enabled radar region keeps `LIBREWXR_MAX_FRAMES` frames (default 12)
+in a memory-mapped ring buffer. Approximate per-frame memory:
+
+| Code | Region | Source | RAM per frame |
+|---|---|---|---|
+| `USCOMP` | Continental US | NCEP MRMS (IEM fallback) | ~63 MB |
+| `AKCOMP` | Alaska | NCEP MRMS (IEM fallback) | ~6 MB |
+| `HICOMP` | Hawaii | NCEP MRMS (IEM fallback) | ~3.4 MB |
+| `PRCOMP` | Puerto Rico | NCEP MRMS (IEM fallback) | ~1 MB |
+| `GUCOMP` | Guam | NCEP MRMS (IEM fallback) | ~1 MB |
+| `CACOMP` | Canada | MSC GeoMet (MRMS blending) | ~6 MB |
+| `SVCOMP` | El Salvador + neighbours | MARN/SNET (San Andrés, 120 km) | <1 MB |
+| `OPERA` | Europe (27 countries) | EUMETNET OPERA | ~16 MB |
+| `ITCOMP` | Italy + neighbours | DPC Radar (24-radar national composite) | ~2 MB |
+| `TWCOMP` | Taiwan + W. Pacific buffer | CWA QPESUMS (7-radar composite) | ~1 MB |
+| `JPCOMP` | Japan archipelago | JMA HRPN (20 radars + AMeDAS gauge correction) | ~4 MB |
+| `MYPENINSULAR` | Peninsular Malaysia + Singapore + N. Sumatra | MET Malaysia (12-radar composite) | <1 MB |
+| `MYEAST` | East Malaysia (Borneo) + Brunei | MET Malaysia (12-radar composite) | <1 MB |
+| `PHCOMP` | Philippines (Luzon, Visayas, Mindanao) | PAGASA PANAHON (9-radar mosaic) | ~4 MB |
+| `RRQPE` | Global 60S-70N band (always-on) | NOAA Enterprise Rain Rate GLB-5 | ~29 MB |
+
+Multiply by `LIBREWXR_MAX_FRAMES` (default 12) for the frame-store budget;
+add NWP grids, satellite frames, nowcast data, and the tile cache on top.
+`/health` is the source of truth for actual usage (see the note at the top
+of this guide).
+
+## RAM and Scaling
+
+The tier table above provisions headroom for traffic spikes; the
+measurements below are what the data + render side itself draws.
+
+Measured RAM by worker count, ALL regions + full NWP chain:
+
+| Configuration | Pipeline RAM | Render RAM | Total |
+|---|---|---|---|
+| ALL regions + full NWP chain, 8 workers | ~8-10 GB | ~3-4 GB | ~12-14 GB |
+| ALL regions + full NWP chain, 16 workers | ~8-10 GB | ~5-6 GB | ~14-16 GB |
+| ALL regions + full NWP chain, 32 workers | ~8-10 GB | ~7-8 GB | ~16-18 GB |
+
+Production observation on an 80-core / 32 GB rack (32 workers): ~16 GB
+total RSS across both containers.
+
+Audience-based scaling:
+
+| Users | Workers | RAM (ALL regions + full NWP) |
+|---|---|---|
+| 1-5 (personal) | 1 | ~9-10 GB |
+| 5-50 (small community) | 1-2 (with CDN) | ~9-18 GB |
+| 50-500 (medium) | 8-16 | ~12-16 GB |
+| 500+ (large) | 24-32+ (with CDN) | ~16-20 GB |
+
+Tiles are served with `Cache-Control: public, max-age=300`, so any caching
+reverse proxy (nginx, Cloudflare, etc.) will work out of the box for
+high-traffic deployments. A CDN like Cloudflare (free tier works) absorbs
+most tile requests at the edge, meaning a single worker can serve far more
+users than the table above suggests. Using a Cloudflare Tunnel also
+provides free HTTPS with no certificate management. For most self-hosting
+scenarios, 1 worker behind Cloudflare is sufficient.
+
 ## AWS Instance Mapping
 
 Indicative only - instance families, generations, availability, and
@@ -117,7 +178,10 @@ physical core only contend for the same execution units.
 **Disk:** expect ~20-30 GiB for caches. Note that the coordinate store's
 soft cap - `LIBREWXR_COORD_STORE_MB` - is a **disk** budget, not RAM
 (default 8192 in multi mode; lower it on small disks - it prunes once
-per fetch cycle).
+per fetch cycle). With `LIBREWXR_VOLATILE_CACHE_DIR` set, the per-cycle
+regenerated stores (~1-1.5 GB at ALL regions) live on tmpfs instead of
+disk, so they count against the container/anon budget rather than the
+disk budget.
 
 **RRQPE memory:** the RRQPE observed-precipitation layer (NOAA
 Enterprise Rain Rate) is now a radar region, so its frames live in the
@@ -139,6 +203,7 @@ versus the old NWP-source form is roughly the nowcast half.  Factor 4
 | `LIBREWXR_POOL_RENDER_MEMORY_RESERVATION` | Optional soft/cgroup `memory.low` protection per renderer container; `0` leaves it disabled. |
 | `LIBREWXR_POOL_RENDER_MEMSWAP_LIMIT` | Optional combined RAM + swap limit per pool renderer; `-1` is unlimited. Set this one allowance above `LIBREWXR_POOL_RENDER_MEMORY` to cap swap. |
 | `LIBREWXR_CACHE_DIR` | Shared cache directory; put it on SSD. Recommended - unset falls back to a per-host tempdir with a warning. |
+| `LIBREWXR_VOLATILE_CACHE_DIR` | Optional RAM-backed (tmpfs) directory for per-cycle regenerated stores (nowcast, precip masks, storm cells, RRQPE scan cache) - moves their rewrite traffic off the SSD; tmpfs pages count against the container memory limit (~1-1.5 GB at ALL regions). |
 | `LIBREWXR_PIPELINE_MEMORY` | Memory limit for the pipeline container; `12G` compose default. |
 | `LIBREWXR_PIPELINE_MEMSWAP_LIMIT` | Optional combined RAM + swap limit for the pipeline; `-1` is unlimited. |
 | `LIBREWXR_RENDER_MEMORY` | Memory limit for the renderer container; `18G` compose default. |

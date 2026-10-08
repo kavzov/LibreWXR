@@ -914,7 +914,7 @@ if settings.mcp_enabled:
 
 app = FastAPI(
     title="LibreWXR",
-    version="0.1.0",
+    version="0.2.0",
     description=(
         "Self-hostable weather radar and map API. Corresponding source for "
         f"this modified version: {settings.source_url}"
@@ -936,7 +936,7 @@ async def project_metadata():
     """Offer the corresponding source at the API's conventional root."""
     return {
         "name": "LibreWXR",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "license": "AGPL-3.0-or-later",
         "source": settings.source_url,
         "upstream": "https://github.com/JoshuaKimsey/LibreWXR",
