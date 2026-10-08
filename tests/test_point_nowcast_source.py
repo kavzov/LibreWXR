@@ -239,3 +239,31 @@ def test_point_nowcast_source_null_when_resolved_region_has_no_data(monkeypatch)
     assert result["source"] is None
     assert result["frames"][0]["region"] == "RRQPE"
     assert result["frames"][0]["coverage"] == "out_of_range"
+
+
+def test_point_nowcast_falls_through_dataless_radar_to_rrqpe(monkeypatch) -> None:
+    """Manila case: a finer radar region with no frames must not shadow RRQPE."""
+    region = _enable_test_region(monkeypatch)
+    latest = int(time.time() // 300) * 300
+    rrqpe = REGIONS["RRQPE"]
+    rrqpe_frame = np.zeros((rrqpe.height, rrqpe.width), dtype=np.uint8)
+    observed = _MemoryFrameStore([RadarFrame(latest, {"RRQPE": rrqpe_frame})])
+
+    result = asyncio.run(build_point_nowcast(
+        frame_store=observed,
+        nowcast_store=None,
+        enabled_regions=[region.name, "RRQPE"],
+        lat=0.05,
+        lon=0.05,
+        radius_km=2.0,
+        past_minutes=30,
+        future_minutes=60,
+        noise_floor_dbz=10.0,
+        fetch_interval=300,
+    ))
+
+    assert result["source"]["region"] == "RRQPE"
+    assert result["source"]["type"] == "satellite"
+    assert result["frames"][0]["region"] == "RRQPE"
+    assert result["frames"][0]["coverage"] == "in_range"
+

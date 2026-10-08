@@ -111,7 +111,7 @@ Returns a list of future nowcast frames (precipitation forecast) for a single ge
 | `minutes_offset` | int | Minutes from now this frame represents |
 | `dbz` | float | Reflectivity in dBZ at the point for this frame |
 | `rate_mmh` | float | Precipitation rate in mm/h (derived from dBZ via Marshall-Palmer Z-R) |
-| `source` | string | `"radar"` when the value comes from radar extrapolation, `"nwp"` when it comes from the model chain, `"none"` when there is no data |
+| `source` | string | `"radar"` when the value comes from Doppler radar extrapolation, `"satellite"` when it comes from the RRQPE satellite estimate (extrapolated), `"nwp"` when it comes from the model chain, `"none"` when there is no data |
 | `blend_weight` | float | Weight of the radar source in the blended nowcast (0.0 = pure NWP, 1.0 = pure radar). Only meaningful when source is not `"none"`. |
 | `coverage` | string | `"in_range"` when the point is inside radar coverage, `"out_of_range"` when it is not |
 

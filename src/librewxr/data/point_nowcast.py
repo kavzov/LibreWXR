@@ -17,7 +17,11 @@ from dataclasses import dataclass
 import numpy as np
 
 from librewxr.data.regions import RegionDef
-from librewxr.mcp.sampling import dbz_to_rate_mmh, resolve_region_for_point
+from librewxr.mcp.sampling import (
+    covering_regions_for_point,
+    dbz_to_rate_mmh,
+    first_region_with_data,
+)
 from librewxr.tiles.coordinates import _laea_forward, _tmerc_forward
 
 
@@ -198,14 +202,25 @@ async def build_point_nowcast(
         raise LookupError("Radar observations not available")
 
     latest_timestamp = max(timestamps)
-    region = resolve_region_for_point(lat, lon, enabled_regions)
-    frames: list[dict] = []
-
+    observed: list[tuple[int, int, object]] = []
     for timestamp in sorted(timestamps):
         offset_seconds = timestamp - latest_timestamp
         if offset_seconds < -past_minutes * 60:
             continue
-        frame = await frame_store.get_frame(timestamp)
+        observed.append(
+            (timestamp, offset_seconds, await frame_store.get_frame(timestamp))
+        )
+
+    # One region answers the whole series: the finest covering region that
+    # has data in the observed window, so a Doppler region whose provider
+    # is disabled or failing does not shadow the layer the tiles show.
+    region = first_region_with_data(
+        covering_regions_for_point(lat, lon, enabled_regions),
+        [frame for _, _, frame in observed],
+    )
+    frames: list[dict] = []
+
+    for timestamp, offset_seconds, frame in observed:
         sample = _sample_frame(
             region, lat, lon, radius_km, frame, noise_floor_dbz,
         )

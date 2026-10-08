@@ -148,12 +148,15 @@ Existing fields are unchanged and clients that ignore it keep working:
   Doppler coverage still resolve to `RRQPE`, with every frame
   `out_of_range`. Such responses do not claim a satellite source.
 
-The resolver picks one region per request: the finest-resolution region
-whose coverage contains the point. It does not check whether that region
-currently has frames. A Doppler region with a disabled or failing provider
-still wins its area. For example, `PHCOMP` resolves for Manila even with
-zero frames, so the point stays `out_of_range` there while tiles fall
-through to RRQPE.
+One region answers each request: the finest-resolution region whose
+coverage contains the point *and* that has data in the observed window.
+This matches the renderer, which falls through to the next coarser region
+when a finer one has no array. A Doppler region with a disabled or failing
+provider no longer shadows RRQPE. For example, Manila answers from RRQPE
+while `PHCOMP` has no frames, then switches back to `PHCOMP` (`radar`) once
+it does. If no covering region has data, the finest one is reported with
+`out_of_range` frames. The MCP `get_precip_nowcast` tool picks its region
+the same way, per frame, and reports `source: "satellite"` for RRQPE.
 
 ## Enabling and rolling back
 
@@ -259,8 +262,9 @@ logged one new scan every other 5-min cycle, with no warnings. New Delhi,
 Lagos, São Paulo, Nairobi and Jakarta all returned
 `source.type == "satellite"` with `in_range` frames. In a production
 `ENABLED_REGIONS=ALL` set (resolver check), Sydney and Cape Town also
-resolve to RRQPE; Berlin, Vilnius and Murmansk resolve to OPERA, and Manila
-to PHCOMP.
+resolve to RRQPE; Berlin, Vilnius and Murmansk resolve to OPERA. Manila
+resolves to PHCOMP by coverage and falls through to RRQPE while PHCOMP has
+no frames.
 
 On a real deployment, RRQPE tiles replace IFS fill rather than the
 empty-tile path, so compare tile latency against the deployment's own

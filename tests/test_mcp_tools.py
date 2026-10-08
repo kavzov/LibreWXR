@@ -131,6 +131,34 @@ async def test_get_precip_nowcast_with_mock_store(monkeypatch):
 
 
 @pytest.mark.mcp
+async def test_get_precip_nowcast_labels_satellite_and_skips_dataless_region(monkeypatch):
+    """A finer region without data falls through to a satellite region."""
+    satellite = RegionDef(
+        name="TEST_SAT",
+        west=-100.0, east=-90.0, south=35.0, north=45.0,
+        pixel_size=2.0, group="TEST", observation_type="satellite",
+    )
+    sat_data = np.zeros((5, 5), dtype=np.uint8)
+    sat_data[2, 2] = 64  # (40, -95) at 2-degree cells
+    frame = NowcastFrame(timestamp=TS_10, regions={"TEST_SAT": sat_data}, blend_weight=1.0)
+    store = MockNowcastStore([TS_10], [frame])
+    monkeypatch.setitem(REGIONS, "TEST_US", _TEST_REGION)
+    monkeypatch.setitem(REGIONS, "TEST_SAT", satellite)
+    monkeypatch.setattr("librewxr.mcp.tools.time.time", lambda: FIXED_NOW)
+    monkeypatch.setattr(
+        "librewxr.mcp.sampling.sample_coverage", lambda _n, _lat, _lon: np.array([True]),
+    )
+
+    # TEST_US is finer but has no array in the frame (provider down).
+    result = await get_precip_nowcast(None, store, ["TEST_US", "TEST_SAT"], 40.0, -95.0, 30)
+
+    assert len(result) == 1
+    assert result[0]["source"] == "satellite"
+    assert result[0]["coverage"] == "in_range"
+    assert result[0]["dbz"] == 0.0
+
+
+@pytest.mark.mcp
 async def test_get_precip_nowcast_minutes_filter(monkeypatch):
     """Only frames with minutes_offset <= minutes are returned."""
     frame_10 = NowcastFrame(timestamp=TS_10, regions={"TEST_US": _FRAME_DATA}, blend_weight=0.7)

@@ -82,21 +82,18 @@ def dbz_to_rate_mmh(dbz: float | None, is_snow: bool = False) -> float:
     return float(R)
 
 
-def resolve_region_for_point(
+def covering_regions_for_point(
     lat: float, lon: float, enabled_regions: list[str],
-) -> RegionDef | None:
-    """Find the finest-resolution enabled radar region covering *lat/lon*.
+) -> list[RegionDef]:
+    """Every enabled radar region covering *lat/lon*, finest resolution first.
 
-    Uses an equirectangular cos(lat) station-range mask
-    (``librewxr.data.coverage.sample_coverage``) to confirm the point
-    is within radar range of operational stations.  Among all candidates
-    that cover the point, the one with the smallest ``pixel_size``
-    (finest resolution) is returned, matching the renderer's
-    ``overlapping_regions`` sort at ``tiles/coordinates.py:343``.
-
-    Returns ``None`` if no enabled region covers the point.
+    Coverage uses an equirectangular cos(lat) station-range mask
+    (``librewxr.data.coverage.sample_coverage``) to confirm the point is
+    within radar range of operational stations.  Candidates are ordered by
+    ``pixel_size`` ascending, matching the renderer's ``overlapping_regions``
+    sort at ``tiles/coordinates.py:343``; ties keep ``enabled_regions`` order.
     """
-    best: RegionDef | None = None
+    candidates: list[RegionDef] = []
     for name in enabled_regions:
         region = REGIONS.get(name)
         if region is None:
@@ -111,11 +108,43 @@ def resolve_region_for_point(
         if not mask[0]:
             continue
 
-        # Pick the finest resolution.
-        if best is None or region.pixel_size < best.pixel_size:
-            best = region
+        candidates.append(region)
+    return sorted(candidates, key=lambda region: region.pixel_size)
 
-    return best
+
+def resolve_region_for_point(
+    lat: float, lon: float, enabled_regions: list[str],
+) -> RegionDef | None:
+    """Find the finest-resolution enabled radar region covering *lat/lon*.
+
+    Returns ``None`` if no enabled region covers the point.  Coverage alone
+    decides; use :func:`first_region_with_data` when the answer must come
+    from a region that actually holds frames.
+    """
+    candidates = covering_regions_for_point(lat, lon, enabled_regions)
+    return candidates[0] if candidates else None
+
+
+def first_region_with_data(
+    candidates: list[RegionDef], frames,
+) -> RegionDef | None:
+    """The finest candidate present in at least one of *frames*.
+
+    Mirrors the renderer, which falls through to the next coarser region
+    when a finer one has no array for a frame: a region whose provider is
+    disabled or failing (no frames at all) must not shadow a coarser region
+    that does have data.  Falls back to the finest candidate when none has
+    data, so callers still report which region covers the point.  ``frames``
+    are objects with a ``regions`` mapping; ``None`` entries are skipped.
+    """
+    present: set[str] = set()
+    for frame in frames:
+        if frame is not None:
+            present.update(frame.regions)
+    for region in candidates:
+        if region.name in present:
+            return region
+    return candidates[0] if candidates else None
 
 
 def sample_region_at_point(

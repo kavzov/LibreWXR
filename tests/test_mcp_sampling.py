@@ -13,6 +13,8 @@ from librewxr.data.regions import REGIONS, RegionDef
 from librewxr.mcp.sampling import (
     dbz_to_rate_mmh,
     decode_dbz,
+    covering_regions_for_point,
+    first_region_with_data,
     resolve_region_for_point,
     sample_nowcast_at_point,
     sample_region_at_point,
@@ -205,3 +207,47 @@ def test_sample_nowcast_at_point_missing_region(monkeypatch):
     assert dbz is None
     assert bw == 0.5
     assert coverage == "out_of_range"
+
+
+# ---------------------------------------------------------------------------
+# covering_regions_for_point / first_region_with_data
+# ---------------------------------------------------------------------------
+
+class _Frame:
+    def __init__(self, *names):
+        self.regions = {name: object() for name in names}
+
+
+def _covering(monkeypatch):
+    coarse = RegionDef(
+        name="COARSE", west=-110.0, east=-80.0, south=30.0, north=50.0,
+        pixel_size=0.04, group="TEST",
+    )
+    fine = RegionDef(
+        name="FINE", west=-100.0, east=-90.0, south=35.0, north=45.0,
+        pixel_size=0.01, group="TEST",
+    )
+    monkeypatch.setitem(REGIONS, "COARSE", coarse)
+    monkeypatch.setitem(REGIONS, "FINE", fine)
+    monkeypatch.setattr(
+        "librewxr.mcp.sampling.sample_coverage",
+        lambda _name, lat, _lon: np.ones(lat.shape, dtype=bool),
+    )
+    return coarse, fine
+
+
+def test_covering_regions_sorted_finest_first(monkeypatch):
+    coarse, fine = _covering(monkeypatch)
+    assert covering_regions_for_point(40.0, -95.0, ["COARSE", "FINE"]) == [fine, coarse]
+    assert covering_regions_for_point(32.0, -105.0, ["COARSE", "FINE"]) == [coarse]
+
+
+def test_first_region_with_data_skips_dataless_finer_region(monkeypatch):
+    coarse, fine = _covering(monkeypatch)
+    candidates = [fine, coarse]
+    assert first_region_with_data(candidates, [_Frame("COARSE")]) is coarse
+    assert first_region_with_data(candidates, [None, _Frame("FINE", "COARSE")]) is fine
+    # Nobody has data: still report the finest covering region.
+    assert first_region_with_data(candidates, [_Frame("OTHER")]) is fine
+    assert first_region_with_data([], [_Frame("COARSE")]) is None
+

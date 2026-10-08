@@ -23,7 +23,8 @@ from librewxr.mcp.alerts_query import alerts_within_radius
 from librewxr.mcp.sampling import (
     dbz_to_rate_mmh,
     decode_dbz,
-    resolve_region_for_point,
+    covering_regions_for_point,
+    first_region_with_data,
     sample_nowcast_at_point,
 )
 from librewxr.mcp.storm_cells import cell_pixel_to_latlon
@@ -75,6 +76,7 @@ async def get_precip_nowcast(
 
     now = int(time.time())
     timestamps = await nowcast_store.get_timestamps()
+    candidates = covering_regions_for_point(lat, lon, enabled_regions)
 
     frames: list[dict] = []
 
@@ -93,14 +95,17 @@ async def get_precip_nowcast(
         frame_bw = 0.0
 
         # ---- Radar path ---------------------------------------------------
-        region = resolve_region_for_point(lat, lon, enabled_regions)
+        # The finest covering region with data in this frame, as the
+        # renderer composites it; ``source`` reports what that region
+        # observes ("satellite" for RRQPE), never "radar" by default.
+        region = first_region_with_data(candidates, [frame])
         if region is not None:
             sample_dbz, sample_bw, sample_cov = sample_nowcast_at_point(
                 region.name, lat, lon, frame,
             )
             if sample_cov == "in_range":
                 dbz = sample_dbz
-                source = "radar"
+                source = region.observation_type
                 coverage = "in_range"
                 frame_bw = float(sample_bw)
 
