@@ -576,6 +576,37 @@ async def ai_catalog() -> Response:
     )
 
 
+# Present-tile cache key length: (timestamp, z, x, y, tile_size, smooth,
+# snow, color, ext, webp_quality, display_min_dbz) -- see ``radar_tile``.
+_PRESENT_KEY_LEN = 11
+
+
+def _tile_cache_kind(key: tuple) -> str | None:
+    """Classify a tile-cache key for the /health breakdown.
+
+    Shapes: satellite keys start with ``"sat"``; window present keys carry
+    ``"win"`` as their second element; geometry keys are 7 elements;
+    present keys are ``_PRESENT_KEY_LEN``; overlay keys extend a present
+    key with style/version fields (arrows, cells, lightning).  Anything
+    else (e.g. ``"cov"`` coverage entries) is left unclassified.
+    """
+    if not key:
+        return None
+    if key[0] == "sat":
+        return "sat"
+    if not isinstance(key[0], int):
+        return None
+    if len(key) > 1 and key[1] == "win":
+        return "window"
+    if len(key) == 7:
+        return "geometry"
+    if len(key) == _PRESENT_KEY_LEN:
+        return "present"
+    if len(key) > _PRESENT_KEY_LEN:
+        return "overlay"
+    return None
+
+
 @router.get("/health")
 async def health():
     """Health and status endpoint."""
@@ -650,15 +681,9 @@ async def health():
         "other_mb": round(other_bytes / (1024 * 1024), 1),
     })
 
-    # Split the tile cache into its five entry kinds: satellite render
-    # entries (``"sat"``-prefixed keys), geometry entries (int timestamp +
-    # 6-element viewport key), present render entries (int timestamp +
-    # 9-element viewport/visual key), overlay present entries (int
-    # timestamp + 9-element viewport/visual key + 6-element style/version
-    # suffix -- arrows/cells/lightning styles and their content versions;
-    # any frame an overlay attaches to), and lat/lon-centered window
-    # present entries (int timestamp + "win" + 9-element window/visual
-    # key).  Each kind is reported with its own count and byte total.
+    # Split the tile cache into its five entry kinds (satellite, geometry,
+    # present, overlay, window); ``_tile_cache_kind`` documents the key
+    # shapes.  Each kind is reported with its own count and byte total.
     cache_kind_geometry = 0
     cache_kind_geometry_bytes = 0
     cache_kind_present = 0
@@ -670,22 +695,20 @@ async def health():
     cache_kind_satellite = 0
     cache_kind_satellite_bytes = 0
     for key, size in tile_cache.entries():
-        if key[0] == "sat":
+        kind = _tile_cache_kind(key)
+        if kind == "sat":
             cache_kind_satellite += 1
             cache_kind_satellite_bytes += size
-        elif key and isinstance(key[0], int) and len(key) == 7:
+        elif kind == "geometry":
             cache_kind_geometry += 1
             cache_kind_geometry_bytes += size
-        elif key and isinstance(key[0], int) and len(key) == 10:
+        elif kind == "present":
             cache_kind_present += 1
             cache_kind_present_bytes += size
-        elif key and isinstance(key[0], int) and len(key) >= 14:
-            # Overlay keys are the 10-element present key plus style/version
-            # params (14 since flow/cells versioning, 16 with lightning); window
-            # keys are length 11 with key[1] == "win", so they cannot land here.
+        elif kind == "overlay":
             cache_kind_overlay += 1
             cache_kind_overlay_bytes += size
-        elif key and isinstance(key[0], int) and len(key) == 11 and key[1] == "win":
+        elif kind == "window":
             cache_kind_window += 1
             cache_kind_window_bytes += size
 
