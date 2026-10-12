@@ -42,8 +42,8 @@ _SERVER_CARD_SCHEMA = (
 _NAME = "io.github.joshuakimsey/librewxr-mcp"
 _TITLE = "LibreWXR MCP"
 _DESCRIPTION = (
-    "Precipitation nowcasts, active weather alerts, and storm-cell "
-    "data for any point on Earth."
+    "Precipitation nowcasts, weather alerts, storm cells, and recent "
+    "lightning strikes for any point."
 )
 _SERVER_CARD_MEDIA_TYPE = "application/mcp-server-card+json"
 _AI_CATALOG_MEDIA_TYPE = "application/ai-catalog+json"
@@ -53,13 +53,13 @@ _CACHE_CONTROL = "public, max-age=3600"
 def package_version() -> str:
     """Return the installed ``librewxr`` distribution version.
 
-    Falls back to ``0.1.1`` (the pyproject version) when the package
+    Falls back to ``0.3.1`` (the pyproject version) when the package
     metadata is unavailable, e.g. running from a bare source tree.
     """
     try:
         return _distribution_version("librewxr")
     except PackageNotFoundError:
-        return "0.1.1"
+        return "0.3.1"
 
 
 def _supported_protocol_versions() -> list[str] | None:

@@ -33,7 +33,12 @@ SERVER_CARD_SCHEMA = (
     "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json"
 )
 SERVER_CARD_NAME = "io.github.joshuakimsey/librewxr-mcp"
-MCP_TOOL_NAMES = ["get_precip_nowcast", "get_active_alerts", "get_storm_cells"]
+MCP_TOOL_NAMES = [
+    "get_precip_nowcast",
+    "get_active_alerts",
+    "get_storm_cells",
+    "get_recent_lightning",
+]
 
 _INIT_HEADERS = {
     "Content-Type": "application/json",
@@ -237,7 +242,7 @@ async def test_mcp_initialize_server_info_matches_server_card():
     try:
         expected_version = importlib.metadata.version("librewxr")
     except PackageNotFoundError:
-        expected_version = "0.1.1"
+        expected_version = "0.3.1"
     mcp_app = build_mcp_http_app()
     app = FastAPI()
     app.mount("/mcp", mcp_app)

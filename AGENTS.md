@@ -7,7 +7,7 @@ LibreWRX is a self-hostable Rain Viewer API replacement. It fetches radar compos
 - **License:** AGPL-3.0-or-later
 - **Python:** >=3.11 (Docker uses 3.12)
 - **Package manager:** pip with hatchling build backend
-- **MCP server:** Model Context Protocol tools (point nowcast sampling, alerts, storm cells) over HTTP at `/mcp` or stdio (`python -m librewxr.mcp`); optional `fastmcp` via the `mcp` extra (installed by default in Docker)
+- **MCP server:** Model Context Protocol tools (point nowcast sampling, alerts, storm cells, lightning strikes) over HTTP at `/mcp` or stdio (`python -m librewxr.mcp`); optional `fastmcp` via the `mcp` extra (installed by default in Docker)
 
 ## Setup
 
@@ -31,7 +31,7 @@ pytest tests/test_renderer.py     # single file
 pytest -k "test_tile_render"      # by name pattern
 ```
 
-Test markers (defined in `pyproject.toml`): `api`, `ecmwf`, `nowcast`, `sources`, `tiles`, `store`, `hrrr`, `hrrr_alaska`, `icon_eu`, `dmi_dini`, `hrdps`, `arome_antilles`, `arome_guyane`, `arome_indien`, `arome_ncaled`, `arome_polyn`, `wrf_smn`, `jma_msm`, `rrqpe`, `alerts`, `mcp`, `storm_cells`.
+Test markers (defined in `pyproject.toml`): `api`, `ecmwf`, `nowcast`, `sources`, `tiles`, `store`, `hrrr`, `hrrr_alaska`, `icon_eu`, `dmi_dini`, `hrdps`, `arome_antilles`, `arome_guyane`, `arome_indien`, `arome_ncaled`, `arome_polyn`, `wrf_smn`, `jma_msm`, `rrqpe`, `alerts`, `mcp`, `storm_cells`, `lightning`.
 
 All tests are auto-async (`asyncio_mode = "auto"` in pyproject.toml). No explicit `@pytest.mark.asyncio` needed on individual async tests (though some older tests still have it).
 
@@ -95,6 +95,8 @@ src/librewxr/
     storm_cells.py   # Storm-cell detection + StormCellStore (?cells= overlay)
     worker_pulse.py  # Per-render-worker health pulses (<cache_dir>/workers/)
     alerts_fetcher.py / alerts_store.py   # WMO weather alerts
+    lightning_fetcher.py   # GOES GLM flash fetch loop (pipeline-owned, clock-aligned)
+    lightning_store.py    # Flash-point store (on-disk artifact handoff, no state.json section)
     master_state.py  # Multi-worker state.json snapshot
     retry.py         # Backoff helper
   tiles/
@@ -151,6 +153,7 @@ Docker Compose uses profiles: `COMPOSE_PROFILES=multi` starts the `pipeline` + `
 - **Worker pulses:** Every render process writes a small JSON pulse to `<cache_dir>/workers/worker_<hostname>-<pid>.json` every ~15s (jittered, atomic tmp+os.replace; see `src/librewxr/data/worker_pulse.py`); `/health` aggregates fresh pulses (mtime-filtered, lock-free) into an additive top-level `cluster` section - workers_reporting, container cgroup anon/file/shmem split, summed per-worker RSS / tile-cache / coord-cache / request counters with hit ratios recomputed from sums. The pulse loop runs in the render lifespan (both the auto-spawned bare-metal process and Docker render workers); not in the pipeline.
 - **Shared stores:** three best-effort on-disk stores under `cache_dir` shared by pipeline + renderers — `data/coord_store.py` (tile-coordinate arrays computed once per fetch cycle globally instead of per worker), `tiles/shared_tile_store.py` (encoded tile bytes, multi-mode only, content-versioned keys so stale entries are unreachable between fetch cycles), and `data/precip_mask.py` (per-timestamp global 0.5° precip mask gating the multi-worker empty-tile fast path).
 - **Storm cells:** `data/storm_cells.py` thresholds the latest radar frame per region (default 40 dBZ), groups contiguous pixels with cv2 connected components, filters cells under 25 km², and derives each cell's motion vector from the same optical-flow field as `?arrows=`; cells live in `StormCellStore` and are drawn as a present-time `?cells=light|dark` tile overlay (does not affect the geometry cache). See `docs/storm-cells.md`.
+- **Lightning:** NOAA GOES GLM flash points (GOES-East + GOES-West) fetched by `data/lightning_fetcher.py` on their own clock-aligned loop (default 300 s) into a shared on-disk artifact `<cache_dir>/lightning/current.npz` with per-satellite watermarks in `<cache_dir>/lightning/watermark.json` — deliberately NO `state.json` section (the artifact is the cross-process handoff, the shared-tile-store/precip-mask pattern). The store (`data/lightning_store.py`) holds structured flash points under a 500k RAM ceiling; render workers and the stdio MCP transport refresh via a cheap `mtime` stat on demand. The `?lightning=1|true|dots|bolts` tile overlay draws dots or a hand-authored vector-bolt glyph (constant brightness, no age fade) on every requested frame's own 10-minute slot window `(T-600, T]` (boundary strikes belong to the earlier frame; slots older than `LIBREWXR_LIGHTNING_MAX_AGE` render plain), with the overlay cache keyed by a deterministic content fingerprint of the tile's slot strikes, and a presentational strongest-by-energy draw cap (`LIBREWXR_LIGHTNING_MAX_DRAW_PER_TILE`) — the store always keeps every flash in the window; unknown values fall back to off silently. MCP `get_recent_lightning` runs on both transports and takes `lat` / `lon` / `radius_km` / `minutes` / `limit` plus a `bbox`; `/v2/lightning` returns the same strikes as a GeoJSON `FeatureCollection` (no-args full window, or `lat` + `lon` + `radius_km`, or `bbox`; `minutes` clamped to `LIBREWXR_LIGHTNING_MAX_AGE`; `limit` newest-first); `/health` gains an additive `lightning` section. Large JSON responses (>= 1 KiB, `application/json` only, client-advertised gzip only) are gzipped by a pure-ASGI middleware in `main.py` - tiles and streaming responses are never compressed. See `docs/lightning.md`.
 - **MCP server:** FastMCP HTTP transport mounted inside the FastAPI app at `LIBREWXR_MCP_PATH` (default `/mcp`) when `LIBREWXR_MCP_ENABLED`; stdio transport via `python -m librewxr.mcp` or the `librewxr-mcp` console script. Tools in `mcp/tools.py` are pure store-passing functions shared by both transports (HTTP reads the `routes` globals; stdio builds its own stores from `state.json`). Discovery metadata: MCP Server Card at `<mcp_path>/server-card` (SEP-2127 draft) and AI Catalog at `/.well-known/ai-catalog.json`. Requires the `fastmcp` `[mcp]` extra (the Dockerfile installs it). See `docs/mcp-server.md`.
 
 ## Configuration
@@ -189,7 +192,7 @@ All config via `LIBREWXR_*` env vars or `.env` file. Settings defined in `src/li
 **NWP:**
 - `LIBREWXR_REGIONAL_NWP_ENABLED`: master switch for all regional NWP (false = IFS only)
 - `LIBREWXR_NA_NWP_SOURCE`: `ifs` (default) or `hrrr` — North American NWP source
-- `LIBREWXR_EU_NWP_PROFILE`: `ifs`, `icon_eu_only`, or `dini_with_icon_eu` — European NWP profile
+- `LIBREWXR_EU_NWP_PROFILE`: `ifs`, `icon_eu_only`, `dini_only`, or `dini_with_icon_eu` — European NWP profile
 - `LIBREWXR_ECMWF_ENABLED`: disable IFS global precipitation (debug use)
 - `LIBREWXR_WEATHER_FIELDS_ENABLED`: global scalar store/API toggle (independent of IFS precipitation)
 - `LIBREWXR_WEATHER_FIELDS_FIELDS`: selected public/native fields; derived fields expand dependencies
@@ -217,6 +220,13 @@ All config via `LIBREWXR_*` env vars or `.env` file. Settings defined in `src/li
 - `LIBREWXR_STORM_CELLS_ENABLED`: storm-cell detection feeding the `?cells=` tile overlay (default true)
 - `LIBREWXR_STORM_CELLS_MIN_DBZ`: minimum dBZ for a pixel to be part of a cell (default 40)
 - `LIBREWXR_STORM_CELLS_MIN_AREA_KM2`: minimum cell area in km²; smaller cells are filtered as noise (default 25.0)
+
+**Lightning:**
+- `LIBREWXR_LIGHTNING_ENABLED`: master toggle for the GOES GLM lightning overlay + MCP tool (default true)
+- `LIBREWXR_LIGHTNING_NOAA_ENABLED`: enable the NOAA GOES GLM flash family (default true); satellite identity is internal — per-family booleans are the knob, never cherry-picked satellites
+- `LIBREWXR_LIGHTNING_FETCH_INTERVAL`: clock-aligned GLM fetch cadence, seconds (default 300)
+- `LIBREWXR_LIGHTNING_MAX_AGE`: seconds of held flash history (default 1800 = 30 min)
+- `LIBREWXR_LIGHTNING_MAX_DRAW_PER_TILE`: presentational strongest-by-energy draw cap per tile (default 1000); the store always holds every flash in the window
 
 **Alerts:**
 - `LIBREWXR_ALERTS_ENABLED`: WMO CAP weather alerts toggle
@@ -257,5 +267,5 @@ The discovery walker picks up the new package automatically — no per-source pl
 - **Commit sign-off:** every commit must carry a `Signed-off-by:` trailer (`git commit -s`) whose name and email match the commit author identity; enforced on pull requests by `.github/workflows/dco.yml`.
 - **Contribution licensing:** LibreWXR is dual-licensed (AGPL-3.0-or-later plus a separate commercial license offered by the maintainer). Contributions are governed by the license grant in CONTRIBUTING.md, restated as required checkboxes in `.github/PULL_REQUEST_TEMPLATE.md`; do not weaken or bypass those terms.
 - **Docker:** `docker compose up --build` with `COMPOSE_PROFILES=multi` (default). A legacy `COMPOSE_PROFILES=single` works through a compatibility alias (same pipeline + renderer pair, 1 render worker). Exposes port 8080 (configurable via `LIBREWXR_PORT`). Use `docker compose run --rm clear-cache` to wipe caches.
-- **Scripts:** `scripts/generate_coverage_map.py` regenerates the `docs/coverage-map-*.png` files (needs the `maps` extra); `generate_scheme_docs.py` + `generate_color_scheme_previews.py` regenerate the color-scheme docs and preview PNGs (a CI workflow checks the previews aren't stale); `refresh_dpc_coverage.py` / `refresh_jma_coverage.py` refresh per-source coverage data; `auto-update.sh` is the server self-update helper
-- **Docs:** `docs/adding-a-source.md`, `docs/configuration-reference.md`, `docs/satellite-implementation-plan.md`, `docs/coverage.md`, `docs/rainviewer-migration-guide.md`, `docs/web-integration-guide.md`, `docs/source-survey.md`, `docs/self-host-sizing.md`, `docs/single-mode-migration.md`, `docs/mcp-server.md`, `docs/storm-cells.md`
+- **Scripts:** `scripts/generate_coverage_map.py` regenerates the `docs/coverage-map-*.png` files (needs the `maps` extra); `generate_scheme_docs.py` + `generate_color_scheme_previews.py` regenerate the color-scheme docs and preview PNGs (a CI workflow checks the previews aren't stale); `refresh_dpc_coverage.py` / `refresh_jma_coverage.py` refresh per-source coverage data; `auto-update.sh` is the server self-update helper; `generate_changelog.py` regenerates `CHANGELOG.md` from published GitHub releases (run after `gh release create`; commit the result with the version bump)
+- **Docs:** `docs/adding-a-source.md`, `docs/configuration-reference.md`, `docs/satellite-implementation-plan.md`, `docs/coverage.md`, `docs/rainviewer-migration-guide.md`, `docs/web-integration-guide.md`, `docs/source-survey.md`, `docs/self-host-sizing.md`, `docs/single-mode-migration.md`, `docs/mcp-server.md`, `docs/storm-cells.md`, `docs/lightning.md`, `docs/lightning-implementation-plan.md`

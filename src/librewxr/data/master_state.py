@@ -30,9 +30,25 @@ subset of stores enabled.
 The envelope stays at version 1 for compatibility. Individual stores may
 version their own additive/representation changes; ECMWF IFS uses store format
 2 and its ``__setstate__`` also accepts the legacy implicit precip/snow shape.
+
+The serialised payload is **gzip-compressed on disk** (the file name is
+still ``state.json``).  :func:`load_state` magic-byte sniffs the gzip
+header, so legacy plaintext ``state.json`` files written by older
+versions still load.  This trade was made because the snapshot is
+rewritten on every fetch cycle and alert-heavy deployments produce a
+~28 MB file per write; gzip cuts the durable-write volume several-fold
+at negligible CPU cost.
+
+Mixed-version deployments -- an old binary's render worker reading a
+new pipeline's gzipped ``state.json`` -- fail loudly by design: the old
+``json.loads`` sees the gzip magic bytes and raises.  Roll render
+workers before the pipeline (the new loader reads both forms), or restart
+them together.  In this fork every generation's ``state.json`` and the
+top-level pointer copy are gzipped alike (see ``_write_json``).
 """
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
@@ -60,9 +76,16 @@ _DESCRIPTOR_STATE_KEYS = frozenset({
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    """Durably write *payload* to *path* (which must not be visible yet)."""
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, default=str)
+    """Durably write *payload* gzipped to *path* (which must not be visible yet).
+
+    Every snapshot is written twice per cycle (the generation copy and the
+    top-level pointer) and runs to tens of MB on alert-heavy deployments;
+    gzip cuts that write volume several-fold.  :func:`load_state` sniffs
+    the gzip magic bytes, so plaintext snapshots from older pipelines load.
+    """
+    data = gzip.compress(json.dumps(payload, default=str).encode("utf-8"))
+    with path.open("wb") as handle:
+        handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -394,7 +417,10 @@ def load_state(cache_dir: Path) -> dict[str, Any] | None:
     path = Path(cache_dir) / STATE_FILENAME
     if not path.exists():
         return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw = path.read_bytes()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    payload = json.loads(raw)
     version = payload.get("version")
     if version != STATE_VERSION:
         logger.warning(

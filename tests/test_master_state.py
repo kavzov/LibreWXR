@@ -8,6 +8,7 @@ that opts into the snapshot has its ``__setstate__`` called in place.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import time
 from pathlib import Path
@@ -49,10 +50,51 @@ def test_dump_state_writes_json_with_version_and_timestamp(tmp_path: Path) -> No
     assert path == cache / STATE_FILENAME
     assert path.exists()
 
-    payload = json.loads(path.read_text())
+    payload = load_state(cache)
+    assert payload is not None
     assert payload["version"] == STATE_VERSION
     assert before <= payload["written_at"] <= after
     assert payload["stores"] == {}
+
+
+def test_dump_state_is_gzip_compressed_on_disk(tmp_path: Path) -> None:
+    """The snapshot payload is gzip-compressed (magic bytes on disk)."""
+    cache = tmp_path / "cache"
+    path = dump_state({}, cache)
+    assert path.read_bytes()[:2] == b"\x1f\x8b"
+
+
+def test_load_state_reads_legacy_plaintext(tmp_path: Path) -> None:
+    """A pre-gzip plaintext state.json from an older version still loads."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    legacy = {
+        "version": STATE_VERSION,
+        "written_at": 1700000000,
+        "stores": {"frame_store": {"timestamps": []}},
+    }
+    (cache / STATE_FILENAME).write_text(json.dumps(legacy), encoding="utf-8")
+
+    payload = load_state(cache)
+    assert payload == legacy
+
+
+def test_round_trip_nested_payload(tmp_path: Path) -> None:
+    """A store whose __getstate__ returns a nested payload round-trips."""
+    cache = tmp_path / "cache"
+
+    class NestedStore:
+        def __getstate__(self):
+            return {"a": [1, 2, {"b": True}], "c": {"d": "e"}}
+
+    dump_state({"nested": NestedStore()}, cache)
+
+    # On disk it must be the gzip container, not plaintext.
+    assert (cache / STATE_FILENAME).read_bytes()[:2] == b"\x1f\x8b"
+
+    payload = load_state(cache)
+    assert payload is not None
+    assert payload["stores"]["nested"] == {"a": [1, 2, {"b": True}], "c": {"d": "e"}}
 
 
 def test_dump_state_skips_none_stores(tmp_path: Path) -> None:
@@ -172,7 +214,8 @@ class TestRoundTripWithFrameStore:
         retained_manifest = (
             cache / STATE_GENERATIONS_DIRNAME / first_generation / STATE_FILENAME
         )
-        retained_payload = json.loads(retained_manifest.read_text())
+        # Generation manifests are gzipped like the top-level snapshot.
+        retained_payload = json.loads(gzip.decompress(retained_manifest.read_bytes()))
         consumer = FrameStore(max_frames=1)
         assert apply_state(retained_payload, {"frame_store": consumer}) == [
             "frame_store"
