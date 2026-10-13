@@ -2,7 +2,10 @@
 # Copyright (C) 2026 Joshua Kimsey
 import logging
 import math
-from functools import lru_cache
+import threading
+import time
+from collections import OrderedDict, namedtuple
+from functools import lru_cache, wraps
 from pathlib import Path
 
 import numpy as np
@@ -179,6 +182,107 @@ def _try_publish(
             kind, region_name, z, x, y, tile_size, pad,
             exc_info=True,
         )
+
+
+# ── Store-aware coordinate caches ─────────────────────────────────────
+#
+# Coordinate functions backed by the shared store return file-backed
+# memmap views once the store holds the entry.  The LRU must pin only
+# those: a heap array returned while the publish is still queued (async
+# publish), skipped (full queue) or failed would otherwise sit in the LRU
+# until evicted.  Across ~11 caches x ``coord_cache_size`` entries x every
+# render worker, that grew each renderer container by several GiB of anon.
+# Heap results are held briefly instead, so a burst on the same tile does
+# not recompute, and a later call re-opens the published memmap.
+
+_HEAP_HOLD_SECONDS = 60.0
+_HEAP_HOLD_ENTRIES = 32
+
+CoordCacheInfo = namedtuple("CoordCacheInfo", "hits misses maxsize currsize")
+
+
+def _file_backed(result) -> bool:
+    """True when every array in *result* is a view of an ``np.memmap``."""
+    arrays = result if isinstance(result, tuple) else (result,)
+    for arr in arrays:
+        base = arr
+        while not isinstance(base, np.memmap):
+            base = getattr(base, "base", None)
+            if base is None:
+                return False
+    return True
+
+
+def _store_aware_cache(maxsize: int):
+    """LRU decorator that pins only store-backed results while a store is active.
+
+    Without a shared store every result is cached, exactly like
+    ``functools.lru_cache``.  With one, heap results go to a small
+    time-limited side cache (``_HEAP_HOLD_ENTRIES`` per function,
+    ``_HEAP_HOLD_SECONDS``).  Exposes ``cache_info``/``cache_clear`` like
+    ``lru_cache`` plus ``cache_held`` (heap entries currently held).
+    """
+    def decorator(fn):
+        lock = threading.Lock()
+        pinned: OrderedDict = OrderedDict()
+        held: OrderedDict = OrderedDict()
+        counts = {"hits": 0, "misses": 0}
+
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            key = (args, tuple(sorted(kwargs.items()))) if kwargs else args
+            now = time.monotonic()
+            with lock:
+                if key in pinned:
+                    pinned.move_to_end(key)
+                    counts["hits"] += 1
+                    return pinned[key]
+                entry = held.get(key)
+                if entry is not None and entry[0] > now:
+                    counts["hits"] += 1
+                    return entry[1]
+                counts["misses"] += 1
+            result = fn(*args, **kwargs)
+            keep = _get_store() is None or _file_backed(result)
+            with lock:
+                if keep:
+                    held.pop(key, None)
+                    pinned[key] = result
+                    pinned.move_to_end(key)
+                    while len(pinned) > maxsize:
+                        pinned.popitem(last=False)
+                else:
+                    held[key] = (now + _HEAP_HOLD_SECONDS, result)
+                    held.move_to_end(key)
+                    while len(held) > _HEAP_HOLD_ENTRIES:
+                        held.popitem(last=False)
+                # Insertion order is deadline order: drop expired holds.
+                while held and next(iter(held.values()))[0] <= now:
+                    held.popitem(last=False)
+            return result
+
+        def cache_info() -> CoordCacheInfo:
+            with lock:
+                return CoordCacheInfo(
+                    counts["hits"], counts["misses"], maxsize,
+                    len(pinned) + len(held),
+                )
+
+        def cache_held() -> int:
+            with lock:
+                return len(held)
+
+        def cache_clear() -> None:
+            with lock:
+                pinned.clear()
+                held.clear()
+                counts["hits"] = counts["misses"] = 0
+
+        wrapper.cache_info = cache_info
+        wrapper.cache_held = cache_held
+        wrapper.cache_clear = cache_clear
+        return wrapper
+    return decorator
 
 
 # ── WGS84 ellipsoidal constants ────────────────────────────────────
@@ -372,7 +476,7 @@ def _compute_region_pixel_indices(
     return row_idx, col_idx
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_store_aware_cache(maxsize=settings.coord_cache_size)
 def region_pixel_indices(
     region: RegionDef, z: int, x: int, y: int, tile_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -445,7 +549,7 @@ def _compute_region_pixel_indices_padded(
     return row_idx, col_idx
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_store_aware_cache(maxsize=settings.coord_cache_size)
 def region_pixel_indices_padded(
     region: RegionDef, z: int, x: int, y: int, tile_size: int = 256, pad: int = 8
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -509,7 +613,7 @@ def _compute_region_pixel_indices_fractional(
     return row_grid, col_grid
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_store_aware_cache(maxsize=settings.coord_cache_size)
 def region_pixel_indices_fractional(
     region: RegionDef, z: int, x: int, y: int, tile_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -571,7 +675,7 @@ def _compute_region_pixel_indices_fractional_padded(
     return row_grid, col_grid
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_store_aware_cache(maxsize=settings.coord_cache_size)
 def region_pixel_indices_fractional_padded(
     region: RegionDef, z: int, x: int, y: int, tile_size: int = 256, pad: int = 8
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -685,7 +789,7 @@ def _compute_region_pixel_indices_fractional_masked(
     return row_grid, col_grid
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_store_aware_cache(maxsize=settings.coord_cache_size)
 def region_pixel_indices_fractional_masked(
     region: RegionDef, z: int, x: int, y: int, tile_size: int = 256,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -717,7 +821,7 @@ def region_pixel_indices_fractional_masked(
     )
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_store_aware_cache(maxsize=settings.coord_cache_size)
 def region_pixel_indices_fractional_masked_padded(
     region: RegionDef,
     z: int,
@@ -818,7 +922,7 @@ def _compute_tile_pixel_latlons(
     return lat_grid, lon_grid
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_store_aware_cache(maxsize=settings.coord_cache_size)
 def tile_pixel_latlons(
     z: int, x: int, y: int, tile_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -873,7 +977,7 @@ def _compute_tile_pixel_latlons_padded(
     return lat_grid, lon_grid
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_store_aware_cache(maxsize=settings.coord_cache_size)
 def tile_pixel_latlons_padded(
     z: int, x: int, y: int, tile_size: int = 256, pad: int = 8
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -921,7 +1025,7 @@ def tile_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
     return west, south, east, north
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_store_aware_cache(maxsize=settings.coord_cache_size)
 def tile_pixel_indices(
     z: int, x: int, y: int, tile_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -929,7 +1033,7 @@ def tile_pixel_indices(
     return region_pixel_indices(_USCOMP, z, x, y, tile_size)
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_store_aware_cache(maxsize=settings.coord_cache_size)
 def tile_pixel_indices_padded(
     z: int, x: int, y: int, tile_size: int = 256, pad: int = 8
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -937,7 +1041,7 @@ def tile_pixel_indices_padded(
     return region_pixel_indices_padded(_USCOMP, z, x, y, tile_size, pad)
 
 
-@lru_cache(maxsize=settings.coord_cache_size)
+@_store_aware_cache(maxsize=settings.coord_cache_size)
 def tile_pixel_indices_fractional(
     z: int, x: int, y: int, tile_size: int = 256
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -1154,6 +1258,7 @@ def coord_cache_stats() -> dict:
         total = info.hits + info.misses
         caches[fn.__name__] = {
             "entries": info.currsize,
+            "heap_held": fn.cache_held(),
             "hits": info.hits,
             "misses": info.misses,
             "hit_ratio": round(info.hits / total, 3) if total else None,

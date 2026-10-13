@@ -570,11 +570,13 @@ The default is 8192 MB (4096 MB in the legacy-single profile). In multi mode the
 
 Moves atomic coordinate-store writes to one bounded background writer per
 render process. This removes file allocation, copying, and flushes from a cold
-tile request. When the queue is full, persistence is skipped while the freshly
-computed arrays remain available in the worker's in-process LRU; rendered
-output and cache correctness are unchanged. This is most useful in multi-mode
-renderer pools. Keep it disabled if every first caller must immediately return
-file-backed memmaps.
+tile request. Until the write lands, or when the queue is full and the write
+is skipped, the freshly computed heap arrays are held briefly: up to 32 per
+coordinate cache for 60 seconds. The LRU itself pins only file-backed
+memmaps, so heap copies never accumulate per worker. Rendered output and cache
+correctness are unchanged. `/health` reports held copies per cache as
+`heap_held`. This is most useful in multi-mode renderer pools; raise
+`LIBREWXR_COORD_STORE_ASYNC_QUEUE_SIZE` if bursts skip many writes.
 
 | | |
 |---|---|
