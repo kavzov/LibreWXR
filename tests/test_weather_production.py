@@ -188,6 +188,28 @@ def test_active_manifest_restart_outage_and_run_cleanup(tmp_path, monkeypatch):
     )
 
 
+def test_restart_restores_from_gzipped_state_json_without_manifest(
+    tmp_path, monkeypatch,
+):
+    """The state.json fallback must read the gzipped snapshot format."""
+    _small_grid(monkeypatch)
+    reference_time = "2026-08-06T06:00:00Z"
+    producer = ECMWFGrid(cache_dir=tmp_path)
+    assert producer._publish_prepared(
+        _prepare_run(producer, reference_time, 12.0),
+        reference_time=reference_time,
+        last_modified_time=reference_time,
+    )
+    state_path = dump_state({"ecmwf_grid": producer}, tmp_path)
+    assert state_path.read_bytes()[:2] == b"\x1f\x8b"
+    producer._manifest_path.unlink()
+
+    restarted = ECMWFGrid(cache_dir=tmp_path)
+
+    assert restarted.reference_time == reference_time
+    assert restarted.has_field_at(WeatherField.TEMPERATURE_2M, None)
+
+
 def test_worker_with_legacy_snapshot_resurrects_ecmwf_on_next_state(
     tmp_path,
     monkeypatch,

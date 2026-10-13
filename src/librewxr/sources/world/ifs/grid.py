@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import os
@@ -494,7 +495,11 @@ class ECMWFGrid:
             legacy_state = self._memmap_dir.parent / "state.json"
             if legacy_state.exists():
                 try:
-                    envelope = json.loads(legacy_state.read_text(encoding="utf-8"))
+                    raw = legacy_state.read_bytes()
+                    # The pipeline gzips state.json; older ones wrote text.
+                    if raw[:2] == b"\x1f\x8b":
+                        raw = gzip.decompress(raw)
+                    envelope = json.loads(raw)
                     state = envelope.get("stores", {}).get("ecmwf_grid")
                     source = legacy_state if state is not None else None
                 except Exception:
