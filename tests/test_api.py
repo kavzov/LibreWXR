@@ -660,7 +660,8 @@ class TestHealthCluster:
         coord = cluster["coord"]
         assert isinstance(coord["caches"], dict)
         for name, info in coord["caches"].items():
-            assert set(info) == {"entries", "hits", "misses", "hit_ratio"}
+            assert set(info) == {"entries", "heap_held", "hits", "misses", "hit_ratio"}
+            assert info["heap_held"] >= 0
             assert info["hits"] >= 0 and info["misses"] >= 0
         # Shared store is off in the test harness -> None; when present it
         # carries the summed per-process counters plus global entries/bytes.

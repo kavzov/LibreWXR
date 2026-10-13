@@ -305,6 +305,7 @@ def collect_worker_pulse() -> dict:
         for name, info in coord_stats.get("caches", {}).items():
             coord["caches"][name] = {
                 "entries": info["entries"],
+                "heap_held": info.get("heap_held", 0),
                 "hits": info["hits"],
                 "misses": info["misses"],
             }
@@ -429,9 +430,11 @@ def _cluster_health_section() -> dict:
     for pulse in pulses:
         for name, info in pulse.get("coord", {}).get("caches", {}).items():
             agg = cache_sums.setdefault(
-                name, {"entries": 0, "hits": 0, "misses": 0},
+                name, {"entries": 0, "heap_held": 0, "hits": 0, "misses": 0},
             )
             agg["entries"] += info["entries"]
+            # Pulses from older workers carry no heap_held.
+            agg["heap_held"] += info.get("heap_held", 0)
             agg["hits"] += info["hits"]
             agg["misses"] += info["misses"]
     for name, agg in cache_sums.items():
