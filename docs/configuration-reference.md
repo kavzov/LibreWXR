@@ -61,6 +61,8 @@ Most self-hosters want the new behaviour, but if your reverse proxy or network o
 
 The port the server listens on.
 
+In Docker deployments the renderer pins the in-container bind to 8080 (`LIBREWXR_PORT: "8080"` in `docker-compose.yml`, which overrides any `.env` value), so `LIBREWXR_PORT` there controls only the published host port via the `${LIBREWXR_PORT:-8080}:8080` mapping. On bare metal it remains the bind port as before.
+
 | | |
 |---|---|
 | **Default** | `8080` |
@@ -957,11 +959,11 @@ How long after a 10-min scan start the file is considered safely published. The 
 
 #### `LIBREWXR_RRQPE_DBZ_OFFSET`
 
-dBZ calibration shift applied after Z-R conversion of RRQPE rain rates (Marshall-Palmer 200·R^1.6). Satellite QPE is a surface rain rate; radar reflectivity samples the storm column and reads higher, so nudge the derived dBZ up to match.
+dBZ calibration shift applied after Z-R conversion of RRQPE rain rates (Marshall-Palmer 200·R^1.6). Provisional display calibration: with the `scale_factor` double-unpack decode bug fixed (Oct 2026), a single-scene comparison against MRMS MergedReflectivityQCComposite (Great Lakes / New York, 2026-10-16 10:00Z) left RRQPE ~13 dB hot at zero offset, so the default shifts it down. Recalibrate against MRMS/OPERA across multiple scenes before treating this as settled.
 
 | | |
 |---|---|
-| **Default** | `6.0` |
+| **Default** | `-7.0` |
 | **Type** | float |
 | **Unit** | dBZ |
 

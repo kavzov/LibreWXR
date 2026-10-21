@@ -26,6 +26,7 @@ from librewxr.mcp.sampling import (
     covering_regions_for_point,
     first_region_with_data,
     sample_nowcast_at_point,
+    undo_display_dbz_offset,
 )
 from librewxr.mcp.storm_cells import cell_pixel_to_latlon
 
@@ -104,7 +105,9 @@ async def get_precip_nowcast(
                 region.name, lat, lon, frame,
             )
             if sample_cov == "in_range":
-                dbz = sample_dbz
+                # Stored dBZ may carry a decode-time display calibration
+                # shift (e.g. RRQPE); report true values.
+                dbz = undo_display_dbz_offset(sample_dbz, region.name)
                 source = region.observation_type
                 coverage = "in_range"
                 frame_bw = float(sample_bw)

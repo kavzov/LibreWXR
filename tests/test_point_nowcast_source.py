@@ -15,6 +15,7 @@ from librewxr.data.nowcast import NowcastFrame
 from librewxr.data.point_nowcast import build_point_nowcast
 from librewxr.data.regions import REGIONS, RegionDef
 from librewxr.data.store import RadarFrame
+from librewxr.mcp.sampling import dbz_to_rate_mmh
 
 pytestmark = pytest.mark.api
 
@@ -102,6 +103,7 @@ def test_point_nowcast_labels_rrqpe_as_satellite(monkeypatch) -> None:
         "librewxr.mcp.sampling.sample_coverage",
         lambda _name, lat, _lon: np.ones(lat.shape, dtype=bool),
     )
+    monkeypatch.setattr("librewxr.config.settings.rrqpe_dbz_offset", -7.0)
     lat, lon = 28.6139, 77.2090  # New Delhi: no Doppler region covers it
     latest = int(time.time() // 300) * 300
     observed, nowcast = _rrqpe_point_stores(lat, lon, latest)
@@ -130,8 +132,12 @@ def test_point_nowcast_labels_rrqpe_as_satellite(monkeypatch) -> None:
     assert [frame["period"] for frame in result["frames"]] == ["observed", "forecast"]
     assert all(frame["region"] == "RRQPE" for frame in result["frames"])
     assert all(frame["coverage"] == "in_range" for frame in result["frames"])
-    assert result["frames"][0]["max_dbz"] == 35.0
-    assert result["frames"][1]["max_dbz"] == 30.0
+    # Stored values carry the display offset; the API reports true dBZ.
+    assert result["frames"][0]["max_dbz"] == 42.0
+    assert result["frames"][1]["max_dbz"] == 37.0
+    assert result["frames"][0]["max_rate_mmh"] == pytest.approx(
+        dbz_to_rate_mmh(42.0)
+    )
 
     from librewxr.api.models import RadarPointNowcastResponse
 

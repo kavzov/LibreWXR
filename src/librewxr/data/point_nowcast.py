@@ -21,6 +21,7 @@ from librewxr.mcp.sampling import (
     covering_regions_for_point,
     dbz_to_rate_mmh,
     first_region_with_data,
+    undo_display_dbz_offset,
 )
 from librewxr.tiles.coordinates import _laea_forward, _tmerc_forward
 
@@ -166,7 +167,9 @@ def sample_neighborhood(
         # use the nearest cell, then native row/column order deterministically.
         max_pixel = int(np.max(pixels[wet]))
         cell_distance = float(np.min(sampled_distances[wet & (pixels == max_pixel)]))
-        max_dbz = max_pixel / 2.0 - 32.0
+        # Wet detection above follows the displayed (calibrated) values so
+        # it matches the map; the reported maximum is the source's true dBZ.
+        max_dbz = undo_display_dbz_offset(max_pixel / 2.0 - 32.0, region.name)
         max_rate_mmh = dbz_to_rate_mmh(max_dbz)
     else:
         max_dbz = None

@@ -245,7 +245,10 @@ Use this endpoint for location-specific precipitation hints instead of
 decoding colours from radar PNG tiles. It samples the native dBZ grids in a
 small circle and returns observed and forecast frames relative to the latest
 observation. Check `stale` and each frame's `coverage` before using its
-`wet_fraction`, `max_dbz`, or `max_rate_mmh` values.
+`wet_fraction`, `max_dbz`, or `max_rate_mmh` values. `max_dbz` and
+`max_rate_mmh` are the source's true values, without a display calibration
+shift such as `LIBREWXR_RRQPE_DBZ_OFFSET`; wet pixels are still counted on
+the displayed values, so `wet_fraction` matches what the tiles show.
 
 Check `source.type` before calling the result radar. Outside Doppler
 coverage, the 60S-70N band is answered by the RRQPE satellite estimate
