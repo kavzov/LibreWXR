@@ -50,6 +50,7 @@ from librewxr.colors.weather_palettes import (
     palettes_for_field,
 )
 from librewxr.config import settings
+from librewxr.data.alerts_store import ensure_valid_polygon
 from librewxr.data.pagecache import coord_pagecache_prime_stats
 from librewxr.data.point_nowcast import build_point_nowcast
 from librewxr.data.lightning_store import LightningStore
@@ -2578,6 +2579,7 @@ async def get_alerts(
     deg_per_meter = simplify / 111_000.0 if simplify > 0 else 0.0
     from shapely.geometry import mapping
     from shapely.ops import unary_union
+    from shapely.errors import GEOSException
     features: list[GeoJSONFeature] = []
 
     # Multi-area CAP alerts (Bulgaria, Romania, France, ...) arrive as many
@@ -2590,10 +2592,29 @@ async def get_alerts(
 
     for group in by_uri.values():
         first = group[0]
-        polygons = [a.polygon for a in group if a.polygon is not None]
-        geom = unary_union(polygons) if polygons else None
-        if deg_per_meter > 0 and geom is not None:
-            geom = geom.simplify(deg_per_meter, preserve_topology=True)
+        # Repair at the request boundary: an invalid polygon reaching the
+        # union raises GEOSException (TopologyException) and 500s the whole
+        # endpoint. The store enforces validity at insert/snapshot load;
+        # this guards any geometry that slips past those chokepoints.
+        polygons = [
+            p for p in (
+                ensure_valid_polygon(a.polygon)
+                for a in group
+                if a.polygon is not None
+            )
+            if p is not None
+        ]
+        geom = None
+        if polygons:
+            try:
+                geom = unary_union(polygons)
+            except GEOSException:
+                geom = polygons[0]
+            if deg_per_meter > 0 and geom is not None:
+                try:
+                    geom = geom.simplify(deg_per_meter, preserve_topology=True)
+                except GEOSException:
+                    pass  # ship unsimplified rather than fail the request
 
         regions: list[str] = []
         for a in group:
