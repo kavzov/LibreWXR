@@ -506,12 +506,13 @@ async def test_render_only_lifespan_yields_before_coord_warm(tmp_path, monkeypat
     monkeypatch.setattr(settings, "warm_coord_zoom", 2)
     monkeypatch.setattr(main_module, "_WARM_JITTER_MAX_S", 0.0)
 
-    warm_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    warm_started = asyncio.Event()
     release_warm = threading.Event()
 
     def _blocking_warm(regions, max_zoom, tile_size=256):
-        warm_started.set()
-        release_warm.wait(30)
+        loop.call_soon_threadsafe(warm_started.set)
+        release_warm.wait()
         return 0
 
     # Patch the module-level reference main.py resolves at call time.
@@ -521,28 +522,28 @@ async def test_render_only_lifespan_yields_before_coord_warm(tmp_path, monkeypat
         pass
 
     entered = asyncio.Event()
+    finish = asyncio.Event()
 
     async def _hold():
         async with main_module._render_only_lifespan(_StubApp()):
             entered.set()
-            await asyncio.sleep(0.5)
+            # Keep the worker alive until the assertions finish, even if
+            # the background warm is scheduled slowly on a busy runner.
+            await finish.wait()
 
     task = asyncio.create_task(_hold())
     try:
-        # Wait for the warm to be *running* (blocked in the stub), then
-        # assert the lifespan already yielded.  If the warm were still
-        # eager/synchronous, entered would never be set while the warm is
-        # blocked and this assertion fails.
-        assert await asyncio.to_thread(warm_started.wait, 5), (
-            "coordinate warm never started"
-        )
-        assert entered.is_set(), (
-            "render-only lifespan did not yield while the coord warm was "
-            "still running"
+        # Synchronize on both events without starting a wall-clock wait
+        # in another thread while startup still occupies the event loop.
+        # The timeout only guards against a deadlock: an eager warm cannot
+        # reach yield while the stub is waiting for release_warm.
+        await asyncio.wait_for(
+            asyncio.gather(entered.wait(), warm_started.wait()), timeout=30,
         )
     finally:
         release_warm.set()
-        await task
+        finish.set()
+        await asyncio.wait_for(task, timeout=30)
 
 
 @pytest.mark.asyncio
