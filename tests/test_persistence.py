@@ -506,3 +506,56 @@ def test_nwp_grid_populated_roundtrip(
     # The on-disk fake frame must be visible after rescan
     assert consumer.frame_count >= 1
     assert (run_ts, lead) in consumer._frames
+
+
+async def test_hidden_grace_frames_outlive_snapshot_and_disk_cleanup(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from librewxr.data import store as store_module
+    from librewxr.data import radar_cache as cache_module
+    from librewxr.data.radar_cache import RadarFrameCache
+
+    clock = SimpleNamespace(now=1000.0)
+    timer = SimpleNamespace(monotonic=lambda: clock.now)
+    monkeypatch.setattr(store_module, "time", timer)
+    monkeypatch.setattr(cache_module, "time", timer)
+    producer = FrameStore(max_frames=2, grace_frames=1, cache_dir=tmp_path, evict_grace_s=60)
+    cache = RadarFrameCache(tmp_path, grace_s=60)
+    arr = np.ones((4, 4), dtype=np.uint8)
+    for ts in (100, 200, 300):
+        await producer.add_frame(RadarFrame(ts, {"A": arr}))
+    snapshot = _roundtrip(producer.__getstate__())
+    await producer.add_frame(RadarFrame(400, {"A": arr}))
+    assert await producer.get_timestamps() == [300, 400]
+    assert await producer.get_frame(200) is not None
+    assert await producer.get_frame(100) is None
+    cache.cleanup([f.timestamp for f in producer._frames])
+    consumer = FrameStore(cache_dir=tmp_path, cleanup_tmp=False)
+    consumer.__setstate__(snapshot)
+    assert await consumer.retained_frame_count() == 3
+    assert await consumer.get_frame(100) is not None
+    clock.now += 61
+    cache.cleanup([f.timestamp for f in producer._frames])
+    assert not (tmp_path / "radar" / "100_A.dat").exists()
+    assert (tmp_path / "radar" / "200_A.dat").exists()
+
+
+async def test_reintroduced_frame_gets_a_fresh_eviction_grace(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from librewxr.data import store as store_module
+
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(store_module, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    store = FrameStore(max_frames=1, cache_dir=tmp_path, evict_grace_s=60)
+    arr = np.ones((4, 4), dtype=np.uint8)
+    await store.add_frame(RadarFrame(100, {"A": arr}))
+    await store.add_frame(RadarFrame(200, {"A": arr}))
+    clock.now += 50
+    await store.add_frame(RadarFrame(100, {"A": arr}))
+    assert 100 not in store._evict_pending
+    clock.now += 11
+    await store.add_frame(RadarFrame(300, {"A": arr}))
+    assert (tmp_path / "radar" / "100_A.dat").exists()
+    assert store._evict_pending[100] == clock.now
+    clock.now += 61
+    await store.add_frame(RadarFrame(400, {"A": arr}))
+    assert not (tmp_path / "radar" / "100_A.dat").exists()

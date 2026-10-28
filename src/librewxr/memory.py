@@ -329,6 +329,10 @@ class MemoryMonitor:
         # resets whenever a check falls below the level.
         self._evict_streak = 0
         self._clear_streak = 0
+        # Re-arm warning latches only after pressure falls below the warn band.
+        # Cache actions retain the fork's thresholds and cooldown.
+        self._logged_evict_episode = False
+        self._logged_clear_episode = False
         # One-time debug log when memory.stat can't be parsed and the raw
         # cgroup usage file is used for decisions instead.
         self._logged_usage_fallback = False
@@ -459,7 +463,9 @@ class MemoryMonitor:
             self._clear_streak += 1
             self._evict_streak = 0
             if self._clear_streak >= 2 and eviction_ready:
-                logger.warning(
+                log = logger.info if self._logged_clear_episode else logger.warning
+                self._logged_clear_episode = True
+                log(
                     "Memory critical: %d MB (%s) / %d MB (%.0f%%; cgroup total %d MB) — "
                     "clearing tile + coord caches",
                     decision_mb, label, self._limit_mb, usage * 100, total_mb,
@@ -476,7 +482,9 @@ class MemoryMonitor:
                 freed = self._tile_cache.evict_half()
                 release_memory()
                 self._next_eviction_at = now + self._eviction_cooldown_seconds
-                logger.warning(
+                log = logger.info if self._logged_evict_episode else logger.warning
+                self._logged_evict_episode = True
+                log(
                     "Memory pressure: %d MB (%s) / %d MB (%.0f%%; cgroup total %d MB) — "
                     "evicted %.1f MB of tiles",
                     decision_mb, label, self._limit_mb, usage * 100, total_mb,
@@ -496,3 +504,5 @@ class MemoryMonitor:
             self._evict_streak = 0
             self._clear_streak = 0
             self._next_eviction_at = 0.0
+            self._logged_evict_episode = False
+            self._logged_clear_episode = False

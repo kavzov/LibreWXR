@@ -242,6 +242,10 @@ class FrameStore:
                 frame.regions[name] = array
                 wrote_any = wrote_any or wrote
 
+            # A reintroduced timestamp is live again. Its previous eviction
+            # clock must not delete the newly published files on a later reap.
+            self._evict_pending.pop(frame.timestamp, None)
+
             # Merge into existing frame if same timestamp.
             # Copy-on-write: build a NEW regions dict and swap the reference instead of
             # mutating in place. The tile warmer/renderer captures `frame.regions` (a live

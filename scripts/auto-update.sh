@@ -139,6 +139,10 @@ sync_env_with_example() {
     local var
     while IFS= read -r var; do
         [[ -z "${var}" ]] && continue
+        # Prose-only mentions have no assignment to copy from the example.
+        if ! grep -qE "^#?[[:space:]]*${var}=" "${example}"; then
+            continue
+        fi
         # A var that's present commented or uncommented counts as
         # "the user has seen it" — don't re-add.
         if ! grep -qE "^#?[[:space:]]*${var}=" "${env_file}"; then
