@@ -5,6 +5,7 @@
 x-pool-renderer: &pool-renderer
   profiles: ["multi", "single"]
   build: .
+  shm_size: "2g"
   command: ["python", "-m", "librewxr.main"]
   env_file:
     - .env

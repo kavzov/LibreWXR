@@ -3,10 +3,12 @@
 import json
 import logging
 import os
+import time
 from pathlib import Path
 
 import numpy as np
 
+from librewxr.data.memmap_guard import atomic_memmap_write
 from librewxr.data.regions import RegionDef
 from librewxr.data.store import RadarFrame
 
@@ -39,10 +41,16 @@ class RadarFrameCache:
     anything that's been evicted from memory is also evicted from disk.
     """
 
-    def __init__(self, cache_dir: Path):
+    def __init__(self, cache_dir: Path, grace_s: float = 0.0):
         self._dir = cache_dir / "radar"
         self._dir.mkdir(parents=True, exist_ok=True)
         self._metadata_path = self._dir / "metadata.json"
+        # Seconds a timestamp's files survive after they first look
+        # inactive to ``cleanup`` (0 = delete immediately, legacy).
+        self._grace_s = grace_s
+        # timestamp -> monotonic time it was first seen inactive; cleared
+        # as soon as the timestamp is active again.
+        self._inactive_since: dict[int, float] = {}
 
     def _file_path(self, unix_ts: int, region_name: str) -> Path:
         return self._dir / f"radar_{unix_ts}_{region_name}.dat"
@@ -79,13 +87,11 @@ class RadarFrameCache:
     ) -> None:
         if data.dtype != DTYPE:
             data = data.astype(DTYPE, copy=False)
-        final = self._file_path(unix_ts, region_name)
-        tmp = final.with_suffix(".dat.tmp")
-        mm = np.memmap(tmp, dtype=DTYPE, mode="w+", shape=data.shape)
-        mm[:] = data
-        mm.flush()
-        del mm
-        os.replace(tmp, final)
+        atomic_memmap_write(
+            self._file_path(unix_ts, region_name),
+            data,
+            what=f"radar cache {unix_ts}/{region_name}",
+        )
 
     def load_frames(
         self, regions: dict[str, RegionDef]
@@ -248,13 +254,32 @@ class RadarFrameCache:
         ``radar_<ts>_<region>.dat`` files (written when the FrameStore is
         non-persistent) and the FrameStore's own ``<ts>_<region>.dat``
         memmaps (the canonical persistent copy, normally removed by the
-        store's own eviction — this is the safety net for crash leftovers).
+        store's own eviction -- this is the safety net for crash leftovers).
         A legacy file that duplicates an existing FrameStore file is also
         removed: it is identical data left behind by a pre-dedupe session,
         superseded by the FrameStore copy.
+
+        With ``grace_s`` > 0 an inactive timestamp is only *clocked* on
+        first sight and its files are deleted once the grace has elapsed.
+        Why: the currently published ``state.json`` still names it until
+        the next publish, and a consumer applying that snapshot (a booting
+        render worker re-opens every frame) would hit FileNotFoundError.
+        This MUST ship together with ``FrameStore``'s eviction grace --
+        this pass runs later in the same cycle over the same directory and
+        would otherwise delete exactly what eviction deliberately lingers.
+        Clocking on first sight also covers a pipeline restart: nothing
+        observable is deleted before it has been inactive for one full
+        grace window.
         """
         active = set(active_timestamps)
+        now = time.monotonic()
         removed = 0
+        # Timestamps whose grace elapsed during THIS pass.  Their remaining
+        # sibling region files must go in the same pass: the grace clock is
+        # popped when it elapses, so without this marker the next sibling
+        # of the same ts would be mistaken for a first sighting, get
+        # re-clocked, and survive another full grace window.
+        reaped: set[int] = set()
         for path in self._dir.glob("*.dat"):
             stem_parts = path.stem.split("_")
             idx = 1 if stem_parts and stem_parts[0] == "radar" else 0
@@ -265,17 +290,32 @@ class RadarFrameCache:
             except ValueError:
                 continue
             if ts in active:
+                # Hygiene: a restored timestamp must not carry an eviction
+                # clock from an earlier cycle.
+                self._inactive_since.pop(ts, None)
                 if (
                     stem_parts[0] == "radar"
                     and len(stem_parts) > 2
                 ):
-                    # Duplicate of an existing FrameStore memmap — drop the
+                    # Duplicate of an existing FrameStore memmap -- drop the
                     # legacy copy (identical bytes, same directory).
                     region_name = "_".join(stem_parts[2:])
                     if self._framestore_file_path(ts, region_name).exists():
                         path.unlink(missing_ok=True)
                         removed += 1
                 continue
+            if self._grace_s > 0 and ts not in reaped:
+                since = self._inactive_since.get(ts)
+                if since is None:
+                    self._inactive_since[ts] = now
+                    continue
+                if now - since < self._grace_s:
+                    continue
+                # Grace elapsed: the first file of this timestamp pays the
+                # grace check and drops the clock; its siblings in this same
+                # pass are reaped alongside it via ``reaped``.
+                self._inactive_since.pop(ts, None)
+                reaped.add(ts)
             path.unlink(missing_ok=True)
             removed += 1
 

@@ -23,6 +23,7 @@ from earthkit.regrid import interpolate
 from omfiles import OmFileReader
 
 from librewxr.config import settings
+from librewxr.data.memmap_guard import atomic_memmap_write
 from librewxr.data.weather_sampling import (
     SamplingPlan,
     build_regular_sampling_plan,
@@ -219,24 +220,12 @@ class ECMWFGrid:
         """Atomically persist ``data`` at an explicit final path."""
 
         final.parent.mkdir(parents=True, exist_ok=True)
-        expected = self._expected_size(data.dtype, data.shape)
         existing = self._open_memmap(final, data.dtype, data.shape)
         if existing is not None:
             return existing
 
-        tmp = final.with_suffix(final.suffix + ".tmp")
-        tmp.unlink(missing_ok=True)
-        mm = np.memmap(tmp, dtype=data.dtype, mode="w+", shape=data.shape)
-        mm[:] = data
-        mm.flush()
-        del mm
-        actual = tmp.stat().st_size
-        if actual != expected:
-            tmp.unlink(missing_ok=True)
-            raise IOError(
-                f"ECMWF memmap size mismatch for {tmp}: {actual} != {expected}"
-            )
-        os.replace(tmp, final)
+        written = atomic_memmap_write(final, data, what=f"ECMWF {final.name}")
+        del written
         reopened = self._open_memmap(final, data.dtype, data.shape)
         if reopened is None:
             raise IOError(f"Failed to verify ECMWF memmap {final}")

@@ -512,3 +512,81 @@ class TestCgroupMemorySnapshot:
     def test_describe_outside_container(self, monkeypatch):
         monkeypatch.setattr("librewxr.memory._read_cgroup_memory_usage", lambda: None)
         assert describe_cgroup_memory() == ""
+
+
+class TestPressureLogLatching:
+    """Each action tier writes one WARNING per pressure episode, then INFO.
+
+    Repeated WARNING lines used to fill the rotating log file during a long
+    pressure episode and drown out real errors, so only the first action
+    firing of an episode reaches WARNING; the latch re-arms once usage falls
+    back below the warn band.
+    """
+
+    @staticmethod
+    def _records(caplog, level: str, needle: str):
+        return [
+            record for record in caplog.records
+            if record.levelname == level and needle in record.getMessage()
+        ]
+
+    def test_first_eviction_warns_once_then_repeats_at_info(self, monkeypatch, caplog):
+        monitor, tile_cache, _ = _make_monitor(monkeypatch, eviction_cooldown_seconds=0)
+        _fake_cgroup_usage(monkeypatch, fraction=0.875)
+        with caplog.at_level("INFO", logger="librewxr.memory"):
+            monitor._check()
+            monitor._check()                  # streak 2: first action firing
+            assert tile_cache.evict_calls == 1
+            assert monitor._logged_evict_episode is True
+            monitor._check()                  # streak 3: repeat
+            monitor._check()                  # streak 4: repeat
+        assert len(self._records(caplog, "WARNING", "Memory pressure:")) == 1
+        assert len(self._records(caplog, "INFO", "Memory pressure:")) >= 1
+        assert tile_cache.evict_calls == 3
+
+    def test_first_clear_warns_once_then_repeats_at_info(self, monkeypatch, caplog):
+        monitor, tile_cache, _ = _make_monitor(monkeypatch, eviction_cooldown_seconds=0)
+        _fake_cgroup_usage(monkeypatch, fraction=0.98)
+        with caplog.at_level("INFO", logger="librewxr.memory"):
+            monitor._check()
+            monitor._check()                  # streak 2: first action firing
+            assert tile_cache.clear_calls == 1
+            assert monitor._logged_clear_episode is True
+            monitor._check()                  # streak 3: repeat
+            monitor._check()                  # streak 4: repeat
+        assert len(self._records(caplog, "WARNING", "Memory critical:")) == 1
+        assert len(self._records(caplog, "INFO", "Memory critical:")) >= 1
+        assert tile_cache.clear_calls == 3
+
+    def test_latch_rearms_after_recovery(self, monkeypatch, caplog):
+        monitor, tile_cache, _ = _make_monitor(monkeypatch, eviction_cooldown_seconds=0)
+        state = _fake_cgroup_usage(monkeypatch, fraction=0.875)
+        with caplog.at_level("INFO", logger="librewxr.memory"):
+            monitor._check()
+            monitor._check()                  # first episode: one WARNING
+            assert len(self._records(caplog, "WARNING", "Memory pressure:")) == 1
+            state["fraction"] = 0.70          # full recovery re-arms the latch
+            monitor._check()
+            assert monitor._logged_evict_episode is False
+            state["fraction"] = 0.875
+            monitor._check()                  # streak 1 of the new episode
+            monitor._check()                  # streak 2: WARNING again
+        assert len(self._records(caplog, "WARNING", "Memory pressure:")) == 2
+        assert tile_cache.evict_calls == 2
+
+    def test_elevated_band_does_not_rearm_latches(self, monkeypatch, caplog):
+        monitor, tile_cache, _ = _make_monitor(monkeypatch, eviction_cooldown_seconds=0)
+        state = _fake_cgroup_usage(monkeypatch, fraction=0.875)
+        with caplog.at_level("INFO", logger="librewxr.memory"):
+            monitor._check()
+            monitor._check()                  # first episode: one WARNING
+            assert len(self._records(caplog, "WARNING", "Memory pressure:")) == 1
+            state["fraction"] = 0.82          # elevated band: episode ongoing
+            monitor._check()
+            assert monitor._logged_evict_episode is True
+            state["fraction"] = 0.875
+            monitor._check()                  # streak 1 again
+            monitor._check()                  # streak 2: INFO, not WARNING
+        assert len(self._records(caplog, "WARNING", "Memory pressure:")) == 1
+        assert len(self._records(caplog, "INFO", "Memory pressure:")) >= 1
+        assert tile_cache.evict_calls == 2

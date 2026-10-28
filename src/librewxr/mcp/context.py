@@ -122,13 +122,20 @@ async def build_stdio_lifespan(mcp_instance):
         max_frames=settings.max_frames,
         cache_dir=cache_dir,
         grace_frames=settings.frame_grace_frames,
+        # The pipeline owns the shared radar memmap dir and may be
+        # mid-write; a boot here must never delete its in-flight
+        # ``<name>.dat.<pid>.<uuid>.tmp`` (the stale-tmp sweep stays the
+        # pipeline's job at its own boot).
+        cleanup_tmp=False,
     )
     nwp_contribs = collect_nwp_contributions(settings, cache_dir)
     nwp_grids_by_slug: dict[str, object] = {
         nwp_grid_slug(c): c.instance for c in nwp_contribs
     }
     nowcast_store = (
-        NowcastStore(cache_dir=cache_dir)
+        # Same shared-dir reasoning as StormCellStore below: never sweep the
+        # pipeline's in-flight tmp files at boot.
+        NowcastStore(cache_dir=cache_dir, cleanup_tmp=False)
         if (settings.nowcast_enabled or settings.arrow_flow_enabled)
         else None
     )
