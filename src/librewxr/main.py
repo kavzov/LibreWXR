@@ -30,8 +30,8 @@ from librewxr.data.coverage import (
     persist_masks_in_background,
 )
 from librewxr.data.master_state import (
+    _apply_render_state,
     _load_and_apply_state,
-    apply_state,
     load_state,
     state_mtime,
 )
@@ -552,7 +552,11 @@ async def _render_only_lifespan(app: FastAPI):
             f"state.json disappeared between mtime check and load — "
             f"is something else writing to {cache_dir}?"
         )
-    refreshed = apply_state(payload, stores)
+    refreshed = _apply_render_state(payload, stores)
+    # The poller owns the previous snapshot. The suspended lifespan must
+    # release its boot reference once the poller replaces that snapshot.
+    last_payload: dict | None = payload
+    del payload
     logger.debug(
         "Render-only worker loaded snapshot: %s",
         ", ".join(refreshed) if refreshed else "(empty)",
@@ -718,8 +722,6 @@ async def _render_only_lifespan(app: FastAPI):
     routes.memory_monitor = monitor
 
     last_mtime = state_mtime(cache_dir)
-    # Seed the diff from the boot payload so the first poll skips unchanged stores.
-    last_payload: dict | None = payload
     poller_stop = asyncio.Event()
     pulse_stop = asyncio.Event()
 

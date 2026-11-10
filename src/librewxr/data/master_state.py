@@ -465,11 +465,6 @@ def apply_state(
         # Incremental reload: skip stores whose payload sub-dict is
         # identical to the previously-applied snapshot.  Comparison is
         # on the parsed dicts (deep ==), not raw JSON strings.
-        #
-        # KNOWN EXCEPTION: alerts_store and storm_cell_store embed a
-        # last_updated wall-clock in their payload, so they compare
-        # unequal every cycle and always reload.  Accepted — they are
-        # tiny.
         prev_state = prev_snapshot.get(name)
         if prev_snapshot and prev_state == store_state:
             continue
@@ -478,6 +473,49 @@ def apply_state(
             refreshed.append(name)
         except Exception:
             logger.exception("Failed to apply state for store %r", name)
+    return refreshed
+
+
+def _apply_render_state(
+    payload: dict[str, Any],
+    stores: dict[str, Any],
+    prev_payload: dict[str, Any] | None = None,
+) -> list[str]:
+    """Apply the worker snapshot, retaining only the alert version for diffing."""
+    snapshot = payload.get("stores", {})
+    alerts_state = snapshot.pop("alerts_store", None)
+    refreshed = apply_state(payload, stores, prev_payload=prev_payload)
+    if alerts_state is None:
+        return refreshed
+
+    # The pipeline sets last_updated on every replacement of the alert list.
+    # Fetch health can change independently. Reload legacy snapshots without
+    # a usable timestamp rather than assuming their alert contents match.
+    snapshot["alerts_store"] = {}
+    alert_store = stores.get("alerts_store")
+    if alert_store is None:
+        return refreshed
+    prev_alerts = (prev_payload or {}).get("stores", {}).get("alerts_store")
+    try:
+        updated = alerts_state.get("last_updated")
+        fetch_success = alerts_state.get("fetch_success", False)
+        version = None
+        if (
+            type(updated) in (int, float)
+            and 0 < updated < float("inf")
+            and isinstance(fetch_success, bool)
+        ):
+            version = {
+                "last_updated": updated,
+                "fetch_success": fetch_success,
+            }
+        if version is None or version != prev_alerts:
+            alert_store.__setstate__(alerts_state)
+            refreshed.append("alerts_store")
+        if version is not None:
+            snapshot["alerts_store"] = version
+    except Exception:
+        logger.exception("Failed to apply state for store %r", "alerts_store")
     return refreshed
 
 
@@ -517,11 +555,11 @@ def _load_and_apply_state(
     (c) in-flight renders hold references to the old structures, so the
         old memmap inodes stay alive until those renders release them.
 
-    Returns ``(payload, refreshed)``; ``payload`` is ``None`` when the
-    snapshot file vanished between the mtime check and the read.
+    Returns the payload with only the alert version retained, plus the
+    refreshed stores. The payload is ``None`` if the snapshot file vanished.
     """
     payload = load_state(cache_dir)
     if payload is None:
         return None, []
-    refreshed = apply_state(payload, stores, prev_payload=prev_payload)
+    refreshed = _apply_render_state(payload, stores, prev_payload=prev_payload)
     return payload, refreshed

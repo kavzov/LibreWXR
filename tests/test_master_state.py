@@ -21,10 +21,13 @@ from librewxr.data.master_state import (
     STATE_FILENAME,
     STATE_GENERATIONS_DIRNAME,
     STATE_VERSION,
+    _apply_render_state,
+    _load_and_apply_state,
     apply_state,
     dump_state,
     load_state,
     state_mtime,
+    write_state_snapshot,
 )
 from librewxr.data.store import FrameStore, RadarFrame
 
@@ -457,3 +460,62 @@ def test_apply_state_reloads_new_store_not_in_prev() -> None:
     assert refreshed == ["nowcast_store"]
     assert stores["frame_store"].loads == 1
     assert stores["nowcast_store"].loads == 1
+
+
+def test_render_snapshot_retains_only_the_alert_version(tmp_path: Path) -> None:
+    alert_store = _FakeStore()
+    frame_store = _FakeStore()
+    stores = {"alerts_store": alert_store, "frame_store": frame_store}
+    geometry = {"type": "Polygon", "coordinates": [[[1, 1], [2, 1], [1, 2], [1, 1]]]}
+    alerts = [{"polygon": geometry}]
+    version = {"last_updated": 123.0, "fetch_success": True}
+    boot = _payload(alerts_store={**version, "alerts": alerts}, frame_store={"frames": []})
+    write_state_snapshot(boot, tmp_path)
+
+    previous = load_state(tmp_path)
+    assert set(_apply_render_state(previous, stores)) == {"alerts_store", "frame_store"}
+    assert previous["stores"]["alerts_store"] == version
+    assert alert_store.state["alerts"] == alerts
+
+    current, refreshed = _load_and_apply_state(tmp_path, stores, previous)
+    assert refreshed == []
+    assert current["stores"]["alerts_store"] == version
+    assert alert_store.loads == frame_store.loads == 1
+
+    version["fetch_success"] = False
+    write_state_snapshot(_payload(alerts_store={**version, "alerts": alerts}), tmp_path)
+    current, refreshed = _load_and_apply_state(tmp_path, stores, current)
+    assert refreshed == ["alerts_store"]
+    assert current["stores"]["alerts_store"] == version
+    assert alert_store.state["fetch_success"] is False
+
+    version["last_updated"] += 1
+    write_state_snapshot(_payload(alerts_store={**version, "alerts": []}), tmp_path)
+    current, refreshed = _load_and_apply_state(tmp_path, stores, current)
+    assert refreshed == ["alerts_store"]
+    assert current["stores"]["alerts_store"] == version
+    assert alert_store.state["alerts"] == []
+
+
+def test_render_snapshot_retries_failed_and_unversioned_alerts() -> None:
+    class FlakyStore(_FakeStore):
+        def __setstate__(self, state: dict) -> None:
+            if not self.loads:
+                self.loads += 1
+                raise ValueError("cannot load alerts yet")
+            super().__setstate__(state)
+
+    store = FlakyStore()
+    stores = {"alerts_store": store}
+    previous = _payload(alerts_store={"last_updated": 123.0, "alerts": []})
+    assert _apply_render_state(previous, stores) == []
+    assert previous["stores"]["alerts_store"] == {}
+    current = _payload(alerts_store={"last_updated": 123.0, "alerts": []})
+    assert _apply_render_state(current, stores, previous) == ["alerts_store"]
+
+    for event in ("wind", "rain"):
+        previous = current
+        current = _payload(alerts_store={"alerts": [{"event": event}]})
+        assert _apply_render_state(current, stores, previous) == ["alerts_store"]
+        assert current["stores"]["alerts_store"] == {}
+        assert store.state["alerts"] == [{"event": event}]
