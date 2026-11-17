@@ -56,7 +56,12 @@ from librewxr.data.point_nowcast import build_point_nowcast
 from librewxr.data.lightning_store import LightningStore
 from librewxr.data.store import FrameStore
 from librewxr.data.weather_fields import WeatherField, field_spec
-from librewxr.data.worker_pulse import read_worker_pulses, worker_identity
+from librewxr.data.worker_pulse import (
+    read_pipeline_pulse,
+    read_pss_mb,
+    read_worker_pulses,
+    worker_identity,
+)
 from librewxr.mcp.discovery import build_ai_catalog
 from librewxr.memory import detect_memory_limit_mb
 from librewxr.tiles import window
@@ -285,6 +290,8 @@ def collect_worker_pulse() -> dict:
     """
     payload = {
         "worker_id": worker_identity(),
+        "role": "render",
+        "pss_mb": read_pss_mb(),
         "pid": os.getpid(),
         "written_at": int(time.time()),
         "rss_bytes": psutil.Process().memory_info().rss,
@@ -370,7 +377,7 @@ def _cluster_health_section() -> dict:
     Reads the pid-unique pulse files the worker pulse loops write under
     ``<cache_dir>/workers/`` (mtime-filtered, no locks — see
     ``librewxr.data.worker_pulse``), then unions in THIS process's live
-    payload by pid so a worker reports even before its first pulse write
+    payload by container + pid so a worker reports even before its first pulse write
     lands on disk.  Per-process counters (RSS, tile-cache bytes, tracker
     counts, coord-cache hits) are summed across workers; the coord store
     ``entries``/``bytes`` describe the single global on-disk store and
@@ -392,7 +399,7 @@ def _cluster_health_section() -> dict:
         key = identity if isinstance(identity, str) else f"legacy-pid-{pulse['pid']}"
         by_worker[key] = pulse
     # The live payload is strictly fresher than any on-disk file this
-    # process left behind, so it wins the pid-keyed union.
+    # process left behind, so it wins the worker-id-keyed union.
     live_pulse = collect_worker_pulse()
     by_worker[live_pulse["worker_id"]] = live_pulse
     pulses = list(by_worker.values())
@@ -550,6 +557,85 @@ def _cluster_health_section() -> dict:
         for key in queue_keys:
             render_queue_block[key] += queue.get(key, 0)
 
+    # Per-worker list (render workers only, the live serving worker
+    # included), sorted by pid for stable output.  age_s comes from the
+    # pulse file's mtime at scan time; the live payload (plain dict) is
+    # age 0.  Older pulses without role/pss_mb default to render/null.
+    workers_block: list[dict] = []
+    for pulse in pulses:
+        role = pulse.get("role") or "render"
+        if role != "render":
+            continue
+        tile = pulse.get("tile_cache") or {}
+        pss = pulse.get("pss_mb")
+        pss_mb = (
+            round(float(pss), 1)
+            if isinstance(pss, (int, float)) and not isinstance(pss, bool)
+            else None
+        )
+        rss_bytes = pulse.get("rss_bytes") or 0
+        workers_block.append({
+            "worker_id": pulse.get("worker_id") or f"legacy-pid-{pulse['pid']}",
+            "pid": pulse["pid"],
+            "role": "render",
+            "rss_mb": round(rss_bytes / (1024 * 1024), 1),
+            "pss_mb": pss_mb,
+            "tile_cache_mb": round(
+                tile.get("total_bytes", 0) / (1024 * 1024), 1
+            ),
+            "age_s": round(float(getattr(pulse, "age_s", 0.0)), 1),
+        })
+    workers_block.sort(key=lambda entry: (entry["pid"], entry["worker_id"]))
+    pss_values = [
+        entry["pss_mb"] for entry in workers_block if entry["pss_mb"] is not None
+    ]
+    workers_pss_block = (
+        {
+            "sum": round(sum(pss_values), 1),
+            "min": round(min(pss_values), 1),
+            "max": round(max(pss_values), 1),
+        }
+        if pss_values
+        else None
+    )
+
+    # Pipeline pulse: one file written by data_pipeline.py on the same
+    # cadence.  Absent (network-split render host: the pipeline runs
+    # remotely) or stale -> reporting false.
+    pipeline_block: dict = {"reporting": False}
+    if cache_dir is not None:
+        try:
+            record = read_pipeline_pulse(cache_dir)
+        except Exception:
+            record = None
+        if record is not None:
+            pipeline_pulse, pipeline_age = record
+            pipeline_pss = pipeline_pulse.get("pss_mb")
+            pipeline_rss = pipeline_pulse.get("rss_mb")
+            pipeline_pid = pipeline_pulse.get("pid")
+            pipeline_block = {
+                "reporting": True,
+                "pid": (
+                    pipeline_pid
+                    if isinstance(pipeline_pid, int)
+                    and not isinstance(pipeline_pid, bool)
+                    else 0
+                ),
+                "rss_mb": (
+                    round(float(pipeline_rss), 1)
+                    if isinstance(pipeline_rss, (int, float))
+                    and not isinstance(pipeline_rss, bool)
+                    else 0.0
+                ),
+                "pss_mb": (
+                    round(float(pipeline_pss), 1)
+                    if isinstance(pipeline_pss, (int, float))
+                    and not isinstance(pipeline_pss, bool)
+                    else None
+                ),
+                "age_s": round(pipeline_age, 1),
+            }
+
     return {
         "workers_reporting": len(pulses),
         "memory": memory_block,
@@ -558,6 +644,9 @@ def _cluster_health_section() -> dict:
         "requests": requests_block,
         "tile_latency": tile_latency_block,
         "render_queue": render_queue_block,
+        "workers": workers_block,
+        "workers_pss_mb": workers_pss_block,
+        "pipeline": pipeline_block,
     }
 
 
@@ -720,7 +809,9 @@ async def health():
     # files under the shared cache dir, unioned with this worker's live
     # payload.  Degrades to None on any failure — never an exception.
     try:
-        cluster = _cluster_health_section()
+        # PSS walks process page tables; keep it and pulse-file I/O off
+        # the event loop, just like periodic pulse collection.
+        cluster = await asyncio.to_thread(_cluster_health_section)
     except Exception:
         logger.exception("Failed to assemble cluster health section")
         cluster = None

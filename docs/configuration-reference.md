@@ -41,7 +41,7 @@ This document is the **full** reference for every setting LibreWXR understands. 
 
 ### `LIBREWXR_HOST`
 
-The network interface the server binds to. When unset (`None`), the value is passed straight to uvicorn, which selects a dual-stack listen — both IPv4 and IPv6 on capable systems. This replaced the previous IPv4-only `0.0.0.0` default in commit `f1eea96` ("Default host to None (dual-stack) instead of 0.0.0.0 (IPv4-only)").
+The network interface the server binds to. When unset (`None`), a single worker passes the value to asyncio for dual-stack binding. With multiple workers, LibreWXR resolves it to `::` when IPv6 sockets are available, or `0.0.0.0` otherwise; uvicorn cannot bind its shared multi-worker socket with `host=None`. Explicit addresses are preserved. This replaced the previous IPv4-only `0.0.0.0` default in commit `f1eea96` ("Default host to None (dual-stack) instead of 0.0.0.0 (IPv4-only)").
 
 Most self-hosters want the new behaviour, but if your reverse proxy or network only speaks IPv4, set this explicitly:
 
