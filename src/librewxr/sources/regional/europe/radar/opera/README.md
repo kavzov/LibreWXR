@@ -1,7 +1,9 @@
 # OPERA pan-European composite
 
 CIRRUS pan-European radar composite operated by **EUMETNET / OPERA**,
-published as ODIM HDF5 to Cloudferro S3 (`openradar-24h`).
+published as ODIM HDF5 to Cloudferro S3 (`openradar-24h`), with the official
+[ORD backup](https://eumetnet.github.io/openradardata-documentation/1-ORD-API-overview/#ord-backup)
+at `https://object-store.os-api.cci1.ecmwf.int/openradar-24h-backup`.
 
 ## Coverage
 
@@ -21,8 +23,19 @@ no per-country directory.
 ## Cadence & latency
 
 - Native cadence: **5 min**.
-- Files publish with ~5–10 min delay; the source walks back up to 3
-  older slots on 404 (`_MAX_FALLBACK_STEPS = 3`).
+- Files publish with ~5–10 min delay. At each timestamp the source tries
+  the primary and then the backup before walking back up to 3 older slots
+  (`_MAX_FALLBACK_STEPS = 3`). Missing files, server/transport errors and
+  invalid products allow failover. There are at most eight URL attempts,
+  each with the existing bounded transport retry policy.
+- `RadarObservation` carries the actual `what.date`/`what.time` from the
+  HDF5; products whose time differs from their requested key are rejected.
+  Older-slot fallback never acquires the requested slot's observation time.
+- Carry-forward inherits the original observation time and expires after
+  two fetch intervals measured from that original, even across restarts.
+  Both disk metadata and renderer snapshots persist per-region times.
+  Legacy caches without provenance have unknown age, are not carried forward,
+  and are refetched within the normal recovery window.
 - Archive: **rolling 24 hours** at the S3 bucket — older frames are
   pruned upstream.
 

@@ -835,7 +835,7 @@ class NowcastGenerator:
         self._nwp_chain = nwp_chain
 
     async def generate(self) -> None:
-        """Generate nowcast frames from the two most recent radar frames.
+        """Generate nowcast frames from distinct per-region observations.
 
         Called after each fetch cycle.  Runs the optical flow computation
         in a thread to avoid blocking the event loop.  External nowcast
@@ -881,15 +881,11 @@ class NowcastGenerator:
         interval = settings.fetch_interval
         extrapolate = settings.nowcast_enabled
 
-        # Regions whose data updates slower than the fetch interval (RRQPE:
-        # one scan per 600 s) measure motion against the frame one native
-        # interval back — the newest pair may repeat a scan (zero flow) or
-        # straddle a full scan step (double speed).  The flow is scaled back
-        # to per-interval motion; without that older frame the plain pair is
-        # used.
+        # Fetch slots may repeat an upstream observation during publication
+        # delay. Measure motion between distinct source times, not slot times.
         prev_regions = dict(prev_frame.regions)
-        flow_scales = await self._native_cadence_pairs(
-            latest_frame.regions, prev_regions, latest_ts, timestamps, interval,
+        flow_scales = await self._observation_pairs(
+            latest_frame, prev_regions, timestamps, interval,
         )
 
         # External nowcast contributions are part of the extrapolation
@@ -1036,41 +1032,54 @@ class NowcastGenerator:
                     for timestamp in changed_animation:
                         self._cache.invalidate_timestamp(timestamp)
 
-    async def _native_cadence_pairs(
+    async def _observation_pairs(
         self,
-        latest_regions: dict[str, np.ndarray],
+        latest: RadarFrame,
         prev_regions: dict[str, np.ndarray],
-        latest_ts: int,
         timestamps: list[int],
         interval: int,
     ) -> dict[str, float]:
-        """Swap in older frames for coarse-cadence regions; return scales.
+        """Select distinct observations and scale flow to one fetch interval.
 
-        Mutates ``prev_regions`` for every region whose
-        ``RegionDef.native_interval_seconds`` exceeds ``interval`` and whose
-        frame one native interval back is stored, and returns
-        ``{region: interval / native_interval}`` for those regions.
+        Only the bounded retained timeline is inspected. Unknown provenance,
+        stale latest observations and gaps over two native/fetch intervals
+        cannot establish motion. Coarse-cadence sources still prefer one full
+        native interval; a closer distinct pair remains a usable fallback.
         """
         from librewxr.data.regions import REGIONS as _ALL_REGIONS
 
-        older_cache: dict[int, RadarFrame | None] = {}
+        frames: dict[int, RadarFrame | None] = {}
         scales: dict[str, float] = {}
-        stored = set(timestamps)
-        for name in latest_regions:
+        previous_ts = timestamps[-2]
+        for name in latest.regions:
+            observed = latest.observation_time(name)
             region_def = _ALL_REGIONS.get(name)
             native = region_def.native_interval_seconds if region_def else 0
-            if native <= interval:
+            cadence = max(interval, native)
+            if observed is None or not 0 <= latest.timestamp - observed <= 2 * interval:
+                prev_regions.pop(name, None)
                 continue
-            older_ts = latest_ts - native
-            if older_ts not in stored:
+            candidates = []
+            for ts in reversed(timestamps[:-1]):
+                if ts < observed - 2 * cadence:
+                    break
+                if ts not in frames:
+                    frames[ts] = await self._store.get_frame(ts)
+                frame = frames[ts]
+                if frame is None or name not in frame.regions:
+                    continue
+                prior = frame.observation_time(name)
+                if prior is not None and 0 < observed - prior <= 2 * cadence:
+                    candidates.append((prior, ts, frame))
+            if not candidates:
+                prev_regions.pop(name, None)
                 continue
-            if older_ts not in older_cache:
-                older_cache[older_ts] = await self._store.get_frame(older_ts)
-            older = older_cache[older_ts]
-            if older is None or name not in older.regions:
-                continue
-            prev_regions[name] = older.regions[name]
-            scales[name] = interval / native
+            preferred = [p for p in candidates if observed - p[0] >= native]
+            prior, ts, frame = max(preferred or candidates, key=lambda p: (p[0], p[1]))
+            prev_regions[name] = frame.regions[name]
+            scale = interval / (observed - prior)
+            if ts != previous_ts or scale != 1.0:
+                scales[name] = scale
         return scales
 
     @staticmethod

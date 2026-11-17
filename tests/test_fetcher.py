@@ -418,6 +418,54 @@ class TestCarryForward:
         )
 
     @pytest.mark.asyncio
+    async def test_repeated_failure_cannot_refresh_original_time(self, small_region, tmp_path):
+        from librewxr.config import settings
+        interval = settings.fetch_interval
+        store = FrameStore(max_frames=8, cache_dir=tmp_path)
+        radar_cache = RadarFrameCache(tmp_path)
+        fetcher, source = _build_fetcher(store, TileCache(max_mb=1), radar_cache, small_region)
+        await fetcher._fetch_timestamps([(1000, "live", 0)])
+        for step in range(1, 5):
+            source.next_return = None
+            await fetcher._fetch_timestamps([(1000 + step * interval, "live", 0)])
+        assert await store.get_timestamps() == [1000, 1000 + interval, 1000 + 2 * interval]
+        assert (await store.get_latest_frame()).observation_time("TESTREG") == 1000
+
+        # Pipeline disk restore and renderer snapshot restore retain the same
+        # age; neither can start a new carry-forward budget after a restart.
+        restored = FrameStore(max_frames=8)
+        for frame in radar_cache.load_frames({"TESTREG": small_region}):
+            await restored.add_frame(frame)
+        worker = FrameStore()
+        worker.__setstate__(store.__getstate__())
+        for restored_store in (restored, worker):
+            assert (await restored_store.get_latest_frame()).observation_time("TESTREG") == 1000
+            retry, failed = _build_fetcher(restored_store, TileCache(max_mb=1), None, small_region)
+            failed.next_return = None
+            await retry._fetch_timestamps([(1000 + 3 * interval, "live", 0)])
+            assert await restored_store.get_frame(1000 + 3 * interval) is None
+
+    @pytest.mark.asyncio
+    async def test_dated_source_survives_processing_and_identical_pixel_refresh(self, small_region):
+        from librewxr.config import settings
+        from librewxr.sources._base import RadarObservation
+        from unittest.mock import AsyncMock
+        store = FrameStore()
+        fetcher, source = _build_fetcher(store, TileCache(max_mb=1), None, small_region)
+        data = np.full((32, 32), 100, dtype=np.uint8)
+        source.fetch_frame = AsyncMock(return_value=RadarObservation(data, 1000))
+        ts = 1000 + settings.fetch_interval
+        await fetcher._fetch_timestamps([(ts, "live", 0)])
+        version = store.frame_version(ts)
+        assert (await store.get_frame(ts)).observation_time("TESTREG") == 1000
+        assert "TESTREG" in fetcher._carried_regions[ts]
+        source.fetch_frame.return_value = RadarObservation(data, ts)
+        await fetcher._fetch_timestamps([(ts, "live", 0)])
+        assert (await store.get_frame(ts)).observation_time("TESTREG") == ts
+        assert store.frame_version(ts) > version
+        assert ts not in fetcher._carried_regions
+
+    @pytest.mark.asyncio
     async def test_silent_drop_carries_forward_from_prev_frame(
         self, small_region,
     ):
@@ -598,6 +646,22 @@ class TestCarryForwardRefetch:
         source.fill_value = 111
         await fetcher._fetch_all_frames()
         assert (await store.get_frame(dropped_ts)).regions["TESTREG"][0, 0] == 111
+
+    @pytest.mark.parametrize("origin", [None, 600])
+    async def test_restart_recovers_retry_from_stored_source_time(self, monkeypatch, small_region, origin):
+        fetcher, source, store, clock, interval = self._clocked_fetcher(monkeypatch, small_region)
+        ts = int(clock["now"])
+        await store.add_frame(RadarFrame(
+            ts, {"TESTREG": np.full((32, 32), 77, dtype=np.uint8)},
+            observed_at={"TESTREG": ts - origin if origin is not None else None},
+        ))
+        # A new process has no transient _carried_regions entries.
+        assert not fetcher._carried_regions
+        source.fill_value = 111
+        await fetcher._fetch_all_frames()
+        restored = await store.get_frame(ts)
+        assert restored.regions["TESTREG"][0, 0] == 111
+        assert restored.observation_time("TESTREG") == ts
 
     @pytest.mark.asyncio
     async def test_successful_refetch_clears_the_retry(

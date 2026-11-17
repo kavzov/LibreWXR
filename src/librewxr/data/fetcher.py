@@ -29,7 +29,7 @@ from librewxr.sources.regional.north_america.usa.radar.mrms import (
 )
 from librewxr.data.store import FrameStore, RadarFrame
 from librewxr.sources import collect_radar_contributions
-from librewxr.sources._base import NWPContribution, SatelliteContribution
+from librewxr.sources._base import NWPContribution, SatelliteContribution, RadarObservation
 from librewxr.tiles.cache import TileCache
 
 logger = logging.getLogger(__name__)
@@ -675,6 +675,20 @@ class RadarFetcher:
             refetch_cutoff = (
                 now_rounded - self._CARRY_FORWARD_REFETCH_MAX_INTERVALS * interval
             )
+            # Rebuild retry provenance from persistent source times, including
+            # legacy caches with unknown times. A restart must not finalize a
+            # carried slot as a successful observation.
+            for ts in existing_frames:
+                if ts < refetch_cutoff:
+                    continue
+                frame = await self._store.get_frame(ts)
+                pending = {
+                    name for name in frame.regions
+                    if frame.observation_time(name) is None
+                    or frame.observation_time(name) < ts
+                }
+                if pending:
+                    self._carried_regions.setdefault(ts, set()).update(pending)
             for carried_ts in list(self._carried_regions):
                 if carried_ts < refetch_cutoff or carried_ts not in existing_frames:
                     del self._carried_regions[carried_ts]
@@ -792,6 +806,9 @@ class RadarFetcher:
         frames_by_ts: dict[int, dict[str, np.ndarray]] = {
             ts: {} for ts, _, _ in ts_and_sources
         }
+        observation_times: dict[int, dict[str, int | None]] = {
+            ts: {} for ts in frames_by_ts
+        }
 
         # Per-result post-processing (fallback, CACOMP blend, despeckle)
         # touches only its own result, so all finalization coroutines fan
@@ -808,6 +825,11 @@ class RadarFetcher:
                     "Failed to fetch %s for ts=%d: %s", region.name, ts, result
                 )
                 continue
+            observed_at = ts
+            if isinstance(result, RadarObservation):
+                observed_at = result.observed_at
+                result = result.data
+            observation_times[ts][region.name] = observed_at
             finalize_coros.append(
                 self._finalize_result(region, ts, source_type, source_arg, result)
             )
@@ -822,6 +844,9 @@ class RadarFetcher:
 
             frames_by_ts[ts][region.name] = result
 
+            if observation_times[ts][region.name] < ts:
+                self._carried_regions.setdefault(ts, set()).add(region.name)
+                continue
             # Real data landed — retire any carry-forward provenance so
             # later cycles stop re-fetching this slot.
             carried_here = self._carried_regions.get(ts)
@@ -870,10 +895,18 @@ class RadarFetcher:
                         continue
                     for name in list(missing):
                         if name in prev_frame.regions:
+                            origin = prev_frame.observation_time(name)
+                            # Bound total age, not the distance to a copy of
+                            # a copy. Unknown legacy provenance cannot carry.
+                            if origin is None or not (
+                                0 <= ts - origin <= self._CARRY_FORWARD_MAX_INTERVALS * interval
+                            ):
+                                continue
                             regions_data[name] = np.asarray(
                                 prev_frame.regions[name]
                             ).copy()
-                            stale_min = (lookback * interval) // 60
+                            observation_times[ts][name] = origin
+                            stale_min = (ts - origin) // 60
                             logger.info(
                                 "%s: carry-forward into ts=%d from %d (%d min stale)",
                                 name, ts, prev_ts, stale_min,
@@ -889,7 +922,10 @@ class RadarFetcher:
                 # source.  Skip the empty-frame write entirely.
                 continue
 
-            frame = RadarFrame(timestamp=ts, regions=regions_data)
+            frame = RadarFrame(
+                timestamp=ts, regions=regions_data,
+                observed_at={name: observation_times[ts][name] for name in regions_data},
+            )
             evicted_ts, merged = await self._store.add_frame(frame)
             if evicted_ts is not None:
                 self._cache.invalidate_timestamp(evicted_ts)
@@ -933,7 +969,14 @@ class RadarFetcher:
                 retained_ts = await self._store.get_retained_timestamps()
                 self._radar_cache.cleanup(retained_ts)
                 regions_by_name = {r.name: r for r in self._enabled_regions}
-                self._radar_cache.save_metadata(regions_by_name, retained_ts)
+                retained_frames = [await self._store.get_frame(ts) for ts in retained_ts]
+                self._radar_cache.save_metadata(
+                    regions_by_name, retained_ts,
+                    observed_at={
+                        f.timestamp: {name: f.observation_time(name) for name in f.regions}
+                        for f in retained_frames if f is not None
+                    },
+                )
             except Exception:
                 logger.exception("Failed to update radar cache metadata")
 

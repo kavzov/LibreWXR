@@ -244,11 +244,27 @@ GET /v2/radar/point-nowcast.json?lat=54.6872&lon=25.2797
 Use this endpoint for location-specific precipitation hints instead of
 decoding colours from radar PNG tiles. It samples the native dBZ grids in a
 small circle and returns observed and forecast frames relative to the latest
-observation. Check `stale` and each frame's `coverage` before using its
+animation slot. Check `stale` and each frame's `coverage` before using its
 `wet_fraction`, `max_dbz`, or `max_rate_mmh` values. `max_dbz` and
 `max_rate_mmh` are the source's true values, without a display calibration
 shift such as `LIBREWXR_RRQPE_DBZ_OFFSET`; wet pixels are still counted on
 the displayed values, so `wet_fraction` matches what the tiles show.
+
+`time`/`minutes_offset` describe animation slots, which may contain a briefly
+carried observation. Each observed frame's `observation_time` is the actual
+source time. `latest_observation_time` and `latest_age_seconds` refer to the
+selected region's latest available observation, not the newest slot or another
+region. Carry-forward and older-product fallback do not reset this clock.
+Unknown provenance (including legacy caches) returns null observation time/age
+and `stale: true`; clients must not interpret it as a fresh dry observation.
+The nominal satellite lag described below is still applied separately.
+
+Forecast motion uses distinct per-region observation times. Repeated slots do
+not imply zero motion: the generator selects the preceding distinct observation
+and scales displacement by the actual source-time gap. Unknown provenance,
+latest observations older than two fetch intervals, or source gaps greater than
+two native/fetch intervals do not establish a motion pair. Coarse native cadence
+remains respected; no synthetic movement is added to genuinely stationary scans.
 
 Check `source.type` before calling the result radar. Outside Doppler
 coverage, the 60S-70N band is answered by the RRQPE satellite estimate

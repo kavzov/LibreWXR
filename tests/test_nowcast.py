@@ -2092,8 +2092,8 @@ class TestNativeCadencePairing:
             cache=None, nowcast_contributions=[],
         )
         prev_regions = dict(prev)
-        scales = await gen._native_cadence_pairs(
-            latest, prev_regions, 1600, [1300, 1600], 300,
+        scales = await gen._observation_pairs(
+            RadarFrame(timestamp=1600, regions=latest), prev_regions, [1300, 1600], 300,
         )
         assert scales == {}
         assert prev_regions[self._NAME] is prev[self._NAME]

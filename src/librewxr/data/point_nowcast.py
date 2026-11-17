@@ -221,15 +221,26 @@ async def build_point_nowcast(
         covering_regions_for_point(lat, lon, enabled_regions),
         [frame for _, _, frame in observed],
     )
+    source_frames = [
+        frame for _, _, frame in observed
+        if region is not None and frame is not None and region.name in frame.regions
+    ]
+    latest_observation = (
+        source_frames[-1].observation_time(region.name) if source_frames else None
+    )
     frames: list[dict] = []
 
     for timestamp, offset_seconds, frame in observed:
         sample = _sample_frame(
             region, lat, lon, radius_km, frame, noise_floor_dbz,
         )
-        frames.append(
-            _frame_payload(timestamp, offset_seconds, "observed", sample, 1.0)
+        payload = _frame_payload(timestamp, offset_seconds, "observed", sample, 1.0)
+        payload["observation_time"] = (
+            frame.observation_time(region.name)
+            if frame is not None and region is not None and region.name in frame.regions
+            else None
         )
+        frames.append(payload)
 
     if nowcast_store is not None:
         for timestamp in await nowcast_store.get_timestamps():
@@ -252,7 +263,9 @@ async def build_point_nowcast(
 
     frames.sort(key=lambda item: item["time"])
     now = int(time.time())
-    latest_age_seconds = max(0, now - latest_timestamp)
+    latest_age_seconds = (
+        max(0, now - latest_observation) if latest_observation is not None else None
+    )
     forecast_offsets = [
         frame["minutes_offset"] for frame in frames if frame["period"] == "forecast"
     ]
@@ -265,9 +278,9 @@ async def build_point_nowcast(
         "longitude": lon,
         "radius_km": radius_km,
         "noise_floor_dbz": noise_floor_dbz,
-        "latest_observation_time": latest_timestamp,
+        "latest_observation_time": latest_observation,
         "latest_age_seconds": latest_age_seconds,
-        "stale": latest_age_seconds > max(fetch_interval * 2, 600),
+        "stale": latest_age_seconds is None or latest_age_seconds > max(fetch_interval * 2, 600),
         "history_minutes_available": max(history_offsets, default=0),
         "forecast_minutes_available": max(forecast_offsets, default=0),
         "source": _source_payload(region, lat, frames),

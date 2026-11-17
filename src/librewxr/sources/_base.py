@@ -17,11 +17,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
 
-from librewxr.data.regions import RegionDef
+if TYPE_CHECKING:
+    from librewxr.data.regions import RegionDef
+
+
+@dataclass(frozen=True)
+class RadarObservation:
+    """Decoded pixels and their actual source time, before slot alignment."""
+
+    data: np.ndarray
+    observed_at: int
 
 
 @runtime_checkable
@@ -31,15 +40,18 @@ class RadarSource(Protocol):
     Concrete implementations are duck-typed against this — they don't
     need to inherit from it.  ``runtime_checkable`` is included so
     tests can ``isinstance``-check without imports.
+
+    An ndarray uses the requested slot's time. Sources that can fall back
+    to an older product must return RadarObservation with the product time.
     """
 
     async def fetch_frame(
         self, region: RegionDef, minutes_ago: int
-    ) -> np.ndarray | None: ...
+    ) -> np.ndarray | RadarObservation | None: ...
 
     async def fetch_archive_frame(
         self, region: RegionDef, when: datetime
-    ) -> np.ndarray | None: ...
+    ) -> np.ndarray | RadarObservation | None: ...
 
     async def close(self) -> None: ...
 

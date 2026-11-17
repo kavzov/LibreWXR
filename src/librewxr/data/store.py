@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 class RadarFrame:
     timestamp: int  # Unix timestamp
     regions: dict[str, np.ndarray] = field(default_factory=dict)
+    # None means unknown provenance (e.g. a cache written by an older build).
+    observed_at: dict[str, int | None] = field(default_factory=dict)
+
+    def observation_time(self, region: str) -> int | None:
+        return self.observed_at.get(region, self.timestamp)
 
 
 class FrameStore:
@@ -212,8 +217,8 @@ class FrameStore:
         If a frame with the same timestamp exists, merge the region data.
         Returns (evicted_timestamp | None, merged_with_content_change).
 
-        The bool is True only when the merge actually changed stored
-        content.  A fully byte-identical merge is a no-op: no disk write,
+        The bool is True when pixels or observation provenance changed.
+        A merge with identical pixels and source times is a no-op: no disk write,
         no version bump, and it returns ``False`` so callers skip the
         tile-cache invalidation / state.json dump.
         """
@@ -256,12 +261,22 @@ class FrameStore:
             # consistent snapshot (region arrays are never mutated in place, so sharing the
             # old arrays with an in-flight reader is safe).
             if existing_frame is not None:
+                observed_at = {
+                    name: frame.observation_time(name) for name in frame.regions
+                }
+                wrote_any = wrote_any or any(
+                    existing_frame.observation_time(name) != value
+                    for name, value in observed_at.items()
+                )
+                existing_frame.observed_at = {
+                    **existing_frame.observed_at, **observed_at,
+                }
                 existing_frame.regions = {
                     **existing_frame.regions, **frame.regions
                 }
                 if not wrote_any:
-                    # Every merged region was byte-identical to what is
-                    # already stored — a no-op merge.  No version bump, so
+                    # Both pixels and source times are identical — a no-op
+                    # merge. No version bump, so
                     # render workers keep their cached geometry for this
                     # timestamp (and the pipeline skips its state dump).
                     # Merge keeps the same object, so the ``_by_ts`` entry
@@ -368,6 +383,9 @@ class FrameStore:
             "frames": [
                 {
                     "timestamp": f.timestamp,
+                    "observed_at": {
+                        name: f.observation_time(name) for name in f.regions
+                    },
                     "regions": {
                         name: [
                             os.path.basename(str(arr.filename)),
@@ -429,7 +447,10 @@ class FrameStore:
         reopened = 0
         for f_info in state["frames"]:
             ts = f_info["timestamp"]
-            frame = RadarFrame(timestamp=ts)
+            frame = RadarFrame(timestamp=ts, observed_at={
+                name: f_info.get("observed_at", {}).get(name)
+                for name in f_info["regions"]
+            })
             old_frame = old_by_ts.get(ts)
             version_ok = (
                 old_frame is not None

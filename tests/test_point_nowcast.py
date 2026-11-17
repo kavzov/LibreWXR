@@ -173,7 +173,8 @@ def test_build_point_nowcast_reports_stale_and_no_coverage(monkeypatch) -> None:
     ))
 
     assert result["stale"] is True
-    assert result["latest_age_seconds"] >= 1_200
+    assert result["latest_age_seconds"] is None
+    assert result["latest_observation_time"] is None
     assert all(frame["coverage"] == "out_of_range" for frame in result["frames"])
     assert all(frame["region"] is None for frame in result["frames"])
     assert result["source"] is None
@@ -213,6 +214,52 @@ def test_point_nowcast_endpoint_and_query_validation(monkeypatch) -> None:
     assert response.headers["cache-control"] == "private, max-age=60"
     assert invalid_radius.status_code == 422
     assert invalid_horizon.status_code == 422
+
+
+@pytest.mark.parametrize("age", [300, 1800, None])
+def test_point_freshness_uses_selected_region_not_slot_or_other_region(monkeypatch, age):
+    _enable_test_region(monkeypatch)
+    latest = int(time.time() // 300) * 300
+    origin = latest - age if age is not None else None
+    observed = FrameStore()
+    pixels = np.zeros((10, 10), dtype=np.uint8)
+    for slot in (latest - 300, latest):
+        asyncio.run(observed.add_frame(RadarFrame(
+            slot, {"TEST_POINT": pixels, "OTHER": pixels},
+            observed_at={"TEST_POINT": origin, "OTHER": slot},
+        )))
+    # Exercise snapshot + HTTP response serialization, including unknown age.
+    worker = FrameStore()
+    worker.__setstate__(observed.__getstate__())
+    monkeypatch.setattr(routes, "frame_store", worker)
+    monkeypatch.setattr(routes, "nowcast_store", None)
+    monkeypatch.setattr(routes, "enabled_regions", ["TEST_POINT"])
+    app = FastAPI()
+    app.include_router(routes.router)
+    with TestClient(app) as client:
+        response = client.get("/v2/radar/point-nowcast.json", params={"lat": .05, "lon": .05})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["latest_observation_time"] == origin
+    assert data["stale"] is (age is None or age == 1800)
+    assert data["frames"][-1]["time"] == latest
+    assert data["frames"][-1]["observation_time"] == origin
+    if age is None:
+        assert data["latest_age_seconds"] is None
+    else:
+        assert data["latest_age_seconds"] >= age
+
+
+def test_legacy_snapshot_has_unknown_age(monkeypatch):
+    _enable_test_region(monkeypatch)
+    latest = int(time.time())
+    observed, _ = _stores(latest)
+    state = observed.__getstate__()
+    for frame in state["frames"]:
+        del frame["observed_at"]
+    worker = FrameStore()
+    worker.__setstate__(state)
+    assert asyncio.run(worker.get_latest_frame()).observation_time("TEST_POINT") is None
 
 
 def test_point_nowcast_endpoint_without_observations(monkeypatch) -> None:

@@ -157,7 +157,11 @@ class RadarFrameCache:
                 if arr is not None:
                     regions_data[name] = arr
             if regions_data:
-                frames.append(RadarFrame(timestamp=ts, regions=regions_data))
+                times = meta.get("observed_at", {}).get(str(ts), {})
+                frames.append(RadarFrame(
+                    timestamp=ts, regions=regions_data,
+                    observed_at={name: times.get(name) for name in regions_data},
+                ))
         return frames
 
     def _scan_timestamps(self) -> set[int]:
@@ -194,7 +198,8 @@ class RadarFrameCache:
             return None
 
     def save_metadata(
-        self, regions: dict[str, RegionDef], timestamps: list[int]
+        self, regions: dict[str, RegionDef], timestamps: list[int], *,
+        observed_at: dict[int, dict[str, int | None]] | None = None,
     ) -> None:
         """Atomically write metadata JSON with current shapes and timestamps."""
         payload = {
@@ -204,6 +209,7 @@ class RadarFrameCache:
                 for name, r in regions.items()
             },
             "timestamps": sorted(timestamps),
+            "observed_at": observed_at or {},
         }
         tmp = self._metadata_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload))

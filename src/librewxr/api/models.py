@@ -171,6 +171,8 @@ class WeatherPointResponse(BaseModel):
 
 
 class RadarPointNowcastFrame(BaseModel):
+    # Actual source time for observations; time remains the animation slot.
+    observation_time: int | None = None
     time: int
     minutes_offset: int
     period: Literal["observed", "forecast"]
@@ -203,8 +205,8 @@ class RadarPointNowcastResponse(BaseModel):
     longitude: float
     radius_km: float
     noise_floor_dbz: float
-    latest_observation_time: int
-    latest_age_seconds: int
+    latest_observation_time: int | None
+    latest_age_seconds: int | None
     stale: bool
     history_minutes_available: int
     forecast_minutes_available: int

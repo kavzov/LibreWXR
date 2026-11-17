@@ -31,6 +31,14 @@ def _make_frame(ts: int, regions: dict[str, tuple[int, int]]) -> RadarFrame:
 
 
 class TestRadarFrameCache:
+    def test_unknown_legacy_cache_and_orphan_do_not_invent_observation_time(self, tmp_path):
+        cache = RadarFrameCache(tmp_path)
+        regions = {"USCOMP": FakeRegion(10, 20)}
+        cache.write_frame(_make_frame(1000, {"USCOMP": (10, 20)}))
+        assert cache.load_frames(regions)[0].observation_time("USCOMP") is None
+        cache.save_metadata(regions, [1000])
+        assert cache.load_frames(regions)[0].observation_time("USCOMP") is None
+
     def test_write_then_load_round_trip(self, tmp_path):
         cache = RadarFrameCache(tmp_path)
         regions = {"USCOMP": FakeRegion(10, 20), "AKCOMP": FakeRegion(5, 8)}
